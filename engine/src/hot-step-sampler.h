@@ -359,6 +359,11 @@ static int dit_ggml_generate(DiTGGML *           model,
         fprintf(stderr, "[DiT] ERROR: unknown solver '%s', falling back to euler\n", solver_name);
         solver_plugin = plugin_reg.solver_lookup("euler");
     }
+    if (!solver_plugin) {
+        fprintf(stderr, "[DiT] FATAL: solver plugin registry is empty or missing euler.lua\n");
+        ggml_free(ctx);
+        return -1;
+    }
     fprintf(stderr, "[DiT] Solver: %s (%s, %d NFE/step, order %d)\n",
             solver_plugin->display_name.c_str(), solver_plugin->name.c_str(),
             solver_plugin->nfe, solver_plugin->order);
@@ -379,6 +384,11 @@ static int dit_ggml_generate(DiTGGML *           model,
     if (!guidance_plugin) {
         fprintf(stderr, "[DiT] ERROR: unknown guidance mode '%s', falling back to apg\n", guidance_mode);
         guidance_plugin = plugin_reg.guidance_lookup("apg");
+    }
+    if (!guidance_plugin) {
+        fprintf(stderr, "[DiT] FATAL: guidance plugin registry is empty or missing apg.lua\n");
+        ggml_free(ctx);
+        return -1;
     }
     bool use_apg_native = (guidance_plugin && guidance_plugin->name == "apg");
     fprintf(stderr, "[DiT] Guidance: %s (%s)%s%s\n",

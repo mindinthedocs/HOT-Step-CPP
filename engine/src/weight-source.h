@@ -24,8 +24,10 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -54,21 +56,44 @@ struct STMulti {
     }
 };
 
+static bool st_path_ends_with(const char * path, const char * suffix) {
+    if (!path || !suffix) return false;
+    size_t n = strlen(path);
+    size_t m = strlen(suffix);
+    return n >= m && strcmp(path + n - m, suffix) == 0;
+}
+
+static bool st_multi_open_file(STMulti * sm, const std::string & path) {
+    STFile sf = {};
+    if (!st_open(&sf, path.c_str())) {
+        return false;
+    }
+    sm->shards.push_back(std::move(sf));
+    return true;
+}
+
 // Open a single or sharded safetensors model from a directory.
 // Looks for:
-//   1. model.safetensors (single file)
-//   2. model.safetensors.index.json (sharded: reads weight_map, opens each shard)
-//   3. diffusion_pytorch_model.safetensors (diffusers/VAE format)
+//   1. an exact .safetensors path, when the caller passed a file
+//   2. model.safetensors (single file)
+//   3. model.safetensors.index.json (sharded: reads weight_map, opens each shard)
+//   4. diffusion_pytorch_model.safetensors (diffusers/VAE format)
 // Returns true on success.
 static bool st_multi_open(STMulti * sm, const char * dir) {
     sm->shards.clear();
 
+    if (st_path_ends_with(dir, ".safetensors")) {
+        if (st_multi_open_file(sm, dir)) {
+            return true;
+        }
+        fprintf(stderr, "[WeightSource] No safetensors file found at %s\n", dir);
+        return false;
+    }
+
     // Try single file first
     std::string single = std::string(dir) + WS_SEP + "model.safetensors";
     {
-        STFile sf = {};
-        if (st_open(&sf, single.c_str())) {
-            sm->shards.push_back(std::move(sf));
+        if (st_multi_open_file(sm, single)) {
             return true;
         }
     }
@@ -152,15 +177,28 @@ static bool st_multi_open(STMulti * sm, const char * dir) {
     // Try diffusers format (VAE)
     std::string diffusers = std::string(dir) + WS_SEP + "diffusion_pytorch_model.safetensors";
     {
-        STFile sf = {};
-        if (st_open(&sf, diffusers.c_str())) {
-            sm->shards.push_back(std::move(sf));
+        if (st_multi_open_file(sm, diffusers)) {
             return true;
         }
     }
 
     fprintf(stderr, "[WeightSource] No safetensors files found in %s\n", dir);
     return false;
+}
+
+static bool st_multi_open_preferred(STMulti * sm, const char * dir, const char * preferred_file) {
+    sm->shards.clear();
+    if (st_path_ends_with(dir, ".safetensors")) {
+        return st_multi_open(sm, dir);
+    }
+    if (preferred_file && preferred_file[0]) {
+        std::string preferred = std::string(dir) + WS_SEP + preferred_file;
+        if (st_multi_open_file(sm, preferred)) {
+            fprintf(stderr, "[WeightSource] Opened sidecar %s\n", preferred.c_str());
+            return true;
+        }
+    }
+    return st_multi_open(sm, dir);
 }
 
 static void st_multi_close(STMulti * sm) {

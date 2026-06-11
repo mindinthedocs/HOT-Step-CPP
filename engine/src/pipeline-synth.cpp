@@ -13,6 +13,7 @@
 #include "pipeline-synth-impl.h"
 #include "pipeline-synth-ops.h"
 #include "task-types.h"
+#include "trt-artifact-manifest.h"
 
 // LRC alignment (Phase 3)
 #include "alignment-config.h"
@@ -22,14 +23,116 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
+
+static bool synth_file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static std::string synth_fsq_metadata_path(const std::string & sidecar) {
+    const char * suffix = ".safetensors";
+    size_t suffix_len = strlen(suffix);
+    if (sidecar.size() >= suffix_len &&
+        sidecar.compare(sidecar.size() - suffix_len, suffix_len, suffix) == 0) {
+        return sidecar.substr(0, sidecar.size() - suffix_len) + ".metadata.json";
+    }
+    return sidecar + ".metadata.json";
+}
+
+static bool synth_require_file(const char * label, const std::string & path, bool & ok) {
+    if (synth_file_exists(path)) {
+        return true;
+    }
+    fprintf(stderr, "[Synth-Load] FATAL: missing %s: %s\n", label, path.c_str());
+    ok = false;
+    return false;
+}
+
+static bool synth_validate_onnx_artifacts(const char * dit_path) {
+    std::string onnx_path = dit_path ? dit_path : "";
+    std::string onnx_dir  = dit_sidecar_dir(dit_path);
+    std::string stem      = onnx_path;
+    if (stem.size() >= 5 && stem.substr(stem.size() - 5) == ".onnx") {
+        stem.resize(stem.size() - 5);
+    }
+
+    bool ok = true;
+    synth_require_file("DiT ONNX", onnx_path, ok);
+    synth_require_file("silence_latent.pt", onnx_dir + WS_SEP + "silence_latent.pt", ok);
+    synth_require_file("null_condition_emb.bin", onnx_dir + WS_SEP + "null_condition_emb.bin", ok);
+    synth_require_file("cond_encoder.onnx", onnx_dir + WS_SEP + "cond_encoder.onnx", ok);
+    synth_require_file("DiT metadata", stem + ".metadata.json", ok);
+    synth_require_file("precision manifest", stem + ".precision-manifest.json", ok);
+    synth_require_file("refit manifest", onnx_path + ".refit_manifest.json", ok);
+    synth_require_file("prebuilt DiT TensorRT engine", stem + ".engine", ok);
+    synth_require_file("prebuilt DiT TensorRT engine metadata", stem + ".engine.metadata.json", ok);
+
+    TrtPrecisionManifestCheck precision_manifest;
+    if (synth_file_exists(stem + ".precision-manifest.json")) {
+        std::string precision_err;
+        if (!trt_artifact_validate_precision_manifest(onnx_path, &precision_manifest, &precision_err)) {
+            fprintf(stderr, "[Synth-Load] FATAL: invalid DiT precision manifest: %s\n", precision_err.c_str());
+            ok = false;
+        } else {
+            fprintf(stderr,
+                    "[Synth-Load] Precision manifest OK: policy=%s matched=%llu downcast=%llu int8=%llu preserved=%llu\n",
+                    precision_manifest.policy.c_str(),
+                    (unsigned long long) precision_manifest.matched_allowlist_count,
+                    (unsigned long long) precision_manifest.downcast_to_fp16_count,
+                    (unsigned long long) precision_manifest.quantized_to_int8_count,
+                    (unsigned long long) precision_manifest.preserved_fp32_count);
+        }
+    }
+
+    std::string precision_report = stem + ".precision.json";
+    if (synth_file_exists(precision_report)) {
+        fprintf(stderr, "[Synth-Load] Precision report: %s\n", precision_report.c_str());
+    }
+
+    std::string engine_path = stem + ".engine";
+    if (synth_file_exists(engine_path) && synth_file_exists(engine_path + ".metadata.json")) {
+        fprintf(stderr, "[Synth-Load] Prebuilt TRT engine: %s\n", engine_path.c_str());
+        std::string engine_metadata = engine_path + ".metadata.json";
+        if (!precision_manifest.policy.empty()) {
+            TrtEngineMetadataCheck engine_check;
+            std::string engine_err;
+            if (!trt_artifact_validate_engine_metadata(engine_metadata, precision_manifest.policy,
+                                                       -1, -1, &engine_check, &engine_err)) {
+                fprintf(stderr, "[Synth-Load] FATAL: prebuilt TRT engine metadata incompatible: %s\n",
+                        engine_err.c_str());
+                ok = false;
+            } else {
+                fprintf(stderr, "[Synth-Load] TRT engine metadata OK: %s (TRT %s, profile=%s)\n",
+                        engine_check.source_path.c_str(),
+                        engine_check.tensorrt_version.c_str(),
+                        engine_check.profile.c_str());
+            }
+        }
+    }
+
+    std::string fsq_sidecar = onnx_dir + WS_SEP + "fsq.safetensors";
+    if (synth_file_exists(fsq_sidecar)) {
+        fprintf(stderr, "[Synth-Load] ONNX FSQ sidecar: %s\n", fsq_sidecar.c_str());
+        synth_require_file("FSQ sidecar metadata", synth_fsq_metadata_path(fsq_sidecar), ok);
+    } else {
+        fprintf(stderr, "[Synth-Load] FATAL: missing ONNX FSQ sidecar: %s\n", fsq_sidecar.c_str());
+        ok = false;
+    }
+    return ok;
+}
 
 void ace_synth_default_params(AceSynthParams * p) {
     p->text_encoder_path = NULL;
     p->dit_path          = NULL;
+    p->aux_dit_path      = NULL;
     p->vae_path          = NULL;
     p->adapter_path      = NULL;
     p->adapter_scale     = 1.0f;
@@ -40,7 +143,6 @@ void ace_synth_default_params(AceSynthParams * p) {
     p->vae_overlap       = 64;
     p->dump_dir          = NULL;
     p->pp_vae_path       = NULL;
-    p->onnx_vae_path     = NULL;
 }
 
 AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
@@ -52,12 +154,22 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
         fprintf(stderr, "[Synth-Load] ERROR: dit_path is NULL\n");
         return NULL;
     }
-    if (!params->text_encoder_path) {
-        fprintf(stderr, "[Synth-Load] ERROR: text_encoder_path is NULL\n");
+    bool is_onnx_dit = dit_ends_with_onnx(params->dit_path);
+    if (is_onnx_dit && !synth_validate_onnx_artifacts(params->dit_path)) {
         return NULL;
     }
-    if (!params->vae_path) {
-        fprintf(stderr, "[Synth-Load] ERROR: vae_path is NULL\n");
+
+    bool have_text_path = params->text_encoder_path && params->text_encoder_path[0];
+    bool text_encoder_is_onnx = have_text_path && dit_ends_with_onnx(params->text_encoder_path);
+    bool have_text_gguf = have_text_path && !text_encoder_is_onnx;
+    if (!have_text_gguf && !is_onnx_dit) {
+        fprintf(stderr, "[Synth-Load] ERROR: text_encoder_path is NULL; a GGUF text encoder is required\n");
+        return NULL;
+    }
+
+    bool have_vae_gguf = params->vae_path && params->vae_path[0];
+    if (!have_vae_gguf) {
+        fprintf(stderr, "[Synth-Load] ERROR: vae_path is NULL; a GGUF VAE decoder is required\n");
         return NULL;
     }
 
@@ -65,12 +177,20 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
     ctx->store     = store;
     ctx->params    = *params;
 
+    bool use_gguf_aux_for_onnx = is_onnx_dit && params->aux_dit_path && params->aux_dit_path[0];
+    if (use_gguf_aux_for_onnx) {
+        fprintf(stderr, "[Synth-Load] ONNX DiT forward with GGUF DiT auxiliary submodels: %s\n",
+                params->aux_dit_path);
+    }
+
     // DiTMeta: config + silence_latent + null_condition_emb + is_turbo,
-    // fetched once, valid for the store lifetime. Avoids loading the DiT
-    // itself just to read a few CPU-side tensors.
-    ctx->meta = store_dit_meta(store, params->dit_path);
+    // fetched once, valid for the store lifetime. For forward-only TRT DiT
+    // mode, metadata follows the GGUF auxiliary source so silence/null
+    // conditioning stays with the non-forward DiT components.
+    const char * meta_path = use_gguf_aux_for_onnx ? params->aux_dit_path : params->dit_path;
+    ctx->meta = store_dit_meta(store, meta_path);
     if (!ctx->meta) {
-        fprintf(stderr, "[Synth-Load] FATAL: DiT metadata unavailable for %s\n", params->dit_path);
+        fprintf(stderr, "[Synth-Load] FATAL: DiT metadata unavailable for %s\n", meta_path);
         delete ctx;
         return NULL;
     }
@@ -81,63 +201,33 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
     // ONNX files in the same directory as the DiT ONNX. Each model type is
     // self-contained — no cross-dependency on safetensors or GGUF.
     // For GGUF/SafeTensors: sub-models share the dit_path as before.
-    bool is_onnx_dit = dit_ends_with_onnx(params->dit_path);
     std::string submodel_path = is_onnx_dit
-        ? dit_sidecar_dir(params->dit_path)  // ONNX dir for future cond_enc.onnx etc.
+        ? (use_gguf_aux_for_onnx ? std::string(params->aux_dit_path) : dit_sidecar_dir(params->dit_path))
         : std::string(params->dit_path);
 
     // ModelKeys. Each path identifies its GGUF; adapter info rides with the
     // DiT key because two DiTs with different adapters are distinct modules.
     ctx->text_enc_key.kind = MODEL_TEXT_ENC;
-    ctx->text_enc_key.path = params->text_encoder_path;
+    ctx->text_enc_key.path = have_text_gguf ? params->text_encoder_path : "";
+    if (is_onnx_dit && have_text_gguf) {
+        fprintf(stderr, "[Synth-Load] ONNX DiT forward with GGUF TextEnc: %s\n", params->text_encoder_path);
+    }
 
     ctx->cond_enc_key.kind = MODEL_COND_ENC;
     ctx->cond_enc_key.path = submodel_path;
 
-    // FSQ tok/detok: when ONNX DiT, FSQ weights aren't in the ONNX dir — they
-    // live in the safetensors DiT directory. Fall back to the first available
-    // safetensors DiT dir. TODO: export FSQ to ONNX to make fully self-contained.
+    // FSQ tok/detok: ONNX DiT artifacts must be self-contained. Do not fall
+    // back to a GGUF/safetensors DiT just to satisfy tokenization side data.
+    // When cover mode or audio_codes need FSQ, the existing GGML FSQ runtime
+    // reads a small fsq.safetensors sidecar from this artifact directory.
     std::string fsq_path = submodel_path;
     if (is_onnx_dit) {
-        // Scan models dir for a safetensors DiT that has model.safetensors
-        // dit_path is e.g. /app/models/onnx/dit-fp8 — need to reach /app/models
-        // (the top-level models dir where safetensors DiTs live)
-        std::string onnx_dir = dit_sidecar_dir(params->dit_path);
-        std::string models_dir = onnx_dir;
-        // Go up from dit-fp8 → onnx
-        auto slash = models_dir.find_last_of("/\\");
-        if (slash != std::string::npos) models_dir = models_dir.substr(0, slash);
-        // Go up from onnx → models root
-        slash = models_dir.find_last_of("/\\");
-        if (slash != std::string::npos) models_dir = models_dir.substr(0, slash);
-
-        // Look for XL model dirs with safetensors (matching the ONNX config)
-        // Prefer dirs with "xl" in the name (matching our ONNX export source)
-        std::vector<std::string> candidates;
-        const char * xl_dirs[] = {
-            "acestep-v15-merge-sft-turbo-xl-ta-0.7",
-            "acestep-v15-merge-sft-turbo-xl-ta-0.5",
-            "acestep-v15-merge-sft-turbo-xl-ta-0.3",
-            "acestep-v15-merge-base-turbo-xl-ta-0.5",
-            "acestep-v15-merge-base-sft-xl-ta-0.5",
-            "acestep-v15-xl-turbo",
-            "acestep-v15-xl-base",
-            "acestep-v15-xl-sft",
-            nullptr
-        };
-        for (int i = 0; xl_dirs[i]; i++) {
-            std::string candidate = models_dir + WS_SEP + xl_dirs[i];
-            std::string st_check = candidate + WS_SEP + "model.safetensors";
-            FILE * fc = fopen(st_check.c_str(), "rb");
-            if (fc) {
-                fclose(fc);
-                fsq_path = candidate;
-                fprintf(stderr, "[Synth-Load] FSQ fallback: %s\n", fsq_path.c_str());
-                break;
-            }
-        }
-        if (fsq_path == submodel_path) {
-            fprintf(stderr, "[Synth-Load] WARNING: no safetensors DiT found for FSQ — covers/passthrough may fail\n");
+        if (use_gguf_aux_for_onnx) {
+            fprintf(stderr, "[Synth-Load] ONNX DiT: FSQ tokenizer/detokenizer sourced from GGUF auxiliary DiT %s\n",
+                    fsq_path.c_str());
+        } else {
+            fprintf(stderr, "[Synth-Load] ONNX DiT: FSQ sidecar must live in %s; GGUF DiT fallback disabled\n",
+                    fsq_path.c_str());
         }
     }
 
@@ -154,15 +244,13 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
     ctx->dit_key.adapter_group_scales = g_hotstep_params.adapter_group_scales;
 
     ctx->vae_enc_key.kind = MODEL_VAE_ENC;
-    ctx->vae_enc_key.path = params->vae_path;
+    ctx->vae_enc_key.path = have_vae_gguf ? params->vae_path : "";
 
     ctx->vae_dec_key.kind = MODEL_VAE_DEC;
-    ctx->vae_dec_key.path = params->vae_path;
+    ctx->vae_dec_key.path = have_vae_gguf ? params->vae_path : "";
 
-    // PP-VAE: optional post-processing VAE
+    // PP-VAE: optional post-processing VAE (GGML)
     ctx->have_pp_vae = false;
-    ctx->pp_vae_onnx_enc_path.clear();
-    ctx->pp_vae_onnx_dec_path.clear();
     if (params->pp_vae_path && params->pp_vae_path[0]) {
         ctx->pp_vae_enc_key.kind = MODEL_VAE_ENC;
         ctx->pp_vae_enc_key.path = params->pp_vae_path;
@@ -170,112 +258,64 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
         ctx->pp_vae_dec_key.path = params->pp_vae_path;
         ctx->have_pp_vae         = true;
         fprintf(stderr, "[Synth-Load] PP-VAE: %s\n", params->pp_vae_path);
+    }
 
-        // Auto-discover PP-VAE-specific ONNX encoder/decoder.
-        // PP-VAE is a DIFFERENT model from the main VAE (scragvae) — same
-        // Oobleck architecture but different weights. Look for pp-vae_encoder.onnx
-        // and pp-vae_decoder.onnx in the models/onnx/ directory.
-        // Try new subdirectory layout (onnx/pp-vae/) first, fall back to legacy flat layout.
-        {
-            // Derive onnx/ directory from pp_vae_path:
-            //   models/pp-vae-BF16.gguf → models/onnx/
-            std::string pp_dir;
-            {
-                std::string p = params->pp_vae_path;
-                auto slash = p.find_last_of("/\\");
-                pp_dir = (slash != std::string::npos) ? p.substr(0, slash) : ".";
-            }
-            std::string onnx_dir = pp_dir + WS_SEP + "onnx";
+    // is_onnx_pipeline: true when FSQ/runtime side data comes from the ONNX
+    // DiT artifact directory (TRT DiT forward without a GGUF auxiliary DiT).
+    // Drives FSQ sidecar resolution in the synthesis ops.
+    ctx->is_onnx_pipeline = is_onnx_dit && !use_gguf_aux_for_onnx;
 
-            // Try new location first: onnx/pp-vae/pp-vae_encoder.onnx
-            std::string enc_path = onnx_dir + WS_SEP + "pp-vae" + WS_SEP + "pp-vae_encoder.onnx";
-            std::string dec_path = onnx_dir + WS_SEP + "pp-vae" + WS_SEP + "pp-vae_decoder.onnx";
+    // Native TRT bundle detection + all-three-or-nothing gate (partner §3.5/§5.7).
+    // The selected ONNX DiT directory is the bundle dir; a manifest.json there is
+    // the sole TRT-bundle detector. When a manifest is present, every component
+    // (dit, text_enc, cond_enc) MUST be declared with an existing engine on disk:
+    // trt_bundle_load_manifest enforces this and fails closed. We HARD FAIL the
+    // load on an incomplete manifest rather than silently routing encoders to
+    // GGUF. When no manifest is present, this is a GGML/ORT pipeline as before.
+    if (ctx->is_onnx_pipeline) {
+        std::string bundle_dir = dit_sidecar_dir(params->dit_path);
+        if (trt_bundle_has_manifest(bundle_dir)) {
+            std::string manifest_err;
+            if (!trt_bundle_load_manifest(bundle_dir, &ctx->trt_manifest, &manifest_err)) {
+                fprintf(stderr,
+                        "[Synth-Load] FATAL: TRT bundle manifest at %s is incomplete; "
+                        "all-three-or-nothing requires dit+text_enc+cond_enc engines: %s\n",
+                        bundle_dir.c_str(), manifest_err.c_str());
+                delete ctx;
+                return NULL;
+            }
+            ctx->use_trt_bundle = true;
 
-            FILE * f_enc = fopen(enc_path.c_str(), "rb");
-            if (!f_enc) {
-                // Fall back to legacy flat layout: onnx/pp-vae_encoder.onnx
-                enc_path = onnx_dir + WS_SEP + "pp-vae_encoder.onnx";
-                f_enc = fopen(enc_path.c_str(), "rb");
-            }
-            if (f_enc) {
-                fclose(f_enc);
-                ctx->pp_vae_onnx_enc_path      = enc_path;
-                ctx->pp_vae_enc_ort_key.kind    = MODEL_VAE_ENC_ORT;
-                ctx->pp_vae_enc_ort_key.path    = enc_path;
-                fprintf(stderr, "[Synth-Load] PP-VAE ORT encoder: %s\n", enc_path.c_str());
-            }
+            ctx->text_enc_trt_key.kind = MODEL_TEXT_ENC_TRT;
+            ctx->text_enc_trt_key.path = ctx->trt_manifest.text_enc.engine;
+            ctx->cond_enc_trt_key.kind = MODEL_COND_ENC_TRT;
+            ctx->cond_enc_trt_key.path = ctx->trt_manifest.cond_enc.engine;
 
-            FILE * f_dec = fopen(dec_path.c_str(), "rb");
-            if (!f_dec) {
-                // Fall back to legacy flat layout: onnx/pp-vae_decoder.onnx
-                dec_path = onnx_dir + WS_SEP + "pp-vae_decoder.onnx";
-                f_dec = fopen(dec_path.c_str(), "rb");
-            }
-            if (f_dec) {
-                fclose(f_dec);
-                ctx->pp_vae_onnx_dec_path      = dec_path;
-                ctx->pp_vae_dec_ort_key.kind    = MODEL_VAE_DEC_ORT;
-                ctx->pp_vae_dec_ort_key.path    = dec_path;
-                fprintf(stderr, "[Synth-Load] PP-VAE ORT decoder: %s\n", dec_path.c_str());
-            }
+            // Group eviction: evict any previously-resident bundle's engines
+            // before this bundle loads, so two bundles never co-reside.
+            store_prune_bundle_except(store, bundle_dir);
+
+            fprintf(stderr,
+                    "[Synth-Load] TRT bundle: version=%s source=%s variant=%s\n"
+                    "[Synth-Load]   dit      = %s\n"
+                    "[Synth-Load]   text_enc = %s\n"
+                    "[Synth-Load]   cond_enc = %s\n",
+                    ctx->trt_manifest.version.c_str(), ctx->trt_manifest.source_model.c_str(),
+                    ctx->trt_manifest.variant.c_str(), ctx->trt_manifest.dit.engine.c_str(),
+                    ctx->trt_manifest.text_enc.engine.c_str(), ctx->trt_manifest.cond_enc.engine.c_str());
         }
     }
 
-    // ORT VAE: optional ONNX Runtime VAE decoder
-    ctx->onnx_vae_path.clear();
-    if (params->onnx_vae_path && params->onnx_vae_path[0]) {
-        ctx->onnx_vae_path          = params->onnx_vae_path;
-        ctx->vae_dec_ort_key.kind   = MODEL_VAE_DEC_ORT;
-        ctx->vae_dec_ort_key.path   = params->onnx_vae_path;
-        fprintf(stderr, "[Synth-Load] ORT-VAE: %s\n", params->onnx_vae_path);
-    }
-
-    // ORT text/cond encoder: auto-discover from ONNX directory.
-    // Triggers when:
-    //   (a) DiT is ONNX → discover text_encoder.onnx + cond_encoder.onnx from dit_sidecar_dir
-    //   (b) text_encoder_path itself is .onnx → discover cond_encoder.onnx from the same dir
-    // Case (b) supports mixing GGUF DiT with ORT text encoding (e.g. NVFP4 DiT + ONNX text enc)
-    ctx->is_onnx_pipeline = false;
-    {
-        std::string te_onnx;
-        std::string ce_onnx;
-
-        if (is_onnx_dit) {
-            // Case (a): DiT is ONNX — look for text/cond encoders in the same directory
-            std::string onnx_dir = dit_sidecar_dir(params->dit_path);
-            te_onnx = onnx_dir + WS_SEP + "text_encoder.onnx";
-            ce_onnx = onnx_dir + WS_SEP + "cond_encoder.onnx";
-        } else if (params->text_encoder_path) {
-            // Case (b): text encoder path is an ONNX file
-            std::string te_path(params->text_encoder_path);
-            if (te_path.size() >= 5 && te_path.substr(te_path.size() - 5) == ".onnx") {
-                te_onnx = te_path;
-                // cond_encoder.onnx must be in the same directory
-                auto sep = te_path.find_last_of("/\\");
-                std::string onnx_dir = (sep != std::string::npos) ? te_path.substr(0, sep) : ".";
-                ce_onnx = onnx_dir + WS_SEP + "cond_encoder.onnx";
-            }
-        }
-
-        if (!te_onnx.empty()) {
-            FILE * f_te = fopen(te_onnx.c_str(), "rb");
-            FILE * f_ce = fopen(ce_onnx.c_str(), "rb");
-            if (f_te && f_ce) {
-                fclose(f_te);
-                fclose(f_ce);
-                ctx->text_enc_ort_key.kind = MODEL_TEXT_ENC_ORT;
-                ctx->text_enc_ort_key.path = te_onnx;
-                ctx->cond_enc_ort_key.kind = MODEL_COND_ENC_ORT;
-                ctx->cond_enc_ort_key.path = ce_onnx;
-                ctx->is_onnx_pipeline = true;
-                fprintf(stderr, "[Synth-Load] ONNX pipeline: TextEnc=%s, CondEnc=%s\n",
-                        te_onnx.c_str(), ce_onnx.c_str());
-            } else {
-                if (f_te) fclose(f_te);
-                if (f_ce) fclose(f_ce);
-                fprintf(stderr, "[Synth-Load] ONNX text encoder selected but cond_encoder.onnx missing — using GGML fallback\n");
-            }
-        }
+    if (!ctx->use_trt_bundle) {
+        // Switching to a GGML/GGUF pipeline: any TRT bundle that was resident
+        // from a prior request must be evicted before the GGUF DiT loads, so the
+        // two never co-reside on the GPU. evict_all_except keeps the MODEL_DIT_TRT
+        // resident shell across a require for a different kind, and the TRT
+        // encoders' release retains their zero-byte shells, so a plain GGUF
+        // store_require_dit would NOT free the bundle's engine VRAM. Pruning with
+        // an empty keep evicts every resident bundle engine (DiT/TextEnc/CondEnc)
+        // while leaving GGML/GGUF modules untouched.
+        store_prune_bundle_except(store, "");
     }
 
     fprintf(stderr, "[Synth-Load] Ready: turbo=%s, merge=%s, fa=%s, batch_cfg=%s\n",
@@ -483,6 +523,19 @@ static void diag_stats_f32(const char * label, const float * data, size_t n) {
             label, n, mean, rms, mn, mx, sum);
 }
 
+static void synth_log_phase_memory(const AceSynth * ctx, const char * phase) {
+    if (!ctx || !ctx->store) {
+        return;
+    }
+    size_t bytes = store_vram_bytes(ctx->store);
+    int    count = store_gpu_module_count(ctx->store);
+    fprintf(stderr, "[Phase-Memory] %-22s policy=%s gpu_modules=%d tracked_weights=%.1f MB\n",
+            phase,
+            store_get_policy(ctx->store) == EVICT_STRICT ? "STRICT" : "NEVER",
+            count,
+            (double) bytes / (1024.0 * 1024.0));
+}
+
 // Common tail every task ends with once its inputs are encoded and flags are
 // posed: resolve params, resolve T, build schedule, encode text, build
 // context, init noise, run DiT. Returns 0 on success, -1 on error/cancel.
@@ -499,23 +552,29 @@ static int run_tail(AceSynth *         ctx,
         return -1;
     }
     ops_build_schedule(s);
+    synth_log_phase_memory(ctx, "tail-start");
     if (ops_encode_text(ctx, reqs, batch_n, s) != 0) {
         return -1;
     }
+    synth_log_phase_memory(ctx, "after-text-cond");
     diag_stats_f32("enc_hidden", s.enc_hidden.data(), s.enc_hidden.size());
 
     if (ops_build_context(ctx, reqs, batch_n, s) != 0) {
         return -1;
     }
+    synth_log_phase_memory(ctx, "after-context");
     diag_stats_f32("context", s.context.data(), s.context.size());
 
     ops_build_context_silence(ctx, batch_n, s);
     ops_init_noise(ctx, reqs, batch_n, s);
     diag_stats_f32("noise", s.noise.data(), s.noise.size());
 
+    synth_log_phase_memory(ctx, "before-dit");
     if (ops_dit_generate(ctx, batch_n, s, cancel, cancel_data) != 0) {
+        synth_log_phase_memory(ctx, "after-dit-error");
         return -1;
     }
+    synth_log_phase_memory(ctx, "after-dit");
     diag_stats_f32("dit_output", s.output.data(), s.output.size());
 
     return 0;
@@ -585,7 +644,10 @@ static AceSynthJob * run_cover(AceSynth *         ctx,
     // Snapshot clean VAE latents before the FSQ roundtrip degrades them.
     // cover_noise_strength blending needs the clean copy.
     s.noise_blend_latents = s.cover_latents;
-    ops_fsq_roundtrip(ctx, s);
+    if (ops_fsq_roundtrip(ctx, s) != 0) {
+        delete job;
+        return NULL;
+    }
 
     if (run_tail(ctx, reqs, batch_n, s, cancel, cancel_data) != 0) {
         delete job;
@@ -892,6 +954,7 @@ int ace_synth_job_run_vae(AceSynth *    ctx,
     }
 
     // Route through postprocess plugin if one is selected
+    synth_log_phase_memory(ctx, "before-vae");
     const std::string & pp = job->state.rr.postprocess_plugin;
     int rc;
     if (!pp.empty()) {
@@ -900,6 +963,7 @@ int ace_synth_job_run_vae(AceSynth *    ctx,
     } else {
         rc = ops_vae_decode(ctx, job->batch_n, out, job->state, cancel, cancel_data);
     }
+    synth_log_phase_memory(ctx, rc == 0 ? "after-vae" : "after-vae-error");
     return rc;
 }
 

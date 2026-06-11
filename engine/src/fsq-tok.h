@@ -8,7 +8,8 @@
 //   -> prepend CLS token -> 2L Qwen3 encoder -> take CLS output
 //   -> RMSNorm -> project_in(2048->6) -> FSQ quantize -> integer index
 //
-// Weights live in the DiT GGUF (prefix "tokenizer.")
+// Weights live in the DiT GGUF, a source safetensors directory, or a runtime
+// fsq.safetensors sidecar (prefix "tokenizer.").
 // Output codes feed into detok_ggml_decode (fsq-detok.h) to get DiT context.
 
 #pragma once
@@ -63,7 +64,8 @@ static int fsq_encode_index(const float * raw_vals) {
     return index;
 }
 
-// Load tokenizer weights from DiT GGUF or safetensors directory
+// Load tokenizer weights from DiT GGUF, source safetensors directory, or
+// runtime fsq.safetensors sidecar.
 static bool tok_ggml_load(TokGGML * m, const char * gguf_path) {
     BackendPair bp    = backend_init("Tokenizer");
     m->backend        = bp.backend;
@@ -89,8 +91,8 @@ static bool tok_ggml_load(TokGGML * m, const char * gguf_path) {
     WeightSource ws;
 
     if (is_st) {
-        if (!st_multi_open(&sm, gguf_path)) {
-            fprintf(stderr, "[Tok] FATAL: cannot open safetensors in %s\n", gguf_path);
+        if (!st_multi_open_preferred(&sm, gguf_path, "fsq.safetensors")) {
+            fprintf(stderr, "[Tok] FATAL: cannot open fsq.safetensors or source safetensors in %s\n", gguf_path);
             return false;
         }
         ws.is_st = true;

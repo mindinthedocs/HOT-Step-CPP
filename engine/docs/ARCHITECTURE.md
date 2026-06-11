@@ -765,16 +765,18 @@ worker thread processes jobs in order. Clients poll GET /job?id=N for status
 and fetch results with GET /job?id=N&result=1.
 Cancel: POST /job?id=N&cancel=1 stops a specific job.
 
-`--models` scans a directory for GGUF files and classifies each by its
-`general.architecture` metadata into LM, Text-Enc, DiT, and VAE buckets.
+`--models` scans a directory for GGUF, SafeTensors, and ONNX runtime-bundle
+artifacts. GGUF files are classified by `general.architecture`; SafeTensors
+and ONNX bundles are classified from sidecars and filenames into LM,
+Text-Enc, DiT, and VAE buckets.
 Each request loads the model, executes, and frees it. With `--keep-loaded`,
 models persist in VRAM and are reused across requests. GPU access is
 serialized by the single worker thread (no mutex needed).
 
-| Pipeline | GGUF architectures needed | Enables | VRAM (approx) |
+| Pipeline | Model artifacts needed | Enables | VRAM (approx) |
 |:---------|:--------------------------|:--------|:--------------|
 | LM | `acestep-lm` | /lm | ~7 GB (batch=1) |
-| Synth | `acestep-text-enc` + `acestep-dit` + `acestep-vae` | /synth | ~12 GB |
+| Synth | `acestep-text-enc` + `acestep-dit` + `acestep-vae`, or an ONNX DiT runtime bundle with sibling text/condition/VAE artifacts | /synth | ~12 GB |
 | Understand | `acestep-lm` + `acestep-dit` + `acestep-vae` | /understand | ~7 GB |
 
 Endpoints whose pipeline has no models in the registry return 501.
@@ -783,7 +785,7 @@ Endpoints whose pipeline has no models in the registry return 501.
 Usage: ace-server --models <dir> [options]
 
 Required:
-  --models <dir>          Directory of GGUF model files
+  --models <dir>          Directory of GGUF, SafeTensors, or ONNX runtime-bundle artifacts
 
 Adapter:
   --adapters <dir>        Directory of adapters

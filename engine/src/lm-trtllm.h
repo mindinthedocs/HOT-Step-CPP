@@ -57,7 +57,7 @@ static bool register_trtllm_plugins() {
 
         // The plugin DLL depends on:
         //   tensorrt_llm.dll    → in engine/trtllm-libs/
-        //   nvinfer_10.dll      → in engine/deps/tensorrt_libs/
+        //   nvinfer_*.dll       -> provided by the installed TensorRT runtime
         // We need BOTH directories in the DLL search order.
         // Use SetDefaultDllDirectories + AddDllDirectory for multi-dir support.
         std::string trtllmDir = exeDir + "\\..\\..\\trtllm-libs";

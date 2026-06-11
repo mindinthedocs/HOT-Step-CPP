@@ -301,6 +301,48 @@ export const modelManagerApi = {
   downloadsStreamUrl: `${BASE}/model-manager/downloads`,
 };
 
+// ── TRT Bundles (build-job API) ──────────────────────────────
+export interface TrtBuildJob {
+  jobId: string;
+  variant: string;
+  bundleName: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  progress: number; // 0..1
+  step: string;
+  lines: { step: number; name: string; progress: number; status: string }[];
+  error?: string;
+  exitCode?: number;
+}
+
+export interface TrtBundleEntry {
+  name: string;
+  available: boolean;
+  variant?: string;
+}
+
+export interface TrtBundleList {
+  bundles: TrtBundleEntry[];
+  engine: unknown[];
+  building: boolean;
+  aceServerDown: boolean;
+}
+
+export const trtBundleApi = {
+  /** List on-disk bundles + engine /props trt view + build-lock state */
+  list: () => get<TrtBundleList>('/trt-bundles'),
+  /** Available DiT build variants */
+  variants: () => get<{ variants: string[] }>('/trt-bundles/variants'),
+  /** Start a build { variant, precision }. Throws on 409 (single-GPU lock). */
+  build: (variant: string, precision?: string) =>
+    post<{ jobId: string }>('/trt-bundles/build', { variant, precision }),
+  /** Build-job status */
+  status: (jobId: string) => get<TrtBuildJob>(`/trt-bundles/build/${jobId}`),
+  /** Cancel a running build */
+  cancel: (jobId: string) => post<{ ok: boolean }>(`/trt-bundles/build/${jobId}/cancel`),
+  /** SSE endpoint URL for a build job's progress stream */
+  eventsUrl: (jobId: string) => `${BASE}/trt-bundles/build/${jobId}/events`,
+};
+
 // ── Retranscribe Lyrics ─────────────────────────────────────
 export async function retranscribeLyrics(
   songId: string,

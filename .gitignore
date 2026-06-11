@@ -29,6 +29,22 @@ engine/build/
 engine/deps/
 engine/.cache/
 
+# TRT verification probe artifacts (local only)
+build-trtcheck/
+build/
+build-*/
+.toolchain/
+
+# Local Python venv (not committed)
+.venv/
+
+# Local model weights / bundles (not committed)
+models/
+
+# Downloaded dependency archives (local only)
+engine/deps/*.zip
+*.zip
+
 # Binaries & compiled objects
 *.exe
 !Essentia/*.exe
@@ -64,6 +80,7 @@ engine/.cache/
 # Downloaded tools (whisper.cpp, etc.)
 tools/*
 !tools/onnx-export/
+!tools/trt/
 !tools/mcp-lyricstudio/
 tools/mcp-lyricstudio/node_modules/
 
@@ -87,6 +104,7 @@ Thumbs.db
 .agents/
 .agent/
 .claude/
+.claude-plans/
 .gemini/
 
 # Dev-only scripts (local only, not needed by end users)
@@ -130,3 +148,22 @@ Important.md
 
 # Docker (container-specific overrides, not committed)
 docker-compose.override.yml
+# Feasibility spike scratch (throwaway, local only)
+.spike-w0-6/
+# ORT-removal proof spike (throwaway, local only)
+.spike-w1-1/
+.spike-w1-1-build*.log
+# Encoder TRT engine build artifacts (safetensors, ONNX, engines — local only)
+.enc-build/
+
+# Throwaway build/probe scratch at repo root (regenerable, local only)
+*_w0*.cmd
+build_w43.cmd
+probe_props*
+/*.log
+
+# E2E gen proof artifacts (audio, drive scripts, logs, VRAM samples — local only)
+w0-5-output/
+w4-1-output/
+w4-2-3-output/
+setup_trt_venv.ps1

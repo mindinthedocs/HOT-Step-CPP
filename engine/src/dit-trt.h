@@ -7,11 +7,11 @@
 //
 // Architecture:
 //  BUILD (once per GPU arch):
-//    ONNX → TRT engine with kREFIT_IDENTICAL | kSTRIP_PLAN | kFP16
-//    → ~50MB stripped engine file (weights stored separately in ONNX)
+//    ONNX -> TRT engine with kREFIT_IDENTICAL (weights embedded)
+//    → full engine file with all weights (~5GB)
 //
 //  RUNTIME:
-//    Load engine → Refit with base weights from ONNX → Run
+//    Load engine → cache base weights via ONNX refitter → Run
 //    On adapter switch: refit with merged weights (~0.5s)
 
 #ifdef HOT_STEP_TRT
@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <mutex>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <atomic>
 
@@ -31,6 +32,10 @@
 #include "NvInfer.h"
 #include "NvOnnxParser.h"
 #include "yyjson.h"
+
+#if NV_TENSORRT_MAJOR != 11
+#error "HOT_STEP_TRT requires TensorRT 11.x headers"
+#endif
 
 // ── TRT Logger ──────────────────────────────────────────────────────────────
 
@@ -50,6 +55,12 @@ public:
     }
 };
 
+inline void dit_trt_log_version(const char* where) {
+    fprintf(stderr, "[DiT-TRT] TensorRT %d.%d.%d (%s)\n",
+            NV_TENSORRT_MAJOR, NV_TENSORRT_MINOR, NV_TENSORRT_PATCH,
+            where ? where : "runtime");
+}
+
 // ── DitTrt context ──────────────────────────────────────────────────────────
 
 struct DitTrt {
@@ -66,6 +77,9 @@ struct DitTrt {
     int idx_t             = -1;
     int idx_t_r           = -1;
     int idx_velocity      = -1;
+    nvinfer1::DataType dtype_input_latents = nvinfer1::DataType::kFLOAT;
+    nvinfer1::DataType dtype_enc_hidden    = nvinfer1::DataType::kFLOAT;
+    nvinfer1::DataType dtype_velocity      = nvinfer1::DataType::kFLOAT;
 
     // Device buffers (allocated lazily, resized as needed)
     void*  d_input_latents = nullptr;
@@ -77,8 +91,14 @@ struct DitTrt {
     size_t buf_enc_hidden_bytes    = 0;
     size_t buf_velocity_bytes      = 0;
 
-    // ONNX path (needed for weight refitting)
+    // ONNX path (needed for weight refitting / adapter base cache)
     std::string onnx_path;
+
+    // TensorRT weight streaming metadata (budget = full size so all weights
+    // are resident in VRAM; streaming is enabled at build time to avoid OOM
+    // during engine compilation, but at runtime nothing is streamed).
+    int64_t streamable_weights_bytes = 0;
+    int64_t weight_streaming_budget_bytes = 0;
 
     // Base weight cache (BF16 host memory, keyed by TRT weight name)
     // Populated on first load; used to revert adapter changes
@@ -86,6 +106,7 @@ struct DitTrt {
 
     // Current adapter state
     std::string current_adapter;  // empty = base model
+    std::string current_adapter_key;  // path + scale + group scales + sidecar hash
     std::mutex  refit_mutex;
 
     // Weights that dynamo stored in transposed [in,out] orientation
@@ -112,6 +133,23 @@ struct DitTrt {
     int64_t load_time_ms  = 0;
 };
 
+// Release per-job GPU buffers without destroying the TRT runtime, engine,
+// execution context, or refitted weights.
+inline void dit_trt_release_evictable(DitTrt* ctx) {
+    if (!ctx) return;
+    bool released = false;
+    if (ctx->d_input_latents) { cudaFree(ctx->d_input_latents); ctx->d_input_latents = nullptr; released = true; }
+    if (ctx->d_enc_hidden)    { cudaFree(ctx->d_enc_hidden);    ctx->d_enc_hidden = nullptr;    released = true; }
+    if (ctx->d_t)             { cudaFree(ctx->d_t);             ctx->d_t = nullptr;             released = true; }
+    if (ctx->d_t_r)           { cudaFree(ctx->d_t_r);           ctx->d_t_r = nullptr;           released = true; }
+    if (ctx->d_velocity)      { cudaFree(ctx->d_velocity);      ctx->d_velocity = nullptr;      released = true; }
+    ctx->buf_input_latents_bytes = 0;
+    ctx->buf_enc_hidden_bytes    = 0;
+    ctx->buf_velocity_bytes      = 0;
+    fprintf(stderr, "[DiT-TRT] EVICT_STRICT: %s\n",
+            released ? "released evictable buffers" : "no evictable buffers to release");
+}
+
 // ── Engine build (once per GPU architecture) ────────────────────────────────
 
 // Build a TRT engine from ONNX and serialize to disk.
@@ -120,8 +158,9 @@ struct DitTrt {
 // This is slow (5-30 minutes) but only needs to run once per GPU arch.
 // The engine is built with:
 //   - kREFIT_IDENTICAL: allows weight refitting with zero inference penalty
-//   - kSTRIP_PLAN: strips weights from engine file (~50MB vs ~5GB)
-//   - kFP16: FP16 inference
+//   - kWEIGHT_STREAMING: avoids OOM during engine compilation
+//   - strongly typed graph precision from ONNX
+//   - weights embedded in engine file (no kSTRIP_PLAN)
 inline bool dit_trt_build(
     const char* onnx_path,
     const char* engine_path,
@@ -129,6 +168,7 @@ inline bool dit_trt_build(
 ) {
     DitTrtLogger logger;
 
+    dit_trt_log_version("build");
     fprintf(stderr, "[DiT-TRT] Building engine from %s ...\n", onnx_path);
     fprintf(stderr, "[DiT-TRT] This will take 5-30 minutes (first run only).\n");
     auto t0 = std::chrono::steady_clock::now();
@@ -143,17 +183,23 @@ inline bool dit_trt_build(
         return false;
     }
 
-    // Create network — STRONGLY_TYPED is mandatory in TRT 11.
-    // TRT honors per-tensor dtypes from the ONNX graph.
+    // Create network: strongly typed so TensorRT honors ONNX tensor dtypes,
+    // typed initializers, and explicit Cast nodes from the precision policy.
+    // STRONGLY_TYPED is mandatory in TRT 11; TRT honors the per-tensor dtypes
+    // from the ONNX graph.
     uint32_t net_flags = 1U << static_cast<uint32_t>(
         nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+#if !defined(HOT_STEP_TRT_VERSION_MAJOR) || HOT_STEP_TRT_VERSION_MAJOR < 11
+    net_flags |= 1U << static_cast<uint32_t>(
+        nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+#endif
     auto network = builder->createNetworkV2(net_flags);
     if (!network) {
         fprintf(stderr, "[DiT-TRT] Failed to create network\n");
         delete builder;
         return false;
     }
-    fprintf(stderr, "[DiT-TRT] STRONGLY_TYPED network\n");
+    fprintf(stderr, "[DiT-TRT] STRONGLY_TYPED network (ONNX precision policy)\n");
 
     // Parse ONNX
     auto parser = nvonnxparser::createParser(*network, logger);
@@ -174,15 +220,16 @@ inline bool dit_trt_build(
     // Builder config
     auto config = builder->createBuilderConfig();
 
-    // STRONGLY_TYPED is mandatory in TRT 11 (kFP16/kOBEY removed).
-    // TF32 accelerates fp32 island ops on tensor cores.
+    // STRONGLY_TYPED + TF32: graph types are authoritative (kFP16/kOBEY removed
+    // in TRT 11). TF32 accelerates fp32 island ops on tensor cores.
+    // No FP16/BF16 builder flags — STRONGLY_TYPED forbids them.
     config->setFlag(nvinfer1::BuilderFlag::kTF32);
-    fprintf(stderr, "[DiT-TRT] STRONGLY_TYPED + TF32\n");
+    fprintf(stderr, "[DiT-TRT] STRONGLY_TYPED + TF32 (no global FP16/BF16 builder flags)\n");
 
     // Enable refittable engine (zero perf penalty with IDENTICAL)
     config->setFlag(nvinfer1::BuilderFlag::kREFIT_IDENTICAL);
-    config->setFlag(nvinfer1::BuilderFlag::kSTRIP_PLAN);
-    fprintf(stderr, "[DiT-TRT] kREFIT_IDENTICAL + kSTRIP_PLAN enabled\n");
+    config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
+    fprintf(stderr, "[DiT-TRT] kREFIT_IDENTICAL + kWEIGHT_STREAMING enabled (weights embedded in engine)\n");
 
     // Workspace (4 GB should be plenty for DiT)
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE,
@@ -190,42 +237,100 @@ inline bool dit_trt_build(
 
     // Optimization profile with dynamic shapes
     auto profile = builder->createOptimizationProfile();
+    if (!profile) {
+        fprintf(stderr, "[DiT-TRT] Failed to create optimization profile\n");
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
+    auto set_profile_dims = [&](const char* name,
+                                nvinfer1::OptProfileSelector selector,
+                                nvinfer1::Dims dims,
+                                const char* selector_label) -> bool {
+        if (!profile->setDimensions(name, selector, dims)) {
+            fprintf(stderr, "[DiT-TRT] Failed to set %s profile dims for %s\n",
+                    selector_label, name);
+            return false;
+        }
+        return true;
+    };
 
     // input_latents: [B, T, 192]
     //   T ranges: min=64, opt=2048, max=8192
-    profile->setDimensions("input_latents",
-        nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims3(1, 64, 192));
-    profile->setDimensions("input_latents",
-        nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims3(1, 2048, 192));
-    profile->setDimensions("input_latents",
-        nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims3(2, 8192, 192));
+    if (!set_profile_dims("input_latents",
+            nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims3(1, 64, 192), "min") ||
+        !set_profile_dims("input_latents",
+            nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims3(1, 2048, 192), "opt") ||
+        !set_profile_dims("input_latents",
+            nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims3(2, 8192, 192), "max")) {
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
 
     // enc_hidden: [B, S, 2048]
     //   S ranges: min=64, opt=512, max=2048
-    profile->setDimensions("enc_hidden",
-        nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims3(1, 64, 2048));
-    profile->setDimensions("enc_hidden",
-        nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims3(1, 512, 2048));
-    profile->setDimensions("enc_hidden",
-        nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims3(2, 2048, 2048));
+    if (!set_profile_dims("enc_hidden",
+            nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims3(1, 64, 2048), "min") ||
+        !set_profile_dims("enc_hidden",
+            nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims3(1, 512, 2048), "opt") ||
+        !set_profile_dims("enc_hidden",
+            nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims3(2, 2048, 2048), "max")) {
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
 
     // t: [B]
-    profile->setDimensions("t",
-        nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims{1, {1}});
-    profile->setDimensions("t",
-        nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims{1, {1}});
-    profile->setDimensions("t",
-        nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims{1, {2}});
+    if (!set_profile_dims("t",
+            nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims{1, {1}}, "min") ||
+        !set_profile_dims("t",
+            nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims{1, {1}}, "opt") ||
+        !set_profile_dims("t",
+            nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims{1, {2}}, "max")) {
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
 
     // t_r: [B]
-    profile->setDimensions("t_r",
-        nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims{1, {1}});
-    profile->setDimensions("t_r",
-        nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims{1, {1}});
-    profile->setDimensions("t_r",
-        nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims{1, {2}});
+    if (!set_profile_dims("t_r",
+            nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims{1, {1}}, "min") ||
+        !set_profile_dims("t_r",
+            nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims{1, {1}}, "opt") ||
+        !set_profile_dims("t_r",
+            nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims{1, {2}}, "max")) {
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
 
-    config->addOptimizationProfile(profile);
+    if (!profile->isValid()) {
+        fprintf(stderr, "[DiT-TRT] Optimization profile is invalid\n");
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
+    if (config->addOptimizationProfile(profile) < 0) {
+        fprintf(stderr, "[DiT-TRT] Failed to add optimization profile\n");
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
 
     // Build serialized engine — this is the blocking call (5-30 min).
     // Launch a heartbeat thread to emit periodic log lines, preventing
@@ -290,8 +395,9 @@ inline bool dit_trt_build(
 
 // ── Engine load + base weight refit ─────────────────────────────────────────
 
-// Load a pre-built TRT engine and refit with base weights from the ONNX file.
-// The ONNX path is needed because kSTRIP_PLAN engines have no weights embedded.
+// Load a pre-built TRT engine and cache base weights via the ONNX refitter.
+// The ONNX path is needed for the refitter to populate base_weights for
+// adapter revert and to ensure the engine weights match the source ONNX.
 inline bool dit_trt_load(
     DitTrt*     ctx,
     const char* engine_path,
@@ -301,6 +407,7 @@ inline bool dit_trt_load(
     auto t0 = std::chrono::steady_clock::now();
     cudaSetDevice(device_id);
     ctx->onnx_path = onnx_path;
+    dit_trt_log_version("load");
 
     // Read engine file
     FILE* f = fopen(engine_path, "rb");
@@ -329,7 +436,7 @@ inline bool dit_trt_load(
         return false;
     }
 
-    fprintf(stderr, "[DiT-TRT] Engine loaded (%zu bytes)\n", engine_size);
+    fprintf(stderr, "[DiT-TRT] First deserialize: engine loaded (%zu bytes)\n", engine_size);
 
     // Refit with base weights from ONNX
     auto refitter = nvinfer1::createInferRefitter(*ctx->engine, ctx->logger);
@@ -339,7 +446,7 @@ inline bool dit_trt_load(
     }
 
     // Use parser refitter to auto-load weights from ONNX
-    // TRT 10: refitFromFile takes only the path (no severity arg)
+    // TensorRT parser refitter takes the ONNX path; graph/weights must match.
     auto parser_refitter = nvonnxparser::createParserRefitter(*refitter, ctx->logger);
     if (!parser_refitter->refitFromFile(onnx_path)) {
         fprintf(stderr, "[DiT-TRT] Parser refit from ONNX failed\n");
@@ -356,7 +463,7 @@ inline bool dit_trt_load(
     }
 
     // Cache base weights for later adapter revert
-    // TRT 10: use getAllWeights (not getAll with LayerRole)
+    // Cache refittable weights for adapter merges/reverts.
     int32_t num_weights = refitter->getAllWeights(0, nullptr);
     if (num_weights > 0) {
         std::vector<const char*> names(num_weights);
@@ -415,6 +522,23 @@ inline bool dit_trt_load(
     delete parser_refitter;
     delete refitter;
 
+    // Weight streaming: set budget = full streamable size so all weights are
+    // resident in VRAM.  kWEIGHT_STREAMING is enabled at build time to avoid
+    // OOM during engine compilation; at runtime we want everything in memory.
+    ctx->streamable_weights_bytes = ctx->engine->getStreamableWeightsSize();
+    if (ctx->streamable_weights_bytes > 0) {
+        // Budget = full size → all weights pinned in VRAM, no on-demand streaming.
+        if (!ctx->engine->setWeightStreamingBudgetV2(ctx->streamable_weights_bytes)) {
+            fprintf(stderr, "[DiT-TRT] WARNING: failed to set full weight-streaming budget\n");
+        } else {
+            ctx->weight_streaming_budget_bytes = ctx->engine->getWeightStreamingBudgetV2();
+            fprintf(stderr,
+                    "[DiT-TRT] Weight streaming: budget=%lld bytes (full, all weights in VRAM), streamable=%lld bytes\n",
+                    (long long)ctx->weight_streaming_budget_bytes,
+                    (long long)ctx->streamable_weights_bytes);
+        }
+    }
+
     // Create execution context
     ctx->context = ctx->engine->createExecutionContext();
     if (!ctx->context) {
@@ -441,11 +565,20 @@ inline bool dit_trt_load(
         const char* io_str = (mode == nvinfer1::TensorIOMode::kINPUT) ? "INPUT" : "OUTPUT";
         fprintf(stderr, "[DiT-TRT] IO[%d] %-20s %s  %s\n", i, name, io_str, dtype_str);
         
-        if (std::string(name) == "input_latents") ctx->idx_input_latents = i;
-        else if (std::string(name) == "enc_hidden") ctx->idx_enc_hidden = i;
+        if (std::string(name) == "input_latents") {
+            ctx->idx_input_latents = i;
+            ctx->dtype_input_latents = dtype;
+        }
+        else if (std::string(name) == "enc_hidden") {
+            ctx->idx_enc_hidden = i;
+            ctx->dtype_enc_hidden = dtype;
+        }
         else if (std::string(name) == "t")          ctx->idx_t = i;
         else if (std::string(name) == "t_r")        ctx->idx_t_r = i;
-        else if (std::string(name) == "velocity")   ctx->idx_velocity = i;
+        else if (std::string(name) == "velocity") {
+            ctx->idx_velocity = i;
+            ctx->dtype_velocity = dtype;
+        }
     }
 
     if (ctx->idx_input_latents < 0 || ctx->idx_enc_hidden < 0 ||
@@ -536,6 +669,7 @@ inline int64_t dit_trt_refit_adapter(
 
     delete refitter;
     ctx->current_adapter = adapter_name;
+    ctx->current_adapter_key = adapter_name;
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -571,6 +705,7 @@ inline int64_t dit_trt_refit_base(DitTrt* ctx) {
     }
 
     ctx->current_adapter.clear();
+    ctx->current_adapter_key.clear();
 
     auto t1 = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -599,6 +734,10 @@ inline bool dit_trt_forward(
     void* velocity_out,         // GPU, fp16 [N, T, 64]
     cudaStream_t stream = nullptr
 ) {
+    if (!ctx || !ctx->engine || !ctx->context) {
+        fprintf(stderr, "[DiT-TRT] FATAL: forward called before engine/context load\n");
+        return false;
+    }
     auto* context = ctx->context;
 
     // Set input shapes
@@ -608,17 +747,24 @@ inline bool dit_trt_forward(
     const char* t_r_name           = ctx->engine->getIOTensorName(ctx->idx_t_r);
     const char* velocity_name      = ctx->engine->getIOTensorName(ctx->idx_velocity);
 
-    context->setInputShape(input_latents_name, nvinfer1::Dims3(N, T, 192));
-    context->setInputShape(enc_hidden_name,    nvinfer1::Dims3(N, S, 2048));
-    context->setInputShape(t_name,             nvinfer1::Dims{1, {N}});
-    context->setInputShape(t_r_name,           nvinfer1::Dims{1, {N}});
+    if (!context->setInputShape(input_latents_name, nvinfer1::Dims3(N, T, 192)) ||
+        !context->setInputShape(enc_hidden_name,    nvinfer1::Dims3(N, S, 2048)) ||
+        !context->setInputShape(t_name,             nvinfer1::Dims{1, {N}}) ||
+        !context->setInputShape(t_r_name,           nvinfer1::Dims{1, {N}})) {
+        fprintf(stderr, "[DiT-TRT] FATAL: failed to set input shapes (N=%d T=%d S=%d)\n",
+                N, T, S);
+        return false;
+    }
 
-    // Set tensor addresses (TRT 10: setTensorAddress takes void*, cast away const)
-    context->setTensorAddress(input_latents_name, const_cast<void*>(input_latents));
-    context->setTensorAddress(enc_hidden_name,    const_cast<void*>(enc_hidden));
-    context->setTensorAddress(t_name,             const_cast<void*>(static_cast<const void*>(t)));
-    context->setTensorAddress(t_r_name,           const_cast<void*>(static_cast<const void*>(t_r)));
-    context->setTensorAddress(velocity_name,      velocity_out);
+    // Set tensor addresses (setTensorAddress takes void*, cast away const)
+    if (!context->setTensorAddress(input_latents_name, const_cast<void*>(input_latents)) ||
+        !context->setTensorAddress(enc_hidden_name,    const_cast<void*>(enc_hidden)) ||
+        !context->setTensorAddress(t_name,             const_cast<void*>(static_cast<const void*>(t))) ||
+        !context->setTensorAddress(t_r_name,           const_cast<void*>(static_cast<const void*>(t_r))) ||
+        !context->setTensorAddress(velocity_name,      velocity_out)) {
+        fprintf(stderr, "[DiT-TRT] FATAL: failed to bind tensor addresses\n");
+        return false;
+    }
 
     // Enqueue on stream
     bool ok = context->enqueueV3(stream ? stream : 0);
@@ -669,17 +815,18 @@ inline bool dit_trt_forward(
 // ── Cleanup ─────────────────────────────────────────────────────────────────
 
 inline void dit_trt_free(DitTrt* ctx) {
-    if (ctx->d_input_latents) { cudaFree(ctx->d_input_latents); ctx->d_input_latents = nullptr; }
-    if (ctx->d_enc_hidden)    { cudaFree(ctx->d_enc_hidden);    ctx->d_enc_hidden = nullptr; }
-    if (ctx->d_t)             { cudaFree(ctx->d_t);             ctx->d_t = nullptr; }
-    if (ctx->d_t_r)           { cudaFree(ctx->d_t_r);           ctx->d_t_r = nullptr; }
-    if (ctx->d_velocity)      { cudaFree(ctx->d_velocity);      ctx->d_velocity = nullptr; }
+    dit_trt_release_evictable(ctx);
     if (ctx->stream)          { cudaStreamDestroy(ctx->stream); ctx->stream = nullptr; }
-    // TRT 10: use delete instead of destroy()
+    // TensorRT objects are destroyed with delete, not destroy().
     if (ctx->context)         { delete ctx->context;            ctx->context = nullptr; }
     if (ctx->engine)          { delete ctx->engine;             ctx->engine = nullptr; }
     if (ctx->runtime)         { delete ctx->runtime;            ctx->runtime = nullptr; }
     ctx->base_weights.clear();
+    ctx->weights_transposed.clear();
+    ctx->current_adapter.clear();
+    ctx->current_adapter_key.clear();
+    ctx->onnx_path.clear();
+    fprintf(stderr, "[DiT-TRT] Engine fully unloaded\n");
 }
 
 #endif // HOT_STEP_TRT

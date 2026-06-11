@@ -5,7 +5,9 @@
 // for the neural network evaluation. All solver/guidance/DCW/repaint logic
 // is identical — only the model forward pass changes.
 //
-// Data layout: host FP32 [B, T, C] <-> GPU BF16 [B, T, C] for TRT
+// Data layout: host FP32 [B, T, C] <-> FP32 TRT graph I/O.
+// q8map-fp16 and w8a16 lower selected matrix weights inside the ONNX graph;
+// neither changes the DiT engine's external input/output tensor dtypes.
 // Masks, RoPE, position IDs are computed inside the ONNX graph (not here).
 
 #ifdef HOT_STEP_TRT
@@ -204,6 +206,10 @@ static int dit_trt_generate(DitTrt *              trt,
         fprintf(stderr, "[DiT-TRT] ERROR: unknown solver '%s', falling back to euler\n", solver_name);
         solver_plugin = plugin_reg.solver_lookup("euler");
     }
+    if (!solver_plugin) {
+        fprintf(stderr, "[DiT-TRT] FATAL: solver plugin registry is empty or missing euler.lua\n");
+        return -1;
+    }
     fprintf(stderr, "[DiT-TRT] Solver: %s (%s)\n",
             solver_plugin->display_name.c_str(), solver_plugin->name.c_str());
 
@@ -221,6 +227,10 @@ static int dit_trt_generate(DitTrt *              trt,
     if (!guidance_plugin) {
         fprintf(stderr, "[DiT-TRT] ERROR: unknown guidance '%s', falling back to apg\n", guidance_mode);
         guidance_plugin = plugin_reg.guidance_lookup("apg");
+    }
+    if (!guidance_plugin) {
+        fprintf(stderr, "[DiT-TRT] FATAL: guidance plugin registry is empty or missing apg.lua\n");
+        return -1;
     }
     bool use_apg_native = (guidance_plugin && guidance_plugin->name == "apg");
     fprintf(stderr, "[DiT-TRT] Guidance: %s (%s)%s\n",
@@ -308,6 +318,13 @@ static int dit_trt_generate(DitTrt *              trt,
     // GPU device memory
     void *d_input = nullptr, *d_enc = nullptr, *d_vel = nullptr;
     float *d_t = nullptr, *d_t_r = nullptr;
+    auto release_io_buffers = [&]() {
+        if (d_input) { cudaFree(d_input); d_input = nullptr; }
+        if (d_enc)   { cudaFree(d_enc);   d_enc = nullptr; }
+        if (d_vel)   { cudaFree(d_vel);   d_vel = nullptr; }
+        if (d_t)     { cudaFree(d_t);     d_t = nullptr; }
+        if (d_t_r)   { cudaFree(d_t_r);   d_t_r = nullptr; }
+    };
 
     cudaMalloc(&d_input, input_elems * io_elem_bytes);
     cudaMalloc(&d_enc,   enc_elems * io_elem_bytes);
@@ -317,11 +334,7 @@ static int dit_trt_generate(DitTrt *              trt,
 
     if (!d_input || !d_enc || !d_vel || !d_t || !d_t_r) {
         fprintf(stderr, "[DiT-TRT] FATAL: cudaMalloc failed\n");
-        if (d_input) cudaFree(d_input);
-        if (d_enc)   cudaFree(d_enc);
-        if (d_vel)   cudaFree(d_vel);
-        if (d_t)     cudaFree(d_t);
-        if (d_t_r)   cudaFree(d_t_r);
+        release_io_buffers();
         return -1;
     }
 
@@ -343,7 +356,7 @@ static int dit_trt_generate(DitTrt *              trt,
     GuidanceCtx g_ctx = {0, num_steps, 0.0f, 0.0f};
 
     // ── Forward pass helper ─────────────────────────────────────────────
-    // Packs xt into input_buf, converts to BF16, uploads, runs TRT, reads back
+    // Packs xt into input_buf, uploads FP32 graph inputs, runs TRT, reads back.
     auto trt_forward = [&](const float * xt_in, float t_val, int n_batch,
                            float * vel_out) {
         // Pack xt noise channels into input_buf slots [0..n_batch)
@@ -431,10 +444,17 @@ static int dit_trt_generate(DitTrt *              trt,
         full_output.resize(n_per * N_graph);
     }
 
+    bool forward_failed = false;
     auto evaluate_velocity = [&](const float * xt_in, float t_val) {
+        if (forward_failed) {
+            return false;
+        }
         if (batch_cfg) {
             // Single forward with 2N batch
-            trt_forward(xt_in, t_val, N_graph, full_output.data());
+            if (!trt_forward(xt_in, t_val, N_graph, full_output.data())) {
+                forward_failed = true;
+                return false;
+            }
             memcpy(vt_cond.data(), full_output.data(), n_total * sizeof(float));
             memcpy(vt_uncond.data(), full_output.data() + n_total, n_total * sizeof(float));
             for (int b = 0; b < N; b++) {
@@ -452,12 +472,18 @@ static int dit_trt_generate(DitTrt *              trt,
             }
         } else if (do_cfg) {
             // 2-pass: conditional
-            trt_forward(xt_in, t_val, N, vt_cond.data());
+            if (!trt_forward(xt_in, t_val, N, vt_cond.data())) {
+                forward_failed = true;
+                return false;
+            }
             // Swap encoder to null for unconditional pass
             if (!null_enc_buf.empty()) {
                 memcpy(enc_buf.data(), null_enc_buf.data(), H_enc * enc_S * N * sizeof(float));
             }
-            trt_forward(xt_in, t_val, N, vt_uncond.data());
+            if (!trt_forward(xt_in, t_val, N, vt_uncond.data())) {
+                forward_failed = true;
+                return false;
+            }
             // Restore conditional encoder
             memcpy(enc_buf.data(), enc_hidden_data, H_enc * enc_S * N * sizeof(float));
 
@@ -476,8 +502,12 @@ static int dit_trt_generate(DitTrt *              trt,
             }
         } else {
             // No CFG — single forward
-            trt_forward(xt_in, t_val, N, vt.data());
+            if (!trt_forward(xt_in, t_val, N, vt.data())) {
+                forward_failed = true;
+                return false;
+            }
         }
+        return true;
     };
 
     // ── Step-level velocity caching (shared by both solver paths) ────────
@@ -533,6 +563,10 @@ static int dit_trt_generate(DitTrt *              trt,
         };
 
         LoopOnStepFn loop_on_step = [&](int step_idx, float t_curr, float t_next) -> bool {
+            if (forward_failed) {
+                fprintf(stderr, "[DiT-TRT] FATAL: aborting solver loop after failed forward pass\n");
+                return true;
+            }
             if (cancel && cancel(cancel_data)) {
                 fprintf(stderr, "[DiT-TRT] Cancelled at step %d/%d\n", step_idx, num_steps);
                 return true;
@@ -621,6 +655,10 @@ static int dit_trt_generate(DitTrt *              trt,
             n_total, N, T, Oc, loop_model_fn, loop_on_step,
             g_hotstep_params.plugin_params);
 
+        if (forward_failed) {
+            release_io_buffers();
+            return -1;
+        }
         memcpy(output, xt.data(), n_total * sizeof(float));
 
     } else {
@@ -633,8 +671,7 @@ static int dit_trt_generate(DitTrt *              trt,
         for (int step = 0; step < num_steps; step++) {
             if (cancel && cancel(cancel_data)) {
                 fprintf(stderr, "[DiT-TRT] Cancelled at step %d/%d\n", step, num_steps);
-                cudaFree(d_input); cudaFree(d_enc); cudaFree(d_vel);
-                cudaFree(d_t); cudaFree(d_t_r);
+                release_io_buffers();
                 return -1;
             }
             float t_curr = schedule[step];
@@ -669,7 +706,12 @@ static int dit_trt_generate(DitTrt *              trt,
             if (!step_computes[step] && has_cached_vt) {
                 memcpy(vt.data(), vt_cached.data(), n_total * sizeof(float));
             } else {
-                evaluate_velocity(xt.data(), t_curr);
+                if (!evaluate_velocity(xt.data(), t_curr)) {
+                    fprintf(stderr, "[DiT-TRT] FATAL: model evaluation failed at step %d/%d\n",
+                            step + 1, num_steps);
+                    release_io_buffers();
+                    return -1;
+                }
                 if (cached_count > 0) {
                     memcpy(vt_cached.data(), vt.data(), n_total * sizeof(float));
                     has_cached_vt = true;
@@ -683,6 +725,12 @@ static int dit_trt_generate(DitTrt *              trt,
                 t_curr, t_next, n_total,
                 solver_state, evaluate_velocity, vt.data(),
                 g_hotstep_params.plugin_params);
+            if (forward_failed) {
+                fprintf(stderr, "[DiT-TRT] FATAL: plugin solver model evaluation failed at step %d/%d\n",
+                        step + 1, num_steps);
+                release_io_buffers();
+                return -1;
+            }
 
             // DCW
             sampler_apply_dcw(xt.data(), vt.data(), N, T, Oc, t_curr, t_next, step, num_steps);
@@ -707,11 +755,7 @@ static int dit_trt_generate(DitTrt *              trt,
     }
 
     // Cleanup GPU buffers
-    cudaFree(d_input);
-    cudaFree(d_enc);
-    cudaFree(d_vel);
-    cudaFree(d_t);
-    cudaFree(d_t_r);
+    release_io_buffers();
 
     fprintf(stderr, "[DiT-TRT] Generation complete (%d steps)\n", num_steps);
     return 0;

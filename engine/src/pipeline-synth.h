@@ -17,9 +17,10 @@ struct AceSynthJob;
 struct ModelStore;
 
 struct AceSynthParams {
-    const char * text_encoder_path;  // Qwen3 text encoder GGUF (required)
+    const char * text_encoder_path;  // Qwen3 text encoder GGUF; optional for ONNX DiT bundles
     const char * dit_path;           // DiT GGUF (required)
-    const char * vae_path;           // VAE GGUF (required)
+    const char * aux_dit_path;       // optional GGUF/SafeTensors source for CondEnc/FSQ with ONNX DiT
+    const char * vae_path;           // VAE GGUF; required for VAE encode and GGML decode
     const char * adapter_path;       // adapter safetensors or directory (NULL to disable)
     float        adapter_scale;      // user scale multiplier
     bool         use_fa;             // flash attention
@@ -29,7 +30,6 @@ struct AceSynthParams {
     int          vae_overlap;        // overlap frames per side
     const char * dump_dir;           // intermediate tensor dump dir (NULL = disabled)
     const char * pp_vae_path;        // PP-VAE GGUF (NULL = no PP-VAE available)
-    const char * onnx_vae_path;      // ONNX VAE decoder path (NULL = not available)
 };
 
 // Output audio buffer. Caller must free with ace_audio_free().

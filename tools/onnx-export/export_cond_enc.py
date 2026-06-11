@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -25,6 +26,49 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+def safetensor_files(model_dir: Path) -> list[Path]:
+    if model_dir.is_file() and model_dir.name.endswith(".safetensors"):
+        return [model_dir]
+
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+        shard_names = sorted(set(payload.get("weight_map", {}).values()))
+        return [model_dir / name for name in shard_names]
+
+    single = model_dir / "model.safetensors"
+    if single.is_file():
+        return [single]
+
+    shards = sorted(model_dir.glob("model-*.safetensors"))
+    if shards:
+        return shards
+
+    raise SystemExit(f"[export_cond_enc] ERROR: No safetensors model files found in {model_dir}")
+
+
+def load_prefixed_tensors(model_dir: Path, prefix: str) -> dict[str, torch.Tensor]:
+    import safetensors
+
+    selected: dict[str, torch.Tensor] = {}
+    for path in safetensor_files(model_dir):
+        with safetensors.safe_open(str(path), framework="pt", device="cpu") as sf:
+            for key in sf.keys():
+                if key.startswith(prefix):
+                    selected[key[len(prefix):]] = sf.get_tensor(key).detach().cpu()
+    return selected
+
+
+def load_tensor(model_dir: Path, name: str) -> torch.Tensor | None:
+    import safetensors
+
+    for path in safetensor_files(model_dir):
+        with safetensors.safe_open(str(path), framework="pt", device="cpu") as sf:
+            if name in sf.keys():
+                return sf.get_tensor(name).detach().cpu()
+    return None
 
 
 class CondEncoderWrapper(nn.Module):
@@ -112,8 +156,8 @@ class CondEncoderWrapperFixed(nn.Module):
     IMPORTANT: The timbre encoder's forward() uses unpack_timbre_embeddings()
     which has data-dependent control flow (refer_audio_order_mask.max().item()).
     torch.export cannot handle this. So we manually invoke the timbre encoder's
-    sub-components: embed_tokens → CLS prepend → transformer layers → norm → 
-    take position 0. This is equivalent for B=1 inference.
+    sub-components: embed_tokens, optional CLS prepend, transformer layers, norm,
+    then take position 0. This is equivalent for B=1 inference.
     
     ONNX inputs:
         text_hidden:  [B, S_text, 1024]  fp16
@@ -124,13 +168,14 @@ class CondEncoderWrapperFixed(nn.Module):
         enc_hidden:   [B, S_total, 2048] fp16 where S_total = S_lyric + 1 + S_text
     """
     
-    def __init__(self, cond_encoder):
+    def __init__(self, cond_encoder, use_timbre_cls: bool):
         super().__init__()
+        self.use_timbre_cls = use_timbre_cls
         self.text_projector = cond_encoder.text_projector
         self.lyric_encoder = cond_encoder.lyric_encoder
         # Extract timbre encoder sub-components for manual invocation
         self.timbre_embed_tokens = cond_encoder.timbre_encoder.embed_tokens
-        self.timbre_special_token = cond_encoder.timbre_encoder.special_token
+        self.timbre_special_token = cond_encoder.timbre_encoder.special_token if use_timbre_cls else None
         self.timbre_norm = cond_encoder.timbre_encoder.norm
         self.timbre_rotary_emb = cond_encoder.timbre_encoder.rotary_emb
         self.timbre_layers = cond_encoder.timbre_encoder.layers
@@ -140,16 +185,17 @@ class CondEncoderWrapperFixed(nn.Module):
         """Run the timbre encoder without unpack_timbre_embeddings.
         
         timbre_feats: [B, S_ref, 64]
-        Returns: [B, 1, hidden_size] — CLS token output
+        Returns: [B, 1, hidden_size] — CLS token output when enabled,
+                 otherwise the first timbre frame output.
         """
         B = timbre_feats.shape[0]
         
         # Project: [B, S_ref, 64] → [B, S_ref, hidden_size]
         inputs_embeds = self.timbre_embed_tokens(timbre_feats)
         
-        # Prepend CLS token: [B, S_ref+1, hidden_size]
-        cls_token = self.timbre_special_token.expand(B, 1, -1)
-        inputs_embeds = torch.cat([cls_token, inputs_embeds], dim=1)
+        if self.use_timbre_cls:
+            cls_token = self.timbre_special_token.expand(B, 1, -1)
+            inputs_embeds = torch.cat([cls_token, inputs_embeds], dim=1)
         
         S = inputs_embeds.shape[1]
         
@@ -173,7 +219,6 @@ class CondEncoderWrapperFixed(nn.Module):
         
         hidden_states = self.timbre_norm(hidden_states)
         
-        # Extract CLS token (position 0): [B, hidden_size]
         timbre_emb = hidden_states[:, 0:1, :]  # [B, 1, hidden_size]
         
         return timbre_emb
@@ -206,8 +251,8 @@ class CondEncoderWrapperFixed(nn.Module):
         return enc_hidden
 
 
-def load_model(model_dir: str, device: str = "cuda", dtype=torch.float32):
-    """Load the AceStep model and extract the condition encoder."""
+def load_model(model_dir: str, device: str = "cuda", dtype=None):
+    dtype = (torch.float16 if os.environ.get("COND_ENC_FP16") == "1" else torch.float32) if dtype is None else dtype
     model_dir = Path(model_dir)
     
     if sys.platform == "win32":
@@ -313,7 +358,10 @@ def load_model(model_dir: str, device: str = "cuda", dtype=torch.float32):
     sys.modules["apg_guidance"] = apg_local
     
     config = AceStepConfig(**config_dict)
-    config._attn_implementation = "sdpa"
+    # PyTorch's ONNX SDPA lowering cannot currently compare symbolic grouped
+    # query dimensions in this encoder path. Eager attention exports as
+    # primitive matmul/softmax ops and preserves dynamic sequence axes.
+    config._attn_implementation = "eager"
     
     # The encoder's Qwen3 sub-models (lyric/timbre) use encoder_hidden_size
     # as their hidden_size. Set it on the config so Qwen3RotaryEmbedding works.
@@ -337,19 +385,20 @@ def load_model(model_dir: str, device: str = "cuda", dtype=torch.float32):
     encoder_config.num_attention_heads = config.encoder_num_attention_heads
     encoder_config.num_key_value_heads = config.encoder_num_key_value_heads
     
-    from modeling_acestep_v15_xl_base import AceStepConditionEncoder
+    import glob
+    import importlib
+    modeling_files = sorted(glob.glob(str(model_dir / "modeling_acestep_v15*.py")))
+    if not modeling_files:
+        raise SystemExit(f"[export_cond_enc] ERROR: No modeling_acestep_v15*.py found in {model_dir}")
+    modeling_module = Path(modeling_files[0]).stem
+    print(f"[export_cond_enc] Using modeling module: {modeling_module}")
+    mod = importlib.import_module(modeling_module)
+    AceStepConditionEncoder = mod.AceStepConditionEncoder
     
     cond_encoder = AceStepConditionEncoder(encoder_config)
     
-    # Load weights — filter to encoder.* prefix
-    from safetensors.torch import load_file
-    st_path = model_dir / "model.safetensors"
-    state_dict = load_file(str(st_path))
-    
-    cond_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("encoder."):
-            cond_state_dict[k[len("encoder."):]] = v
+    # Load only encoder.* tensors; XL checkpoints are sharded.
+    cond_state_dict = load_prefixed_tensors(model_dir, "encoder.")
     
     missing, unexpected = cond_encoder.load_state_dict(cond_state_dict, strict=False)
     if missing:
@@ -368,12 +417,34 @@ def load_model(model_dir: str, device: str = "cuda", dtype=torch.float32):
     return cond_encoder, encoder_config
 
 
-def export_onnx(cond_encoder, config, output_path: str, opset: int = 18):
+def model_uses_timbre_cls(model_dir: str) -> bool:
+    """Detect whether the source timbre encoder actually prepends special_token."""
+    model_dir = Path(model_dir)
+    for path in sorted(model_dir.glob("modeling_acestep_v15*.py")):
+        in_timbre = False
+        in_forward = False
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("class AceStepTimbreEncoder"):
+                in_timbre = True
+                in_forward = False
+                continue
+            if in_timbre and stripped.startswith("class "):
+                break
+            if in_timbre and stripped.startswith("def forward("):
+                in_forward = True
+                continue
+            if in_forward and "self.special_token" in stripped and "torch.cat" in stripped:
+                return not stripped.startswith("#")
+    return False
+
+
+def export_onnx(cond_encoder, config, output_path: str, opset: int = 18, use_timbre_cls: bool = False):
     """Export the condition encoder to ONNX."""
     device = next(cond_encoder.parameters()).device
     dtype = next(cond_encoder.parameters()).dtype
     
-    wrapper = CondEncoderWrapperFixed(cond_encoder)
+    wrapper = CondEncoderWrapperFixed(cond_encoder, use_timbre_cls=use_timbre_cls)
     wrapper.eval()
     
     # Dummy inputs
@@ -427,17 +498,14 @@ def export_onnx(cond_encoder, config, output_path: str, opset: int = 18):
 
 def export_null_cond_emb(model_dir: str, output_path: str):
     """Export null_condition_emb as raw float32 binary."""
-    from safetensors.torch import load_file
     model_dir = Path(model_dir)
-    st_path = model_dir / "model.safetensors"
-    
-    state_dict = load_file(str(st_path))
     key = "null_condition_emb"
-    if key not in state_dict:
+    tensor = load_tensor(model_dir, key)
+    if tensor is None:
         print(f"[export_cond_enc] WARNING: {key} not found, skipping")
         return
     
-    vec = state_dict[key].detach().cpu().float().numpy().flatten()
+    vec = tensor.float().numpy().flatten()
     with open(output_path, "wb") as f:
         f.write(struct.pack("<I", len(vec)))
         f.write(vec.tobytes())
@@ -445,7 +513,7 @@ def export_null_cond_emb(model_dir: str, output_path: str):
     print(f"[export_cond_enc] null_condition_emb: [{len(vec)}] -> {output_path} ({len(vec)*4} bytes)")
 
 
-def verify_onnx(onnx_path: str, cond_encoder, config):
+def verify_onnx(onnx_path: str, cond_encoder, config, use_timbre_cls: bool = False):
     """Verify ONNX output matches PyTorch."""
     try:
         import onnxruntime as ort
@@ -455,7 +523,7 @@ def verify_onnx(onnx_path: str, cond_encoder, config):
     
     device = next(cond_encoder.parameters()).device
     dtype = next(cond_encoder.parameters()).dtype
-    wrapper = CondEncoderWrapperFixed(cond_encoder)
+    wrapper = CondEncoderWrapperFixed(cond_encoder, use_timbre_cls=use_timbre_cls)
     wrapper.eval()
     
     B, S_text, S_lyric, S_ref = 1, 32, 64, 8
@@ -493,6 +561,8 @@ def main():
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--timbre-cls", choices=["auto", "on", "off"], default="auto",
+                        help="Whether to prepend timbre special_token; auto follows source modeling file")
     args = parser.parse_args()
     
     if args.output is None:
@@ -505,9 +575,14 @@ def main():
     
     # Load model
     cond_encoder, config = load_model(args.model_dir, device=args.device)
+    if args.timbre_cls == "auto":
+        use_timbre_cls = model_uses_timbre_cls(args.model_dir)
+    else:
+        use_timbre_cls = args.timbre_cls == "on"
+    print(f"[export_cond_enc] timbre CLS: {'on' if use_timbre_cls else 'off'}")
     
     # Export ONNX
-    export_onnx(cond_encoder, config, args.output, opset=args.opset)
+    export_onnx(cond_encoder, config, args.output, opset=args.opset, use_timbre_cls=use_timbre_cls)
     
     # Export null_condition_emb
     null_cond_path = os.path.join(output_dir, "null_condition_emb.bin")
@@ -515,7 +590,7 @@ def main():
     
     # Verify
     if args.verify:
-        verify_onnx(args.output, cond_encoder, config)
+        verify_onnx(args.output, cond_encoder, config, use_timbre_cls=use_timbre_cls)
     
     print("[export_cond_enc] Done!")
 

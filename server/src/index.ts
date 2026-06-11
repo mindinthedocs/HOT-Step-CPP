@@ -35,7 +35,7 @@ import uploadRoutes from './routes/upload.js';
 import supersepRoutes from './routes/supersep.js';
 import settingsRoutes from './routes/settings.js';
 import modelManagerRoutes from './routes/modelManager.js';
-import stemStudioRoutes from './routes/stemStudio.js';
+import trtBundleRoutes from './routes/trtBundles.js'; import stemStudioRoutes from './routes/stemStudio.js';
 import assistantRoutes from './routes/assistant.js';
 import pluginRoutes from './routes/plugins.js';
 import inspireRoutes from './routes/inspire.js';
@@ -85,7 +85,7 @@ app.use('/api/upload', uploadRoutes);
 app.use('/api/supersep', supersepRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/model-manager', modelManagerRoutes);
-app.use('/api/stem-studio', stemStudioRoutes);
+app.use('/api/trt-bundles', trtBundleRoutes); app.use('/api/stem-studio', stemStudioRoutes);
 app.use('/api/assistant', assistantRoutes);
 app.use('/api/plugins', pluginRoutes);
 app.use('/api/inspire', inspireRoutes);
@@ -189,15 +189,6 @@ function startAceServer(): ChildProcess | null {
   }
   if (config.aceServer.vaeOverlap) {
     args.push('--vae-overlap', String(config.aceServer.vaeOverlap));
-  }
-
-  // Add ONNX model directory for ORT/TRT VAE (if it exists and contains .onnx files)
-  if (config.aceServer.onnxDir && fs.existsSync(config.aceServer.onnxDir)) {
-    const hasOnnx = fs.readdirSync(config.aceServer.onnxDir).some(f => f.endsWith('.onnx'));
-    if (hasOnnx) {
-      args.push('--onnx-dir', config.aceServer.onnxDir);
-      console.log(`[Server] ONNX models: ${config.aceServer.onnxDir}`);
-    }
   }
 
   console.log(`[Server] Starting ace-server: ${path.basename(exe)}`);

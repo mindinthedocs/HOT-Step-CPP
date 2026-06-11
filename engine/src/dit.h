@@ -587,6 +587,22 @@ static void dit_ggml_free(DiTGGML * m) {
 // Used by the orchestrator to keep patch_size, in_channels, out_channels
 // accessible during text encoding while the DiT itself is not yet loaded.
 // Returns true on success, false on I/O or missing key.
+static void dit_ggml_load_default_acestep_v15_xl_config(DiTGGMLConfig * cfg) {
+    if (!cfg) return;
+    cfg->n_layers          = 32;
+    cfg->hidden_size       = 2560;
+    cfg->intermediate_size = 9728;
+    cfg->n_heads           = 32;
+    cfg->n_kv_heads        = 8;
+    cfg->head_dim          = 128;
+    cfg->in_channels       = 192;
+    cfg->out_channels      = 64;
+    cfg->patch_size        = 2;
+    cfg->sliding_window    = 128;
+    cfg->rope_theta        = 1000000.0f;
+    cfg->rms_norm_eps      = 1e-6f;
+}
+
 static bool dit_ggml_load_config(DiTGGMLConfig * cfg, const char * path) {
     bool is_st = !dit_ends_with_gguf(path);
 
@@ -596,8 +612,14 @@ static bool dit_ggml_load_config(DiTGGMLConfig * cfg, const char * path) {
         std::string sidecar_dir = dit_sidecar_dir(path);
         std::string cfg_path = sidecar_dir + WS_SEP + "config.json";
         if (!config_json_load_dit(cfg, cfg_path.c_str())) {
-            fprintf(stderr, "[Load] FATAL: cannot read config from %s\n", cfg_path.c_str());
-            return false;
+            if (dit_ends_with_onnx(path)) {
+                dit_ggml_load_default_acestep_v15_xl_config(cfg);
+                fprintf(stderr,
+                        "[Load] DiT ONNX runtime bundle has no config.json; using built-in ACE-Step v1.5 XL runtime config\n");
+            } else {
+                fprintf(stderr, "[Load] FATAL: cannot read config from %s\n", cfg_path.c_str());
+                return false;
+            }
         }
     } else {
         GGUFModel gf;

@@ -135,6 +135,25 @@ static bool str_ends_with(const std::string & s, const char * suffix) {
     return s.size() >= slen && s.compare(s.size() - slen, slen, suffix) == 0;
 }
 
+static std::string registry_classify_onnx_name(const std::string & name) {
+    std::string lower = name;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "lm.onnx" || lower.find("lm_") == 0 || lower.find("lm-") == 0) {
+        return "LM";
+    }
+    if (lower == "dit.onnx" || lower.find("dit_") == 0 || lower.find("dit-") == 0) {
+        return "DiT";
+    }
+    if (lower == "vae.onnx" || lower.find("vae_") == 0 || lower.find("vae-") == 0) {
+        return "VAE";
+    }
+    if (lower == "text_encoder.onnx" || lower.find("text_enc") == 0 ||
+        lower.find("text-enc") == 0 || lower.find("text_encoder") == 0) {
+        return "Text-Enc";
+    }
+    return "";
+}
+
 #ifdef _WIN32
 
 // scan a directory for files matching a pattern (Windows)
@@ -229,6 +248,52 @@ static bool registry_is_file(const char * path) {
 #    define REGISTRY_SEP "/"
 #endif
 
+static void registry_add_onnx_entry(ModelRegistry * reg,
+                                    const std::string & type,
+                                    const std::string & name,
+                                    const std::string & path) {
+    ModelEntry entry = { name, path };
+    if (type == "LM") {
+        reg->lm.push_back(entry);
+    } else if (type == "DiT") {
+        reg->dit.push_back(entry);
+    } else if (type == "Text-Enc") {
+        reg->text_enc.push_back(entry);
+    } else if (type == "VAE") {
+        reg->vae.push_back(entry);
+    }
+}
+
+static int registry_scan_onnx_bundle_dir(ModelRegistry * reg,
+                                         const std::string & entry_prefix,
+                                         const std::string & dir_path) {
+    std::vector<std::string> files;
+    registry_list_dir(dir_path.c_str(), &files);
+    std::sort(files.begin(), files.end());
+
+    int count = 0;
+    for (const auto & f : files) {
+        if (!str_ends_with(f, ".onnx")) {
+            continue;
+        }
+        std::string type = registry_classify_onnx_name(f);
+        if (type.empty()) {
+            continue;
+        }
+        bool primary =
+            (type == "DiT" && f == "dit.onnx") ||
+            (type == "LM" && f == "lm_full.onnx") ||
+            (type == "Text-Enc" && f == "text_encoder.onnx") ||
+            (type == "VAE" && (f == "vae_decoder.onnx" || f == "vae.onnx"));
+        std::string entry_name = primary ? entry_prefix : (entry_prefix + "/" + f);
+        registry_add_onnx_entry(reg, type, entry_name, dir_path + REGISTRY_SEP + f);
+        fprintf(stderr, "[Registry] %s -> %s (ONNX bundle: %s)\n",
+                entry_name.c_str(), type.c_str(), f.c_str());
+        count++;
+    }
+    return count;
+}
+
 // scan a directory for .gguf files, classify each by architecture.
 // returns true if at least one model was found.
 static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
@@ -297,26 +362,23 @@ static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
             continue;
         }
 
-        std::string lower = fname;
-        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-
         std::string full = std::string(models_dir) + REGISTRY_SEP + fname;
         ModelEntry  entry = { fname, full };
+        std::string type  = registry_classify_onnx_name(fname);
 
-        if (lower.find("dit_") == 0 || lower.find("dit-") == 0) {
+        if (type == "DiT") {
             reg->dit.push_back(entry);
             fprintf(stderr, "[Registry] %s -> DiT (ONNX)\n", fname.c_str());
             count++;
-        } else if (lower.find("vae_") == 0 || lower.find("vae-") == 0 ||
-                   lower.find("scragvae_") == 0 || lower.find("scragvae-") == 0) {
+        } else if (type == "VAE") {
             reg->vae.push_back(entry);
             fprintf(stderr, "[Registry] %s -> VAE (ONNX)\n", fname.c_str());
             count++;
-        } else if (lower.find("lm_") == 0 || lower.find("lm-") == 0) {
+        } else if (type == "LM") {
             reg->lm.push_back(entry);
             fprintf(stderr, "[Registry] %s -> LM (ONNX)\n", fname.c_str());
             count++;
-        } else if (lower.find("text_enc") == 0 || lower.find("text-enc") == 0) {
+        } else if (type == "Text-Enc") {
             reg->text_enc.push_back(entry);
             fprintf(stderr, "[Registry] %s -> Text-Enc (ONNX)\n", fname.c_str());
             count++;
@@ -389,69 +451,89 @@ static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
             continue;
         }
 
-        // Look for .onnx files in this subdirectory
+        // Register each recognized ONNX file in this subdirectory. Runtime
+        // bundles contain dit.onnx plus sibling text/VAE files, so choosing an
+        // arbitrary first .onnx would miss the DiT in some directory orders.
         std::vector<std::string> sub_files;
         registry_list_dir(dir_path.c_str(), &sub_files);
-        std::string onnx_name;
+        std::sort(sub_files.begin(), sub_files.end());
+        int onnx_count = 0;
         for (const auto & f : sub_files) {
-            if (str_ends_with(f, ".onnx")) {
-                onnx_name = f;
-                break;
+            if (!str_ends_with(f, ".onnx")) {
+                continue;
             }
-        }
-        if (onnx_name.empty()) {
-            continue;
-        }
-
-        // Classify: try ONNX filename first, then directory name
-        std::string lower_onnx = onnx_name;
-        std::transform(lower_onnx.begin(), lower_onnx.end(), lower_onnx.begin(), ::tolower);
-        std::string lower_dir = dname;
-        std::transform(lower_dir.begin(), lower_dir.end(), lower_dir.begin(), ::tolower);
-
-        std::string type;
-        // Check ONNX filename prefix
-        if (lower_onnx.find("lm_") == 0 || lower_onnx.find("lm-") == 0) {
-            type = "LM";
-        } else if (lower_onnx.find("dit_") == 0 || lower_onnx.find("dit-") == 0) {
-            type = "DiT";
-        } else if (lower_onnx.find("vae_") == 0 || lower_onnx.find("vae-") == 0) {
-            type = "VAE";
-        } else if (lower_onnx.find("text_enc") == 0 || lower_onnx.find("text-enc") == 0) {
-            type = "Text-Enc";
-        }
-        // Fallback: check directory name prefix
-        if (type.empty()) {
-            if (lower_dir.find("lm") == 0) {
-                type = "LM";
-            } else if (lower_dir.find("dit") == 0) {
-                type = "DiT";
-            } else if (lower_dir.find("vae") == 0) {
-                type = "VAE";
-            } else if (lower_dir.find("text") == 0 || lower_dir.find("enc") == 0) {
-                type = "Text-Enc";
+            std::string type = registry_classify_onnx_name(f);
+            if (type.empty()) {
+                continue;
             }
-        }
 
-        if (type.empty()) {
+            std::string entry_name = (type == "DiT") ? dname : (dname + "/" + f);
+            ModelEntry entry = { entry_name, dir_path + REGISTRY_SEP + f };
+            if (type == "LM") {
+                reg->lm.push_back(entry);
+            } else if (type == "DiT") {
+                reg->dit.push_back(entry);
+            } else if (type == "Text-Enc") {
+                reg->text_enc.push_back(entry);
+            } else if (type == "VAE") {
+                reg->vae.push_back(entry);
+            }
+            fprintf(stderr, "[Registry] %s -> %s (ONNX: %s)\n", entry_name.c_str(), type.c_str(), f.c_str());
+            onnx_count++;
+            count++;
+        }
+        if (onnx_count == 0) {
             fprintf(stderr, "[Registry] WARNING: skipping %s/ (unrecognized ONNX directory)\n", dname.c_str());
+        }
+    }
+
+    // Scan structured prebuilt bundle roots:
+    //   models/dit/<bundle>/dit.onnx
+    //   models/embedding/<bundle>/text_encoder.onnx
+    //   models/lm/<bundle>/lm_full.onnx
+    //   models/vae/<bundle>/vae_decoder.onnx
+    const char * bundle_roots[] = { "dit", "embedding", "lm", "vae" };
+    for (const char * root_name : bundle_roots) {
+        std::string root_path = std::string(models_dir) + REGISTRY_SEP + root_name;
+        std::vector<std::string> bundle_dirs;
+        registry_list_subdirs(root_path.c_str(), &bundle_dirs);
+        if (bundle_dirs.empty()) {
             continue;
         }
-
-        // ModelEntry.path is the directory path. The TRT runtime finds the .onnx inside.
-        ModelEntry entry = { dname, dir_path };
-        if (type == "LM") {
-            reg->lm.push_back(entry);
-        } else if (type == "DiT") {
-            reg->dit.push_back(entry);
-        } else if (type == "Text-Enc") {
-            reg->text_enc.push_back(entry);
-        } else if (type == "VAE") {
-            reg->vae.push_back(entry);
+        std::sort(bundle_dirs.begin(), bundle_dirs.end());
+        for (const auto & bundle_name : bundle_dirs) {
+            std::string bundle_path = root_path + REGISTRY_SEP + bundle_name;
+            std::string entry_prefix = std::string(root_name) + "/" + bundle_name;
+            count += registry_scan_onnx_bundle_dir(reg, entry_prefix, bundle_path);
         }
+    }
 
-        fprintf(stderr, "[Registry] %s/ -> %s (ONNX: %s)\n", dname.c_str(), type.c_str(), onnx_name.c_str());
-        count++;
+    // Scan native TRT bundles: models/trt-bundles/<name>/ each carrying a
+    // manifest.json + dit.onnx (+ text_encoder.onnx). Registering the bundle's
+    // dit.onnx as a DiT named <name> and text_encoder.onnx as a Text-Enc named
+    // <name> lets a synth request select it via synth_model="<name>"; the synth
+    // path detects the sibling manifest.json and routes DiT+TextEnc+CondEnc
+    // through the TRT engines (the registered ONNX paths provide the bundle dir
+    // for manifest detection and the BPE tokenizer sidecars). Without this the
+    // generic subdir scan skips trt-bundles/ — its .onnx files live one level
+    // deeper, in trt-bundles/<name>/ — so the bundle would show in /props but
+    // not be selectable as a DiT.
+    {
+        std::string trt_root = std::string(models_dir) + REGISTRY_SEP + "trt-bundles";
+        std::vector<std::string> bundle_dirs;
+        registry_list_subdirs(trt_root.c_str(), &bundle_dirs);
+        std::sort(bundle_dirs.begin(), bundle_dirs.end());
+        for (const auto & bundle_name : bundle_dirs) {
+            std::string bundle_path   = trt_root + REGISTRY_SEP + bundle_name;
+            std::string manifest_path = bundle_path + REGISTRY_SEP + "manifest.json";
+            std::string dit_onnx_path = bundle_path + REGISTRY_SEP + "dit.onnx";
+            if (!registry_is_file(manifest_path.c_str()) || !registry_is_file(dit_onnx_path.c_str())) {
+                continue;  // not a complete TRT bundle (full manifest validation lives in synth-load)
+            }
+            // Registers dit.onnx (DiT) and text_encoder.onnx (Text-Enc) under the
+            // bundle name; cond_encoder.onnx is unclassified and skipped.
+            count += registry_scan_onnx_bundle_dir(reg, bundle_name, bundle_path);
+        }
     }
 
     return count > 0;

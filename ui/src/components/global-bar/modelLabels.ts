@@ -11,6 +11,10 @@ export function formatDitModel(filename: string): string {
   if (filename === 'dit_fp8.onnx') return 'DiT XL FP8 (TensorRT)';
   if (filename === 'dit_bf16.onnx') return 'DiT XL BF16 (TensorRT)';
 
+  // TRT bundles: acestep-v15-2b-<variant> -> "TRT 2B q8map-fp16"
+  const trtMatch = filename.match(/^acestep-v15-2b-(.+)$/);
+  if (trtMatch) return `TRT 2B ${trtMatch[1]}`;
+
   const name = filename.replace(/\.gguf$/i, '');
 
   // Extract quant suffix (last segment after final dash, e.g. BF16, Q8_0, Q4_K_M)

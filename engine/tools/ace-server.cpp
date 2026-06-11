@@ -12,12 +12,13 @@
 // Running jobs are never evicted.
 //
 // Models are discovered by scanning --models directory at startup
-// (reads GGUF metadata only, no weights loaded).
+// (reads lightweight GGUF/SafeTensors/ONNX metadata only, no weights loaded).
 // Each request loads the model, executes, and frees it. No model persists
 // in VRAM between requests unless --keep-loaded is set. GPU access is
 // serialized by the single worker thread (no mutex needed).
 //
-// Available models are classified by their GGUF general.architecture:
+// Available models are classified from GGUF architecture, SafeTensors
+// sidecars, or ONNX runtime-bundle filenames:
 //   acestep-lm       -> lm bucket
 //   acestep-dit      -> dit bucket
 //   acestep-text-enc -> text-enc bucket (singleton, first entry used)
@@ -29,8 +30,10 @@
 //   /understand LM + DiT + VAE
 
 #include "audio-io.h"
+#include "lua-plugin-registry.h"
 #include "model-registry.h"
 #include "model-store.h"
+#include "trt-bundle-manifest.h"
 #include "pipeline-lm.h"
 #include "pipeline-synth.h"
 #include "pipeline-understand.h"
@@ -546,6 +549,117 @@ static std::string resolve_name(const std::vector<ModelEntry> & bucket,
     return "";
 }
 
+static bool entry_is_onnx(const ModelEntry * entry) {
+    return entry && str_ends_with(entry->path, ".onnx");
+}
+
+static bool server_file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static std::string server_dirname(const std::string & path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    if (pos == 0) {
+        return path.substr(0, 1);
+    }
+    return path.substr(0, pos);
+}
+
+// TRT-bundle detection. A directory is a native TRT runtime bundle iff it
+// carries a manifest.json (partner §3.5 / §4.4). This is the SOLE TRT-bundle
+// detector; the legacy onnx_dit_has_synth_bundle() file-list probe is retired.
+static bool onnx_dit_has_trt_bundle(const ModelEntry & entry) {
+    if (!str_ends_with(entry.path, ".onnx")) {
+        return false;
+    }
+    return trt_bundle_has_manifest(server_dirname(entry.path));
+}
+
+static bool onnx_dit_has_sibling_vae(const ModelEntry * entry) {
+    if (!entry || !str_ends_with(entry->path, ".onnx")) {
+        return false;
+    }
+    return server_file_exists(server_dirname(entry->path) + REGISTRY_SEP + "vae_decoder.onnx");
+}
+
+static bool bucket_has_non_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (!str_ends_with(entry.path, ".onnx")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const ModelEntry * bucket_first_non_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (!str_ends_with(entry.path, ".onnx")) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static const ModelEntry * bucket_first_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (str_ends_with(entry.path, ".onnx")) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static const ModelEntry * resolve_native_entry(const std::vector<ModelEntry> & bucket,
+                                               const std::string &             requested,
+                                               const std::string &             loaded,
+                                               std::string &                   resolved_name) {
+    if (!requested.empty()) {
+        resolved_name = requested;
+        const ModelEntry * entry = registry_find(bucket, resolved_name.c_str());
+        if (!entry || entry_is_onnx(entry)) {
+            return nullptr;
+        }
+        return entry;
+    }
+    if (!loaded.empty()) {
+        const ModelEntry * entry = registry_find(bucket, loaded.c_str());
+        if (entry && !entry_is_onnx(entry)) {
+            resolved_name = loaded;
+            return entry;
+        }
+    }
+    const ModelEntry * entry = bucket_first_non_onnx(bucket);
+    resolved_name = entry ? entry->name : "";
+    return entry;
+}
+
+static bool registry_has_compatible_synth(const ModelRegistry & registry) {
+    bool have_onnx_dit = false;
+    bool have_native_dit = false;
+    for (const auto & entry : registry.dit) {
+        if (str_ends_with(entry.path, ".onnx")) {
+            if (onnx_dit_has_trt_bundle(entry) &&
+                !registry.text_enc.empty()) {
+                have_onnx_dit = true;
+            }
+        } else {
+            have_native_dit = true;
+        }
+    }
+    return have_onnx_dit ||
+           (have_native_dit &&
+            bucket_has_non_onnx(registry.text_enc) &&
+            bucket_has_non_onnx(registry.vae));
+}
+
 // LM worker: generates metadata + lyrics + codes, stores JSON result in job.
 static void lm_worker(std::shared_ptr<Job> job, AceRequest ace_req, int lm_batch_size, int mode) {
     if (job->cancel.load()) {
@@ -713,27 +827,62 @@ static void synth_worker(std::shared_ptr<Job>    job,
         job->status.store(JobStatus::FAILED);
         return;
     }
-    if (g_registry.text_enc.empty() || g_registry.vae.empty()) {
+    const bool dit_is_onnx = entry_is_onnx(dit);
+    const ModelEntry * text = dit_is_onnx ? bucket_first_onnx(g_registry.text_enc) : bucket_first_non_onnx(g_registry.text_enc);
+    if (dit_is_onnx && !onnx_dit_has_trt_bundle(*dit)) {
+        fprintf(stderr, "[Server] Selected ONNX DiT bundle has no manifest.json (not a TRT bundle): %s\n",
+                dit->path.c_str());
+        free(src_interleaved);
+        free(ref_interleaved);
+        job->status.store(JobStatus::FAILED);
+        return;
+    }
+    if (!dit_is_onnx && (!text || g_registry.vae.empty())) {
         fprintf(stderr, "[Server] Missing Text-Enc or VAE in registry\n");
         free(src_interleaved);
         free(ref_interleaved);
         job->status.store(JobStatus::FAILED);
         return;
     }
-    std::string        vae_name = resolve_name(g_registry.vae, ace_reqs[0].vae, g_loaded_vae);
-    const ModelEntry * vae      = registry_find(g_registry.vae, vae_name.c_str());
-    if (!vae) {
+    if (dit_is_onnx && !text) {
+        fprintf(stderr, "[Server] Missing ONNX Text-Enc bundle in registry\n");
+        free(src_interleaved);
+        free(ref_interleaved);
+        job->status.store(JobStatus::FAILED);
+        return;
+    }
+    if (!dit_is_onnx && entry_is_onnx(text)) {
+        fprintf(stderr, "[Server] GGUF/SafeTensors DiT requires GGUF/SafeTensors text/VAE models\n");
+        free(src_interleaved);
+        free(ref_interleaved);
+        job->status.store(JobStatus::FAILED);
+        return;
+    }
+    std::string        vae_name;
+    const ModelEntry * vae = nullptr;
+    if (!dit_is_onnx && ace_reqs[0].vae.empty() && g_loaded_vae.empty()) {
+        vae = bucket_first_non_onnx(g_registry.vae);
+        vae_name = vae ? vae->name : "";
+    } else if (dit_is_onnx && ace_reqs[0].vae.empty() && g_loaded_vae.empty() && onnx_dit_has_sibling_vae(dit)) {
+        vae = nullptr;
+    } else if (!g_registry.vae.empty() || !ace_reqs[0].vae.empty() || !g_loaded_vae.empty()) {
+        vae_name = resolve_name(g_registry.vae, ace_reqs[0].vae, g_loaded_vae);
+        vae      = registry_find(g_registry.vae, vae_name.c_str());
+    }
+    if (!vae && (!dit_is_onnx || !vae_name.empty())) {
         fprintf(stderr, "[Server] VAE not found: %s\n", vae_name.c_str());
         free(src_interleaved);
         free(ref_interleaved);
         job->status.store(JobStatus::FAILED);
         return;
     }
-
     AceSynthParams p    = g_synth_params;
-    p.text_encoder_path = g_registry.text_enc[0].path.c_str();
+    p.text_encoder_path = text ? text->path.c_str() : nullptr;
     p.dit_path          = dit->path.c_str();
-    p.vae_path          = vae->path.c_str();
+    p.vae_path          = nullptr;
+    if (vae && !entry_is_onnx(vae)) {
+        p.vae_path = vae->path.c_str();
+    }
     p.adapter_path      = nullptr;
     p.adapter_scale     = 1.0f;
     if (!ace_reqs[0].adapter.empty()) {
@@ -748,7 +897,8 @@ static void synth_worker(std::shared_ptr<Job>    job,
         p.adapter_path  = adapter->path.c_str();
         p.adapter_scale = ace_reqs[0].adapter_scale;
     }
-    fprintf(stderr, "[Server] Loading synth: DiT=%s VAE=%s%s%s\n", dit_name.c_str(), vae_name.c_str(),
+    fprintf(stderr, "[Server] Loading synth: DiT=%s VAE=%s%s%s\n", dit_name.c_str(),
+            vae ? vae_name.c_str() : "(onnx auto)",
             ace_reqs[0].adapter.empty() ? "" : " Adapter=", ace_reqs[0].adapter.c_str());
 
     AceSynth * ctx = ace_synth_load(g_store, &p);
@@ -881,8 +1031,8 @@ static void synth_worker(std::shared_ptr<Job>    job,
 // Batch size = number of JSON objects (after synth_batch_size expansion, clamped to 9).
 // Metadata (seed, duration, etc) is already in the request JSON from /lm.
 static void handle_synth(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.dit.empty() || g_registry.text_enc.empty() || g_registry.vae.empty()) {
-        json_error(res, 501, "No synth models in registry (need dit + text-encoder + vae)");
+    if (!registry_has_compatible_synth(g_registry)) {
+        json_error(res, 501, "No compatible synth pipeline in registry (need complete ONNX DiT runtime bundle, or GGUF/SafeTensors DiT + text-encoder + VAE)");
         return;
     }
 
@@ -1049,16 +1199,17 @@ static void understand_worker(std::shared_ptr<Job> job,
         return;
     }
 
-    // Resolve LM + DiT (the DiT path carries the tokenizer weights) + VAE.
-    std::string        lm_name   = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
-    std::string        dit_name  = resolve_name(g_registry.dit, ace_req.synth_model, g_loaded_dit);
-    std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
+    // Resolve LM + native DiT/VAE. Understand tokenizes with native FSQ
+    // weights and needs a native VAE encoder, not ONNX runtime-bundle entries.
+    std::string        lm_name = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
+    std::string        dit_name;
+    std::string        vae_name;
     const ModelEntry * lm_entry  = registry_find(g_registry.lm, lm_name.c_str());
-    const ModelEntry * dit       = registry_find(g_registry.dit, dit_name.c_str());
-    const ModelEntry * vae_entry = registry_find(g_registry.vae, vae_name.c_str());
+    const ModelEntry * dit       = resolve_native_entry(g_registry.dit, ace_req.synth_model, g_loaded_und_dit, dit_name);
+    const ModelEntry * vae_entry = resolve_native_entry(g_registry.vae, ace_req.vae, g_loaded_vae, vae_name);
     if (!lm_entry || !dit || !vae_entry) {
-        fprintf(stderr, "[Server] LM, DiT or VAE not found: lm=%s dit=%s vae=%s\n", lm_name.c_str(), dit_name.c_str(),
-                vae_name.c_str());
+        fprintf(stderr, "[Server] LM, native DiT or native VAE not found: lm=%s dit=%s vae=%s\n",
+                lm_name.c_str(), dit_name.c_str(), vae_name.c_str());
         free(src_interleaved);
         job->status.store(JobStatus::FAILED);
         return;
@@ -1118,8 +1269,8 @@ static void understand_worker(std::shared_ptr<Job> job,
 // returns: JSON {"id":"N"} immediately. Result is multipart/mixed of one
 // JSON part and one optional latent part.
 static void handle_understand(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.lm.empty() || g_registry.dit.empty() || g_registry.vae.empty()) {
-        json_error(res, 501, "Understand requires LM, DiT and VAE models");
+    if (g_registry.lm.empty() || !bucket_first_non_onnx(g_registry.dit) || !bucket_first_non_onnx(g_registry.vae)) {
+        json_error(res, 501, "Understand requires LM plus GGUF/SafeTensors DiT and VAE models");
         return;
     }
 
@@ -1224,10 +1375,10 @@ static void decode_worker(std::shared_ptr<Job> job,
         return;
     }
 
-    std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
-    const ModelEntry * vae_entry = registry_find(g_registry.vae, vae_name.c_str());
+    std::string        vae_name;
+    const ModelEntry * vae_entry = resolve_native_entry(g_registry.vae, ace_req.vae, g_loaded_vae, vae_name);
     if (!vae_entry) {
-        fprintf(stderr, "[Server] decode: VAE not found: %s\n", vae_name.c_str());
+        fprintf(stderr, "[Server] decode: native VAE not found: %s\n", vae_name.c_str());
         job->status.store(JobStatus::FAILED);
         return;
     }
@@ -1308,10 +1459,10 @@ static void encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, float * 
         return;
     }
 
-    std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
-    const ModelEntry * vae_entry = registry_find(g_registry.vae, vae_name.c_str());
+    std::string        vae_name;
+    const ModelEntry * vae_entry = resolve_native_entry(g_registry.vae, ace_req.vae, g_loaded_vae, vae_name);
     if (!vae_entry) {
-        fprintf(stderr, "[Server] encode: VAE not found: %s\n", vae_name.c_str());
+        fprintf(stderr, "[Server] encode: native VAE not found: %s\n", vae_name.c_str());
         job->status.store(JobStatus::FAILED);
         return;
     }
@@ -1380,8 +1531,8 @@ static void encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, float * 
 // audio was sent, or audio/mpeg|audio/wav when src_latents was sent. No
 // echo of the uploaded side: the client already holds it.
 static void handle_vae(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.vae.empty()) {
-        json_error(res, 501, "VAE endpoint requires a VAE in the registry");
+    if (!bucket_first_non_onnx(g_registry.vae)) {
+        json_error(res, 501, "VAE endpoint requires a GGUF/SafeTensors VAE in the registry");
         return;
     }
     if (!req.is_multipart_form_data()) {
@@ -1574,7 +1725,7 @@ static void usage(const char * prog) {
             "Usage: %s --models <dir> [options]\n"
             "\n"
             "Required:\n"
-            "  --models <dir>          Directory of GGUF model files\n"
+            "  --models <dir>          Directory of GGUF, SafeTensors, or ONNX runtime-bundle artifacts\n"
             "\n"
             "Adapter:\n"
             "  --adapters <dir>        Directory of adapters\n"
@@ -1669,10 +1820,12 @@ int main(int argc, char ** argv) {
     // stderr capture for SSE /logs (must be after arg parsing so --help prints directly)
     LogCapture log_capture;
 
-    // scan models directory (reads GGUF metadata only)
+    PluginRegistry::instance().init_from_executable(argv[0]);
+
+    // scan models directory (reads lightweight GGUF/SafeTensors/ONNX metadata only)
     fprintf(stderr, "[Server] Scanning models in %s\n", models_dir);
     if (!registry_scan(&g_registry, models_dir)) {
-        fprintf(stderr, "[Server] ERROR: no GGUF models found in %s\n", models_dir);
+        fprintf(stderr, "[Server] ERROR: no models found in %s\n", models_dir);
         return 1;
     }
 
@@ -1683,29 +1836,19 @@ int main(int argc, char ** argv) {
     }
 
     // validate pipeline
-    bool have_lm    = !g_registry.lm.empty();
-    bool have_dit   = !g_registry.dit.empty();
-    bool have_enc   = !g_registry.text_enc.empty();
-    bool have_vae   = !g_registry.vae.empty();
-    bool have_synth = have_dit && have_enc && have_vae;
+    bool have_lm     = !g_registry.lm.empty();
+    bool have_dit    = !g_registry.dit.empty();
+    bool have_enc    = !g_registry.text_enc.empty();
+    bool have_vae    = !g_registry.vae.empty();
+    bool have_synth  = registry_has_compatible_synth(g_registry);
 
     // partial synth: some components found but pipeline incomplete
     if (!have_synth && (have_dit || have_enc || have_vae)) {
-        char missing[64];
-        int  n = 0;
-        if (!have_dit) {
-            n += snprintf(missing + n, sizeof(missing) - n, "%sDiT", n ? ", " : "");
-        }
-        if (!have_enc) {
-            n += snprintf(missing + n, sizeof(missing) - n, "%sText-Enc", n ? ", " : "");
-        }
-        if (!have_vae) {
-            n += snprintf(missing + n, sizeof(missing) - n, "%sVAE", n ? ", " : "");
-        }
+        const char * need = "need complete ONNX DiT runtime bundle, or GGUF/SafeTensors DiT + GGUF/SafeTensors text-encoder + GGUF/SafeTensors VAE";
         if (have_lm) {
-            fprintf(stderr, "[Server] WARNING: /synth unavailable, missing: %s\n", missing);
+            fprintf(stderr, "[Server] WARNING: /synth unavailable: %s\n", need);
         } else {
-            fprintf(stderr, "[Server] ERROR: no usable pipeline, synth missing: %s\n", missing);
+            fprintf(stderr, "[Server] ERROR: no usable pipeline; %s\n", need);
             return 1;
         }
     }
@@ -1728,7 +1871,7 @@ int main(int argc, char ** argv) {
     g_und_params.vae_chunk   = g_synth_params.vae_chunk;    // share --vae-chunk with /synth
     g_und_params.vae_overlap = g_synth_params.vae_overlap;  // share --vae-overlap with /synth
 
-    bool have_understand = have_lm && have_dit && have_vae;
+    bool have_understand = have_lm && bucket_first_non_onnx(g_registry.dit) && bucket_first_non_onnx(g_registry.vae);
 
     // central store: one policy for the whole server lifetime. STRICT keeps
     // at most one GPU module resident at a time; --keep-loaded flips it to

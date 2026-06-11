@@ -491,12 +491,18 @@ def main():
     parser.add_argument("--output", default=None,
                         help="Output directory (default: models/onnx/lm-<name>/)")
     parser.add_argument("--opset", type=int, default=18)
-    parser.add_argument("--device", default="cuda",
+    parser.add_argument("--device", default="cpu",
                         help="Device for export (cuda or cpu)")
+    parser.add_argument("--low-memory-export", dest="low_memory_export", action="store_true", default=True,
+                        help="Load weights with low CPU memory defaults before export (default)")
+    parser.add_argument("--no-low-memory-export", dest="low_memory_export", action="store_false",
+                        help="Use the legacy eager loader")
     parser.add_argument("--verify", action="store_true",
                         help="Verify ONNX output against PyTorch")
     parser.add_argument("--no-rename", action="store_true",
                         help="Skip SHA-256 weight renaming")
+    parser.add_argument("--rename", action="store_true",
+                        help="Force SHA-256 weight renaming even with --low-memory-export")
     parser.add_argument("--full-only", action="store_true",
                         help="Only export full-vocab model")
     parser.add_argument("--partial-only", action="store_true",
@@ -515,19 +521,25 @@ def main():
     config = AutoConfig.from_pretrained(args.model_dir)
     config._attn_implementation = "sdpa"  # Required for ONNX (no flash attention)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_dir,
-        config=config,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device if args.device != "cpu" else None,
-    )
+    model_kwargs = {
+        "config": config,
+        "torch_dtype": torch.bfloat16,
+        "device_map": args.device if args.device != "cpu" else None,
+    }
+    if args.low_memory_export:
+        model_kwargs["low_cpu_mem_usage"] = True
+        if args.device == "cpu":
+            model_kwargs["device_map"] = "cpu"
+    model = AutoModelForCausalLM.from_pretrained(args.model_dir, **model_kwargs)
     model.eval()
 
     print(f"[Load] Qwen3ForCausalLM: {config.num_hidden_layers}L, "
           f"H={config.hidden_size}, V={config.vocab_size}, "
           f"Nkv={config.num_key_value_heads}")
 
-    do_rename = not args.no_rename
+    do_rename = args.rename or (not args.no_rename and not args.low_memory_export)
+    if args.low_memory_export and not args.rename:
+        print("[Load] Low-memory export: skipping SHA-256 weight rename pass")
 
     # ── Export full-vocab model (Phase 1) ────────────────────────────────────
     if not args.partial_only:

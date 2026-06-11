@@ -1162,19 +1162,17 @@ AceLm * ace_lm_load(ModelStore * store, const AceLmParams * params) {
             fclose(probe);
             fprintf(stderr, "[Ace-LM] ONNX model found at %s — using TRT backend\n", onnx_path.c_str());
 
-            // Build engine if it doesn't exist
             FILE* engine_probe = fopen(engine_path.c_str(), "rb");
             if (engine_probe) {
                 fclose(engine_probe);
-                fprintf(stderr, "[Ace-LM] TRT engine found, skipping build\n");
+                fprintf(stderr, "[Ace-LM] Prebuilt TRT engine found\n");
             } else {
-                fprintf(stderr, "[Ace-LM] TRT engine not found, building...\n");
-                if (!lm_trt_build(onnx_path.c_str(), engine_path.c_str(),
-                                  params->max_seq)) {
-                    fprintf(stderr, "[Ace-LM] ERROR: TRT engine build failed\n");
-                    delete ctx;
-                    return NULL;
-                }
+                fprintf(stderr,
+                        "[Ace-LM] FATAL: ONNX LM bundle is missing prebuilt TRT engine: %s\n"
+                        "[Ace-LM] Build LM engines offline and place lm_full.engine next to lm_full.onnx.\n",
+                        engine_path.c_str());
+                delete ctx;
+                return NULL;
             }
 
             // Load engine + refit weights from ONNX

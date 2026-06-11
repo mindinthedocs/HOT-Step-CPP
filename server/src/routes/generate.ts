@@ -314,7 +314,6 @@ async function runGeneration(job: GenerationJob): Promise<void> {
           cache_ratio: aceReq.cache_ratio,
           use_cot_caption: aceReq.use_cot_caption,
           negative_prompt: aceReq.negative_prompt,
-          use_ort_vae: aceReq.use_ort_vae,
         };
         for (const result of lmResults) {
           Object.assign(result, synthFields);

@@ -53,7 +53,6 @@ const DEFAULT_EXE = EXE_CANDIDATES.find(p => fs.existsSync(p)) || EXE_CANDIDATES
 const DEFAULT_MODELS = path.join(PROJECT_ROOT, 'models');
 const DEFAULT_ADAPTERS = path.join(PROJECT_ROOT, 'adapters');
 const DEFAULT_NOISE_SAMPLES = path.join(PROJECT_ROOT, 'noise_samples');
-const DEFAULT_ONNX_DIR = path.join(PROJECT_ROOT, 'models', 'onnx');
 
 // ── FFmpeg path resolution ──────────────────────────────────────────
 // Portable: bundled ffmpeg.exe alongside the server.
@@ -120,7 +119,6 @@ export const config = {
     // persistent graphs or CUDA graphs reduce per-call overhead.
     // To re-enable: set ACESTEPCPP_DRAFT_LM env var or uncomment auto-detect.
     draftLm: process.env.ACESTEPCPP_DRAFT_LM || '',
-    onnxDir: process.env.ACESTEPCPP_ONNX_DIR || DEFAULT_ONNX_DIR,
     /** TensorRT runtime DLL directory — auto-detected or TENSORRT_LIBS env override */
     trtLibs: process.env.TENSORRT_LIBS || (() => {
       // Auto-detect from engine/deps/tensorrt_libs/ (downloaded by Model Manager)

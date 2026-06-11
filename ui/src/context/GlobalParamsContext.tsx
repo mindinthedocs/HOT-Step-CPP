@@ -126,8 +126,6 @@ export interface GlobalParams {
   lufsEnabled: boolean; setLufsEnabled: (v: boolean) => void;
   lufsPreset: string; setLufsPreset: (v: string) => void;
   lufsTarget: number; setLufsTarget: (v: number) => void;
-  // VAE backend
-  useOrtVae: boolean; setUseOrtVae: (v: boolean) => void;
   // Whisper Lyrics
   whisperLyricsEnabled: boolean; setWhisperLyricsEnabled: (v: boolean) => void;
   whisperModel: string; setWhisperModel: (v: string) => void;

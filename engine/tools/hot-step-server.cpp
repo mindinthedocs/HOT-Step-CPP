@@ -18,12 +18,13 @@
 // Running jobs are never evicted.
 //
 // Models are discovered by scanning --models directory at startup
-// (reads GGUF metadata only, no weights loaded).
+// (reads lightweight GGUF/SafeTensors/ONNX metadata only, no weights loaded).
 // Each request loads the model, executes, and frees it. No model persists
 // in VRAM between requests unless --keep-loaded is set. GPU access is
 // serialized by the single worker thread (no mutex needed).
 //
-// Available models are classified by their GGUF general.architecture:
+// Available models are classified from GGUF architecture, SafeTensors
+// sidecars, or ONNX runtime-bundle filenames:
 //   acestep-lm       -> lm bucket
 //   acestep-dit      -> dit bucket
 //   acestep-text-enc -> text-enc bucket (singleton, first entry used)
@@ -52,6 +53,7 @@ static volatile int * _hotstep_guard_ = &hotstep_sampler_linked_;
 
 #include "model-registry.h"
 #include "model-store.h"
+#include "trt-bundle-manifest.h"
 #include "vae.h"
 #include "vae-enc.h"
 #include "pipeline-lm.h"
@@ -83,6 +85,7 @@ static volatile int * _hotstep_guard_ = &hotstep_sampler_linked_;
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -206,6 +209,9 @@ static ModelStore * g_store = nullptr;
 // model registry (populated at startup from GGUF metadata)
 static ModelRegistry g_registry;
 
+// root models directory (set once in main after --models is validated)
+static std::string g_models_dir;
+
 // loaded model names (empty = nothing loaded)
 static std::string g_loaded_lm;
 static std::string g_loaded_dit;
@@ -226,9 +232,6 @@ static bool g_keep_loaded = false;
 
 // speculative decoding: path to 0.6B draft model (auto-discovered or --draft-lm)
 static std::string g_draft_lm_path;
-
-// ONNX model directory (optional, for TensorRT/CUDA EP accelerated VAE)
-static const char * g_onnx_dir = nullptr;
 
 // HOT-Step: pre-computed noise profile for spectral denoiser.
 // Loaded once at startup from a reference noise sample WAV.
@@ -483,6 +486,119 @@ static std::string resolve_name(const std::vector<ModelEntry> & bucket,
         return bucket[0].name;
     }
     return "";
+}
+
+static bool entry_is_onnx(const ModelEntry * entry) {
+    return entry && str_ends_with(entry->path, ".onnx");
+}
+
+static bool server_file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static std::string server_dirname(const std::string & path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    if (pos == 0) {
+        return path.substr(0, 1);
+    }
+    return path.substr(0, pos);
+}
+
+// TRT-bundle detection. A directory is a native TRT runtime bundle iff it
+// carries a manifest.json (partner §3.5 / §4.4). This is the SOLE TRT-bundle
+// detector; the legacy onnx_dit_has_synth_bundle() file-list probe is retired.
+// The ONNX DiT entry's directory is the bundle dir. Completeness (all-three:
+// dit/text_enc/cond_enc) is enforced when the manifest is loaded at synth-load.
+static bool onnx_dit_has_trt_bundle(const ModelEntry & entry) {
+    if (!str_ends_with(entry.path, ".onnx")) {
+        return false;
+    }
+    return trt_bundle_has_manifest(server_dirname(entry.path));
+}
+
+static bool onnx_dit_has_sibling_vae(const ModelEntry * entry) {
+    if (!entry || !str_ends_with(entry->path, ".onnx")) {
+        return false;
+    }
+    return server_file_exists(server_dirname(entry->path) + REGISTRY_SEP + "vae_decoder.onnx");
+}
+
+static bool bucket_has_non_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (!str_ends_with(entry.path, ".onnx")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const ModelEntry * bucket_first_non_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (!str_ends_with(entry.path, ".onnx")) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static const ModelEntry * bucket_first_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (str_ends_with(entry.path, ".onnx")) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static const ModelEntry * resolve_native_entry(const std::vector<ModelEntry> & bucket,
+                                               const std::string &             requested,
+                                               const std::string &             loaded,
+                                               std::string &                   resolved_name) {
+    if (!requested.empty()) {
+        resolved_name = requested;
+        const ModelEntry * entry = registry_find(bucket, resolved_name.c_str());
+        if (!entry || entry_is_onnx(entry)) {
+            return nullptr;
+        }
+        return entry;
+    }
+    if (!loaded.empty()) {
+        const ModelEntry * entry = registry_find(bucket, loaded.c_str());
+        if (entry && !entry_is_onnx(entry)) {
+            resolved_name = loaded;
+            return entry;
+        }
+    }
+    const ModelEntry * entry = bucket_first_non_onnx(bucket);
+    resolved_name = entry ? entry->name : "";
+    return entry;
+}
+
+static bool registry_has_compatible_synth(const ModelRegistry & registry) {
+    bool have_onnx_dit = false;
+    bool have_native_dit = false;
+    for (const auto & entry : registry.dit) {
+        if (str_ends_with(entry.path, ".onnx")) {
+            if (onnx_dit_has_trt_bundle(entry) &&
+                !registry.text_enc.empty()) {
+                have_onnx_dit = true;
+            }
+        } else {
+            have_native_dit = true;
+        }
+    }
+    return have_onnx_dit ||
+           (have_native_dit &&
+            bucket_has_non_onnx(registry.text_enc) &&
+            bucket_has_non_onnx(registry.vae));
 }
 
 // =====================================================================
@@ -876,8 +992,44 @@ static void synth_worker(std::shared_ptr<Job>    job,
         job->status.store(2);
         return;
     }
-    if (g_registry.text_enc.empty() || g_registry.vae.empty()) {
+    const bool dit_is_onnx = entry_is_onnx(dit);
+    const ModelEntry * default_emb = dit_is_onnx ? bucket_first_onnx(g_registry.text_enc) : bucket_first_non_onnx(g_registry.text_enc);
+    const ModelEntry * default_vae = nullptr;
+    if (!dit_is_onnx) {
+        default_vae = bucket_first_non_onnx(g_registry.vae);
+    } else if (!onnx_dit_has_sibling_vae(dit) && !g_registry.vae.empty()) {
+        default_vae = &g_registry.vae[0];
+    }
+    if (dit_is_onnx && !onnx_dit_has_trt_bundle(*dit)) {
+        fprintf(stderr, "[Server] Selected ONNX DiT bundle has no manifest.json (not a TRT bundle): %s\n",
+                dit->path.c_str());
+        free(src_interleaved);
+        free(src_latents);
+        free(ref_interleaved);
+        free(ref_latents);
+        job->status.store(2);
+        return;
+    }
+    if (!dit_is_onnx && (!default_emb || g_registry.vae.empty())) {
         fprintf(stderr, "[Server] Missing Text-Enc or VAE in registry\n");
+        free(src_interleaved);
+        free(src_latents);
+        free(ref_interleaved);
+        free(ref_latents);
+        job->status.store(2);
+        return;
+    }
+    if (dit_is_onnx && !default_emb) {
+        fprintf(stderr, "[Server] Missing ONNX Text-Enc bundle in registry\n");
+        free(src_interleaved);
+        free(src_latents);
+        free(ref_interleaved);
+        free(ref_latents);
+        job->status.store(2);
+        return;
+    }
+    if (!dit_is_onnx && entry_is_onnx(default_emb)) {
+        fprintf(stderr, "[Server] GGUF/SafeTensors DiT requires a GGUF/SafeTensors text encoder\n");
         free(src_interleaved);
         free(src_latents);
         free(ref_interleaved);
@@ -895,32 +1047,36 @@ static void synth_worker(std::shared_ptr<Job>    job,
             fprintf(stderr, "[Server] Text encoder not found: %s, using default\n", sf.emb_model.c_str());
         }
     }
-    p.text_encoder_path = emb_entry ? emb_entry->path.c_str() : g_registry.text_enc[0].path.c_str();
+    const ModelEntry * text_for_params = emb_entry ? emb_entry : default_emb;
+    if (!dit_is_onnx && entry_is_onnx(text_for_params)) {
+        fprintf(stderr, "[Server] GGUF/SafeTensors DiT requires a GGUF/SafeTensors text encoder\n");
+        free(src_interleaved);
+        free(src_latents);
+        free(ref_interleaved);
+        free(ref_latents);
+        job->status.store(2);
+        return;
+    }
+    p.text_encoder_path = text_for_params ? text_for_params->path.c_str() : nullptr;
     p.dit_path          = dit->path.c_str();
     // HOT-STEP: VAE model selection. Resolve by name from registry.
-    // ONNX VAE files are decoder-only — they go through the ORT decode path,
-    // NOT the GGML encode path. If the user selects an ONNX VAE, we route it
-    // to onnx_vae_path and use the first GGUF/safetensors VAE for encoding.
+    // VAE decode and encode run on the GGML VAE; ONNX VAE entries are not
+    // usable here, so an ONNX selection falls back to a GGUF/safetensors VAE.
     const ModelEntry * vae_entry = nullptr;
-    bool               vae_is_onnx = false;
     if (!sf.vae_model.empty()) {
         vae_entry = registry_find(g_registry.vae, sf.vae_model.c_str());
         if (!vae_entry) {
             fprintf(stderr, "[Server] VAE not found: %s, using default\n", sf.vae_model.c_str());
-        } else if (vae_entry->name.size() >= 5 &&
-                   vae_entry->name.substr(vae_entry->name.size() - 5) == ".onnx") {
-            vae_is_onnx = true;
-            // Route ONNX VAE to ORT decode path
-            p.onnx_vae_path = vae_entry->path.c_str();
-            fprintf(stderr, "[Server] ONNX VAE selected: %s → ORT decode path\n", vae_entry->name.c_str());
-            // Fall back to GGUF/safetensors for encoding
+        } else if (entry_is_onnx(vae_entry)) {
+            fprintf(stderr, "[Server] ONNX VAE selected (%s); using GGUF VAE instead\n", vae_entry->name.c_str());
             vae_entry = registry_find_non_onnx(g_registry.vae);
         }
     }
-    if (!vae_entry) {
-        vae_entry = registry_find_non_onnx(g_registry.vae);
+    const ModelEntry * vae_for_params = vae_entry ? vae_entry : default_vae;
+    p.vae_path = nullptr;
+    if (vae_for_params && !entry_is_onnx(vae_for_params)) {
+        p.vae_path = vae_for_params->path.c_str();
     }
-    p.vae_path = vae_entry ? vae_entry->path.c_str() : g_registry.vae[0].path.c_str();
     // PP-VAE: auto-detect from registry, prefer highest precision: F32 > BF16 > F16
     p.pp_vae_path = nullptr;
     if (!g_registry.pp_vae.empty()) {
@@ -965,7 +1121,10 @@ static void synth_worker(std::shared_ptr<Job>    job,
             p.adapter_scale = ace_reqs[0].adapter_scale;
         }
     }
-    fprintf(stderr, "[Server] Text encoder: %s\n", emb_entry ? sf.emb_model.c_str() : g_registry.text_enc[0].name.c_str());
+    const char * text_label = text_for_params
+        ? (emb_entry ? sf.emb_model.c_str() : text_for_params->name.c_str())
+        : "(onnx auto)";
+    fprintf(stderr, "[Server] Text encoder: %s\n", text_label);
     fprintf(stderr, "[Server] Loading synth: DiT=%s%s%s%s\n", dit_name.c_str(),
             ace_reqs[0].adapter.empty() ? "" : " Adapter=", ace_reqs[0].adapter.c_str(),
             (g_keep_loaded || req_keep_loaded) ? " [keep-loaded]" : "");
@@ -1225,8 +1384,8 @@ static void synth_worker(std::shared_ptr<Job>    job,
 // Batch size = number of JSON objects (after synth_batch_size expansion, clamped to 9).
 // Metadata (seed, duration, etc) is already in the request JSON from /lm.
 static void handle_synth(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.dit.empty() || g_registry.text_enc.empty() || g_registry.vae.empty()) {
-        json_error(res, 501, "No synth models in registry (need dit + text-encoder + vae)");
+    if (!registry_has_compatible_synth(g_registry)) {
+        json_error(res, 501, "No compatible synth pipeline in registry (need complete ONNX DiT runtime bundle, or GGUF/SafeTensors DiT + text-encoder + VAE)");
         return;
     }
 
@@ -1398,13 +1557,17 @@ static void understand_worker(std::shared_ptr<Job> job, AceRequest ace_req, floa
         return;
     }
 
-    // Resolve LM + DiT (the DiT path carries the tokenizer weights).
-    std::string        lm_name  = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
-    std::string        dit_name = resolve_name(g_registry.dit, ace_req.synth_model, g_loaded_dit);
-    const ModelEntry * lm_entry = registry_find(g_registry.lm, lm_name.c_str());
-    const ModelEntry * dit      = registry_find(g_registry.dit, dit_name.c_str());
-    if (!lm_entry || !dit) {
-        fprintf(stderr, "[Server] LM or DiT not found: lm=%s dit=%s\n", lm_name.c_str(), dit_name.c_str());
+    // Resolve LM + native DiT/VAE. Understand tokenizes with native FSQ
+    // weights and needs a native VAE encoder, not ONNX runtime-bundle entries.
+    std::string        lm_name = resolve_name(g_registry.lm, ace_req.lm_model, g_loaded_lm);
+    std::string        dit_name;
+    std::string        vae_name;
+    const ModelEntry * lm_entry  = registry_find(g_registry.lm, lm_name.c_str());
+    const ModelEntry * dit       = resolve_native_entry(g_registry.dit, ace_req.synth_model, g_loaded_und_dit, dit_name);
+    const ModelEntry * vae_entry = resolve_native_entry(g_registry.vae, ace_req.vae, g_loaded_vae, vae_name);
+    if (!lm_entry || !dit || !vae_entry) {
+        fprintf(stderr, "[Server] LM, native DiT or native VAE not found: lm=%s dit=%s vae=%s\n",
+                lm_name.c_str(), dit_name.c_str(), vae_name.c_str());
         free(src_interleaved);
         job->status.store(2);
         return;
@@ -1413,6 +1576,7 @@ static void understand_worker(std::shared_ptr<Job> job, AceRequest ace_req, floa
     AceUnderstandParams p = g_und_params;
     p.model_path          = lm_entry->path.c_str();
     p.dit_path            = dit->path.c_str();
+    p.vae_path            = vae_entry->path.c_str();
 
     AceUnderstand * ctx = ace_understand_load(g_store, &p);
     if (!ctx) {
@@ -1441,9 +1605,11 @@ static void understand_worker(std::shared_ptr<Job> job, AceRequest ace_req, floa
     if (g_keep_loaded) {
         g_loaded_lm      = lm_name;
         g_loaded_und_dit = dit_name;
+        g_loaded_vae     = vae_name;
     } else {
         g_loaded_lm.clear();
         g_loaded_und_dit.clear();
+        g_loaded_vae.clear();
     }
 
     job->result_body = "[" + request_to_json(&out) + "]";
@@ -1458,8 +1624,8 @@ static void understand_worker(std::shared_ptr<Job> job, AceRequest ace_req, floa
 //   part "request": JSON text (optional, for model selection and sampling params)
 // returns: JSON {"id":"N"} immediately.
 static void handle_understand(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.lm.empty() || g_registry.dit.empty() || g_registry.vae.empty()) {
-        json_error(res, 501, "Understand requires LM, DiT and VAE models");
+    if (g_registry.lm.empty() || !bucket_first_non_onnx(g_registry.dit) || !bucket_first_non_onnx(g_registry.vae)) {
+        json_error(res, 501, "Understand requires LM plus GGUF/SafeTensors DiT and VAE models");
         return;
     }
 
@@ -1543,10 +1709,10 @@ static void vae_decode_worker(std::shared_ptr<Job> job,
         return;
     }
 
-    std::string        vae_name  = resolve_name(g_registry.vae, ace_req.vae, g_loaded_vae);
-    const ModelEntry * vae_entry = registry_find(g_registry.vae, vae_name.c_str());
+    std::string        vae_name;
+    const ModelEntry * vae_entry = resolve_native_entry(g_registry.vae, ace_req.vae, g_loaded_vae, vae_name);
     if (!vae_entry) {
-        fprintf(stderr, "[Server] decode: VAE not found: %s\n", vae_name.c_str());
+        fprintf(stderr, "[Server] decode: native VAE not found: %s\n", vae_name.c_str());
         job->status.store(2);
         return;
     }
@@ -1628,78 +1794,8 @@ static void vae_encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, floa
 
     auto t_start = std::chrono::steady_clock::now();
 
-    // ── Try ONNX encoder first ─────────────────────────────────────
-    // Look for a *_encoder.onnx file matching the selected (or default) VAE.
-    // E.g., if user selected "scragvae_decoder.onnx", look for "scragvae_encoder.onnx".
-    // Also auto-detect from the onnx/ directory if no specific VAE is selected.
-    bool tried_ort = false;
+    // ── GGML encode ────────────────────────────────────────────────
     {
-        std::string enc_onnx_path;
-        // If a specific VAE was requested and it's ONNX, derive encoder path
-        if (!ace_req.vae.empty()) {
-            const ModelEntry * entry = registry_find(g_registry.vae, ace_req.vae.c_str());
-            if (entry && entry->name.size() >= 5 &&
-                entry->name.substr(entry->name.size() - 5) == ".onnx") {
-                // Replace "_decoder.onnx" with "_encoder.onnx"
-                std::string p = entry->path;
-                auto pos = p.rfind("_decoder.onnx");
-                if (pos != std::string::npos) {
-                    enc_onnx_path = p.substr(0, pos) + "_encoder.onnx";
-                }
-            }
-        }
-        // If no specific ONNX VAE selected, check the registry for any ONNX decoder
-        // and derive the encoder path from it
-        if (enc_onnx_path.empty()) {
-            for (const auto & e : g_registry.vae) {
-                if (e.name.size() >= 5 && e.name.substr(e.name.size() - 5) == ".onnx") {
-                    std::string p = e.path;
-                    auto pos = p.rfind("_decoder.onnx");
-                    if (pos != std::string::npos) {
-                        std::string candidate = p.substr(0, pos) + "_encoder.onnx";
-                        FILE * f = fopen(candidate.c_str(), "rb");
-                        if (f) {
-                            fclose(f);
-                            enc_onnx_path = candidate;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // If we found an encoder ONNX, try ORT
-        if (!enc_onnx_path.empty()) {
-            FILE * f = fopen(enc_onnx_path.c_str(), "rb");
-            if (f) {
-                fclose(f);
-                tried_ort = true;
-                ModelKey ort_key;
-                ort_key.kind = MODEL_VAE_ENC_ORT;
-                ort_key.path = enc_onnx_path;
-
-                VaeEncOrt * enc_ort = store_require_vae_enc_ort(g_store, ort_key);
-                if (enc_ort) {
-                    ModelHandle guard(g_store, enc_ort);
-                    T_latent = vae_enc_ort_encode_tiled(enc_ort, src_interleaved, src_len,
-                                                         latent.data(), T_latent_max,
-                                                         g_synth_params.vae_chunk, g_synth_params.vae_overlap);
-                    if (T_latent >= 0) {
-                        // Extract basename for logging
-                        auto slash = enc_onnx_path.find_last_of("/\\");
-                        vae_name_used = (slash != std::string::npos) ? enc_onnx_path.substr(slash + 1) : enc_onnx_path;
-                    } else {
-                        fprintf(stderr, "[Server] encode: ORT encode failed, falling back to GGML\n");
-                    }
-                } else {
-                    fprintf(stderr, "[Server] encode: ORT session load failed, falling back to GGML\n");
-                }
-            }
-        }
-    }
-
-    // ── GGML fallback ──────────────────────────────────────────────
-    if (T_latent < 0) {
         const ModelEntry * vae_entry = registry_find_non_onnx(g_registry.vae, ace_req.vae.c_str());
         if (!vae_entry) {
             vae_entry = registry_find_non_onnx(g_registry.vae);
@@ -1761,8 +1857,8 @@ static void vae_encode_worker(std::shared_ptr<Job> job, AceRequest ace_req, floa
 // Returns JSON {"id":"N"} immediately. Result is raw latent bytes (encode)
 // or audio (decode). Only one direction at a time.
 static void handle_vae(const httplib::Request & req, httplib::Response & res) {
-    if (g_registry.vae.empty()) {
-        json_error(res, 501, "VAE endpoint requires a VAE in the registry");
+    if (!bucket_first_non_onnx(g_registry.vae)) {
+        json_error(res, 501, "VAE endpoint requires a GGUF/SafeTensors VAE in the registry");
         return;
     }
     if (!req.is_multipart_form_data()) {
@@ -1901,6 +1997,112 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     }
     yyjson_mut_obj_add_val(doc, root, "adapters", adapters_arr);
 
+    // trt_bundles: native TRT bundles under <models>/trt-bundles/<name>/
+    // Each entry: name, format="trt", variant, precision, components[], status
+    // status = "available" when every listed engine file exists on disk;
+    //          "incomplete" when the manifest is present but at least one engine is missing.
+    {
+        yyjson_mut_val * trt_arr = yyjson_mut_arr(doc);
+        std::filesystem::path bundles_root =
+            std::filesystem::path(g_models_dir) / "trt-bundles";
+        std::error_code ec;
+        for (const auto & entry : std::filesystem::directory_iterator(bundles_root, ec)) {
+            if (!entry.is_directory()) {
+                continue;
+            }
+            std::string name      = entry.path().filename().string();
+            std::string bundle_dir = entry.path().string();
+            if (!trt_bundle_has_manifest(bundle_dir)) {
+                continue;  // not a TRT bundle — no manifest.json
+            }
+
+            yyjson_mut_val * bundle_entry = yyjson_mut_obj(doc);
+            // Use strncpy variants for all values sourced from local std::string objects
+            // so yyjson owns copies that outlive the loop iteration.
+            yyjson_mut_obj_add_strncpy(doc, bundle_entry, "name", name.c_str(), name.size());
+            yyjson_mut_obj_add_str(doc, bundle_entry, "format", "trt");
+
+            // Attempt full load (validates all engine files exist).
+            TrtBundleManifest manifest;
+            std::string       manifest_err;
+            bool              available = trt_bundle_load_manifest(bundle_dir, &manifest, &manifest_err);
+
+            if (available) {
+                // Emit metadata from the validated manifest.
+                // Use string literals for fallback so strncpy args always point to stable memory.
+                const char * var_cs  = manifest.variant.empty() ? "unknown" : manifest.variant.c_str();
+                const char * prec_cs = manifest.dit.precision.empty() ? "unknown" : manifest.dit.precision.c_str();
+                // variant and precision come from manifest (scoped to this loop body) — copy into doc.
+                yyjson_mut_obj_add_strncpy(doc, bundle_entry, "variant",
+                                           var_cs, strlen(var_cs));
+                // precision: use the dit component's precision as the bundle-level badge
+                // (all engines share the same precision policy in a well-formed bundle).
+                yyjson_mut_obj_add_strncpy(doc, bundle_entry, "precision",
+                                           prec_cs, strlen(prec_cs));
+
+                // components: enumerate present engine keys (string literals — static lifetime)
+                yyjson_mut_val * comps = yyjson_mut_arr(doc);
+                yyjson_mut_arr_add_str(doc, comps, "dit");
+                yyjson_mut_arr_add_str(doc, comps, "text_enc");
+                yyjson_mut_arr_add_str(doc, comps, "cond_enc");
+                if (!manifest.fsq_sidecar.empty()) {
+                    yyjson_mut_arr_add_str(doc, comps, "fsq");
+                }
+                yyjson_mut_obj_add_val(doc, bundle_entry, "components", comps);
+                yyjson_mut_obj_add_str(doc, bundle_entry, "status", "available");
+            } else {
+                // Manifest is present but one or more engine files are missing.
+                // Do a lenient parse of the manifest JSON to recover informational fields
+                // (variant, precision) without the engine-file existence gate.
+                std::string lenient_err;
+                yyjson_doc * raw_doc = trt_artifact_read_json(
+                    (std::filesystem::path(bundle_dir) / "manifest.json").string(),
+                    &lenient_err);
+                std::string variant_str   = "unknown";
+                std::string precision_str = "unknown";
+                yyjson_mut_val * comps    = yyjson_mut_arr(doc);
+                if (raw_doc) {
+                    yyjson_val * raw_root = yyjson_doc_get_root(raw_doc);
+                    yyjson_val * va       = yyjson_obj_get(raw_root, "variant");
+                    if (va && yyjson_is_str(va)) {
+                        variant_str.assign(yyjson_get_str(va), yyjson_get_len(va));
+                    }
+                    // Extract component names present in the manifest (no engine check).
+                    yyjson_val * raw_comps = yyjson_obj_get(raw_root, "components");
+                    if (raw_comps && yyjson_is_obj(raw_comps)) {
+                        const char * comp_keys[] = {"dit", "text_enc", "cond_enc", "fsq", nullptr};
+                        for (int ci = 0; comp_keys[ci] != nullptr; ++ci) {
+                            yyjson_val * cv = yyjson_obj_get(raw_comps, comp_keys[ci]);
+                            if (cv && yyjson_is_obj(cv)) {
+                                yyjson_mut_arr_add_str(doc, comps, comp_keys[ci]);
+                                // grab precision from the first component that has it
+                                if (precision_str == "unknown") {
+                                    yyjson_val * pv = yyjson_obj_get(cv, "precision");
+                                    if (pv && yyjson_is_str(pv)) {
+                                        precision_str.assign(yyjson_get_str(pv), yyjson_get_len(pv));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    yyjson_doc_free(raw_doc);
+                }
+                yyjson_mut_obj_add_strncpy(doc, bundle_entry, "variant",
+                                           variant_str.c_str(), variant_str.size());
+                yyjson_mut_obj_add_strncpy(doc, bundle_entry, "precision",
+                                           precision_str.c_str(), precision_str.size());
+                yyjson_mut_obj_add_val(doc, bundle_entry, "components", comps);
+                yyjson_mut_obj_add_str(doc, bundle_entry, "status", "incomplete");
+                // surface the missing-engine error for diagnostics
+                yyjson_mut_obj_add_strncpy(doc, bundle_entry, "incomplete_reason",
+                                           manifest_err.c_str(), manifest_err.size());
+            }
+
+            yyjson_mut_arr_append(trt_arr, bundle_entry);
+        }
+        yyjson_mut_obj_add_val(doc, root, "trt_bundles", trt_arr);
+    }
+
     // cli: server settings
     yyjson_mut_val * cli = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, root, "cli", cli);
@@ -1955,7 +2157,7 @@ static void usage(const char * prog) {
             "Usage: %s --models <dir> [options]\n"
             "\n"
             "Required:\n"
-            "  --models <dir>          Directory of GGUF model files\n"
+            "  --models <dir>          Directory of GGUF, SafeTensors, or ONNX runtime-bundle artifacts\n"
             "\n"
             "Adapter:\n"
             "  --adapters <dir>        Directory of adapters\n"
@@ -1964,9 +2166,6 @@ static void usage(const char * prog) {
             "  --keep-loaded           Keep models in VRAM between requests\n"
             "  --vae-chunk <N>         Latent frames per tile (default: %d)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: %d)\n"
-            "\n"
-            "ONNX/TensorRT:\n"
-            "  --onnx-dir <dir>        Directory with ONNX models (e.g. vae_decoder.onnx)\n"
             "\n"
             "Speculative decoding:\n"
             "  --draft-lm <path>        Path to 0.6B draft LM (auto-discovers if omitted)\n"
@@ -2053,9 +2252,6 @@ int main(int argc, char ** argv) {
         } else if (!strcmp(argv[i], "--no-draft")) {
             g_draft_lm_path = "none";
 
-        } else if (!strcmp(argv[i], "--onnx-dir") && i + 1 < argc) {
-            g_onnx_dir = argv[++i];
-
         } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             usage(argv[0]);
             return 0;
@@ -2072,11 +2268,12 @@ int main(int argc, char ** argv) {
         usage(argv[0]);
         return 1;
     }
+    g_models_dir = models_dir;
 
     // stderr capture for SSE /logs (must be after arg parsing so --help prints directly)
     LogCapture log_capture;
 
-    // scan models directory (reads GGUF metadata only)
+    // scan models directory (reads lightweight GGUF/SafeTensors/ONNX metadata only)
     fprintf(stderr, "[Server] Scanning models in %s\n", models_dir);
     if (!registry_scan(&g_registry, models_dir)) {
         fprintf(stderr, "[Server] ERROR: no models found in %s\n", models_dir);
@@ -2131,53 +2328,20 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // ONNX/TensorRT: auto-detect vae_decoder.onnx in --onnx-dir
-    // Try new subdirectory layout first (onnx/vae/), fall back to legacy flat layout.
-    static std::string g_onnx_vae_path_buf;
-    if (g_onnx_dir) {
-        // Try new location: onnx_dir/vae/vae_decoder.onnx
-        g_onnx_vae_path_buf = std::string(g_onnx_dir) + "/vae/vae_decoder.onnx";
-        FILE * f = fopen(g_onnx_vae_path_buf.c_str(), "rb");
-        if (!f) {
-            // Fall back to legacy flat layout: onnx_dir/vae_decoder.onnx
-            g_onnx_vae_path_buf = std::string(g_onnx_dir) + "/vae_decoder.onnx";
-            f = fopen(g_onnx_vae_path_buf.c_str(), "rb");
-        }
-        if (f) {
-            fclose(f);
-            g_synth_params.onnx_vae_path = g_onnx_vae_path_buf.c_str();
-            fprintf(stderr, "[Server] ONNX VAE decoder: %s\n", g_onnx_vae_path_buf.c_str());
-        } else {
-            fprintf(stderr, "[Server] WARNING: --onnx-dir specified but no vae_decoder.onnx found in %s\n",
-                    g_onnx_dir);
-            g_onnx_vae_path_buf.clear();
-        }
-    }
-
     // validate pipeline
-    bool have_lm    = !g_registry.lm.empty();
-    bool have_dit   = !g_registry.dit.empty();
-    bool have_enc   = !g_registry.text_enc.empty();
-    bool have_vae   = !g_registry.vae.empty();
-    bool have_synth = have_dit && have_enc && have_vae;
+    bool have_lm     = !g_registry.lm.empty();
+    bool have_dit    = !g_registry.dit.empty();
+    bool have_enc    = !g_registry.text_enc.empty();
+    bool have_vae    = !g_registry.vae.empty();
+    bool have_synth  = registry_has_compatible_synth(g_registry);
 
     // partial synth: some components found but pipeline incomplete
     if (!have_synth && (have_dit || have_enc || have_vae)) {
-        char missing[64];
-        int  n = 0;
-        if (!have_dit) {
-            n += snprintf(missing + n, sizeof(missing) - n, "%sDiT", n ? ", " : "");
-        }
-        if (!have_enc) {
-            n += snprintf(missing + n, sizeof(missing) - n, "%sText-Enc", n ? ", " : "");
-        }
-        if (!have_vae) {
-            n += snprintf(missing + n, sizeof(missing) - n, "%sVAE", n ? ", " : "");
-        }
+        const char * need = "need complete ONNX DiT runtime bundle, or GGUF/SafeTensors DiT + GGUF/SafeTensors text-encoder + GGUF/SafeTensors VAE";
         if (have_lm) {
-            fprintf(stderr, "[Server] WARNING: /synth unavailable, missing: %s\n", missing);
+            fprintf(stderr, "[Server] WARNING: /synth unavailable: %s\n", need);
         } else {
-            fprintf(stderr, "[Server] ERROR: no usable pipeline, synth missing: %s\n", missing);
+            fprintf(stderr, "[Server] ERROR: no usable pipeline; %s\n", need);
             return 1;
         }
     }
@@ -2202,45 +2366,19 @@ int main(int argc, char ** argv) {
     g_und_params.max_batch   = g_lm_params.max_batch;       // must match ace_lm: part of the LM ModelKey
     g_und_params.vae_chunk   = g_synth_params.vae_chunk;    // share --vae-chunk with /synth
     g_und_params.vae_overlap = g_synth_params.vae_overlap;  // share --vae-overlap with /synth
-    if (have_vae) {
-        g_und_params.vae_path = g_registry.vae[0].path.c_str();
+    const ModelEntry * und_vae = bucket_first_non_onnx(g_registry.vae);
+    if (und_vae) {
+        g_und_params.vae_path = und_vae->path.c_str();
     }
 
-    bool have_understand = have_lm && have_dit && have_vae;
+    bool have_understand = have_lm && bucket_first_non_onnx(g_registry.dit) && und_vae;
 
     // central store: one policy for the whole server lifetime. STRICT keeps
     // at most one GPU module resident at a time; --keep-loaded flips it to
     // NEVER and lets the working set accumulate across requests.
     g_store = store_create(g_keep_loaded ? EVICT_NEVER : EVICT_STRICT);
 
-    // Initialize Lua plugin system.
-    // engine_dir: derive from executable path.
-    // Binary location varies by build system:
-    //   - Visual Studio (multi-config): engine/build/Release/ace-server.exe  (3 levels up)
-    //   - Ninja / Makefiles / macOS:    engine/build/ace-server              (2 levels up)
-    //   - Portable release:             engine/ace-server                    (1 level up)
-    // Scans both engine/plugins/ (native) and <project-root>/plugins/ (community)
-    {
-        std::filesystem::path exe_path = std::filesystem::canonical(argv[0]);
-        std::filesystem::path exe_dir = exe_path.parent_path();
-        std::string dir_name = exe_dir.filename().string();
-
-        std::filesystem::path engine_dir;
-        if (dir_name == "Release" || dir_name == "Debug" ||
-            dir_name == "RelWithDebInfo" || dir_name == "MinSizeRel") {
-            // Multi-config generator: engine/build/Release/ → engine/ is 3 levels
-            engine_dir = exe_dir.parent_path().parent_path();
-        } else if (dir_name == "build") {
-            // Single-config generator: engine/build/ → engine/ is 1 level
-            engine_dir = exe_dir.parent_path();
-        } else {
-            // Portable release: engine/ → engine/ is 0 levels (already there)
-            engine_dir = exe_dir;
-        }
-        // Project root is one more level up from engine/
-        std::filesystem::path project_dir = engine_dir.parent_path();
-        PluginRegistry::instance().init(engine_dir.string(), project_dir.string());
-    }
+    PluginRegistry::instance().init_from_executable(argv[0]);
 
     // setup HTTP server
     httplib::Server svr;
@@ -2382,12 +2520,6 @@ int main(int argc, char ** argv) {
             if (blend > 1.0f) blend = 1.0f;
         }
 
-        // Parse backend preference: "onnx" = force ORT/TRT, "gguf" = force GGML, absent = auto
-        std::string backend = "auto";
-        if (req.has_param("backend")) {
-            backend = req.get_param_value("backend");
-        }
-
         // Resolve PP-VAE model path from registry (prefer F32 > BF16 > F16)
         if (g_registry.pp_vae.empty()) {
             json_error(res, 501, "No PP-VAE model in registry");
@@ -2414,8 +2546,8 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        fprintf(stderr, "[Server] PP-VAE re-encode: %.2fs @ 48kHz, model=%s, blend=%.2f, backend=%s\n",
-                (float) T_audio / 48000.0f, pp_vae_path, blend, backend.c_str());
+        fprintf(stderr, "[Server] PP-VAE re-encode: %.2fs @ 48kHz, model=%s, blend=%.2f\n",
+                (float) T_audio / 48000.0f, pp_vae_path, blend);
 
         // If blend is 1.0 (fully original), skip processing entirely
         if (blend >= 1.0f) {
@@ -2438,55 +2570,11 @@ int main(int argc, char ** argv) {
         }
         float in_rms = (float) sqrt(in_sum_sq / (double) n_total);
 
-        // Resolve PP-VAE ONNX paths for ORT/TRT acceleration.
-        // Look for pp-vae_encoder.onnx / pp-vae_decoder.onnx in models/onnx/
-        // Try new subdirectory layout (onnx/pp-vae/) first, fall back to legacy flat layout.
-        // Skipped entirely when backend=gguf.
-        std::string pp_dir;
-        {
-            std::string p = pp_vae_path;
-            auto slash = p.find_last_of("/\\");
-            pp_dir = (slash != std::string::npos) ? p.substr(0, slash) : ".";
-        }
-        std::string onnx_dir = pp_dir + "/" + "onnx";
-        std::string onnx_enc_path, onnx_dec_path;
-        if (backend != "gguf") {
-            {
-                // Try new location first: onnx/pp-vae/pp-vae_encoder.onnx
-                std::string ep = onnx_dir + "/" + "pp-vae" + "/" + "pp-vae_encoder.onnx";
-                FILE * f = fopen(ep.c_str(), "rb");
-                if (!f) {
-                    // Fall back to legacy flat layout
-                    ep = onnx_dir + "/" + "pp-vae_encoder.onnx";
-                    f = fopen(ep.c_str(), "rb");
-                }
-                if (f) { fclose(f); onnx_enc_path = ep; }
-            }
-            {
-                // Try new location first: onnx/pp-vae/pp-vae_decoder.onnx
-                std::string dp = onnx_dir + "/" + "pp-vae" + "/" + "pp-vae_decoder.onnx";
-                FILE * f = fopen(dp.c_str(), "rb");
-                if (!f) {
-                    // Fall back to legacy flat layout
-                    dp = onnx_dir + "/" + "pp-vae_decoder.onnx";
-                    f = fopen(dp.c_str(), "rb");
-                }
-                if (f) { fclose(f); onnx_dec_path = dp; }
-            }
-            if (backend == "onnx" && (onnx_enc_path.empty() || onnx_dec_path.empty())) {
-                fprintf(stderr, "[Server] PP-VAE backend=onnx but ONNX models not found in %s, falling back to GGML\n",
-                        onnx_dir.c_str());
-            }
-        } else {
-            fprintf(stderr, "[Server] PP-VAE backend=gguf, skipping ONNX discovery\n");
-        }
-
         // Default VAE tiling params (match scragvae: same Oobleck architecture)
         int vae_chunk   = 1024;
         int vae_overlap = 64;
 
-        // Phase 1: Encode (planar → interleaved → VAE encoder → latents)
-        // Prefers ORT/TRT when pp-vae_encoder.onnx exists, falls back to GGML.
+        // Phase 1: Encode (planar → interleaved → VAE encoder → latents) via GGML
         std::vector<float> latents;
         int T_latent = 0;
 
@@ -2504,23 +2592,7 @@ int main(int argc, char ** argv) {
         int max_T = (T_audio / 1920) + 64;
         latents.resize((size_t) max_T * 64);
 
-        if (!onnx_enc_path.empty()) {
-            // Try ORT encoder
-            ModelKey enc_ort_key;
-            enc_ort_key.kind = MODEL_VAE_ENC_ORT;
-            enc_ort_key.path = onnx_enc_path;
-            VaeEncOrt * enc_ort = store_require_vae_enc_ort(g_store, enc_ort_key);
-            if (enc_ort) {
-                ModelHandle enc_guard(g_store, enc_ort);
-                fprintf(stderr, "[Server] PP-VAE encoding via ORT/TRT: %s\n", onnx_enc_path.c_str());
-                T_latent = vae_enc_ort_encode_tiled(enc_ort, interleaved.data(), T_audio,
-                                                     latents.data(), max_T, vae_chunk, vae_overlap);
-            } else {
-                fprintf(stderr, "[Server] PP-VAE ORT encoder load failed, falling back to GGML\n");
-            }
-        }
-        if (T_latent <= 0) {
-            // Fall back to GGML encoder
+        {
             ModelKey enc_key;
             enc_key.kind = MODEL_VAE_ENC;
             enc_key.path = pp_vae_path;
@@ -2542,31 +2614,14 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "[Server] PP-VAE encode: T_latent=%d\n", T_latent);
 
-        // Phase 2: Decode (latents → VAE decoder → planar PCM)
-        // Prefers ORT/TRT when pp-vae_decoder.onnx exists, falls back to GGML.
+        // Phase 2: Decode (latents → VAE decoder → planar PCM) via GGML
         std::vector<float> decoded;
         int T_decoded = 0;
 
         int T_audio_max = T_latent * 1920;
         decoded.resize(2 * T_audio_max);
 
-        if (!onnx_dec_path.empty()) {
-            // Try ORT decoder
-            ModelKey dec_ort_key;
-            dec_ort_key.kind = MODEL_VAE_DEC_ORT;
-            dec_ort_key.path = onnx_dec_path;
-            VaeOrt * dec_ort = store_require_vae_dec_ort(g_store, dec_ort_key);
-            if (dec_ort) {
-                ModelHandle dec_guard(g_store, dec_ort);
-                fprintf(stderr, "[Server] PP-VAE decoding via ORT/TRT: %s\n", onnx_dec_path.c_str());
-                T_decoded = vae_ort_decode_tiled(dec_ort, latents.data(), T_latent,
-                                                  decoded.data(), T_audio_max, vae_chunk, vae_overlap);
-            } else {
-                fprintf(stderr, "[Server] PP-VAE ORT decoder load failed, falling back to GGML\n");
-            }
-        }
-        if (T_decoded <= 0) {
-            // Fall back to GGML decoder
+        {
             ModelKey dec_key;
             dec_key.kind = MODEL_VAE_DEC;
             dec_key.path = pp_vae_path;

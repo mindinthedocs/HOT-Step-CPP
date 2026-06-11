@@ -7,20 +7,26 @@ wrapping the full 32-layer transformer + attention mask computation + RoPE
 into a single ONNX graph with 4 simplified inputs.
 
 Precision recipes (--precision):
+  q8map-fp16 — Default. Export FP32, then downcast only the hardcoded
+               Q8_0-equivalent DiT matrix-weight allowlist to FP16 and add
+               explicit Cast nodes so TensorRT 11 strongly typed builds honor
+               the graph-level policy.
+  w8a16     — Weight-only INT8. Export FP32, quantize the same matrix-weight
+               allowlist to INT8 with per-output-channel scales, then
+               DequantizeLinear those weights to FP16 compute islands.
   fp32       — Full FP32. Correct but slow. Baseline for validation.
-  bf16_mixed — (default for XL) bf16 bulk + fp32 ConvTranspose1d island.
-               Used with TRT STRONGLY_TYPED mode. Demon-proven recipe.
-               bf16 has same exponent range as fp32 — no activation overflow.
 
 Usage:
     python export_dit.py --model-dir <path-to-safetensors-model> --output <output.onnx>
-    python export_dit.py --model-dir <path> --output <path> --precision bf16_mixed
+    python export_dit.py --model-dir <path> --output <path> --precision fp32
 
 The diffusion loop, guidance (APG/CFG), and solvers stay in C++.
 TRT compiles the ONNX graph once; LoRA adapters use IRefitter weight swapping.
 """
 
 import argparse
+import json
+import re
 import sys
 import os
 import time
@@ -30,35 +36,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from acestep_trt_common import (
+    ExportMetadata,
+    TRT_FP16_WEIGHT_ALLOWLIST_PATTERNS,
+    classify_tensor_names,
+    write_export_metadata,
+    write_json,
+)
+
 # We need the model's own code
 # The model dir contains modeling_acestep_v15_xl_base.py
-
-
-class _Fp32CastWrapper(nn.Module):
-    """Run an inner module in fp32, casting around it.
-
-    Used when TRT has no kernel for a specific op shape in bf16.
-    The wrapper casts input to fp32, runs the inner module, then casts
-    output back to the caller's dtype.
-    """
-    def __init__(self, inner: nn.Module):
-        super().__init__()
-        inner.float()  # force inner weights to fp32
-        self.inner = inner
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out_dtype = x.dtype
-        # Disable autocast — without this, the outer autocast(bf16) overrides
-        # our explicit fp32 computation and TRT sees bf16 weights.
-        with torch.amp.autocast('cuda', enabled=False):
-            return self.inner(x.float()).to(out_dtype)
 
 
 class PatchEmbedLinear(nn.Module):
     """Replace Conv1d(C_in, C_out, K, stride=K) with reshape + Linear.
     
-    TRT 10.16 has NO kernels for 1D convolutions with patch_size shapes
-    in any precision mode (fp16, bf16, or fp32). This is mathematically equivalent:
+    TensorRT has historically lacked reliable kernels for these 1D convolution
+    patch shapes in some precision modes. This is mathematically equivalent:
       Conv1d: input[B, C_in, T] → output[B, C_out, T//K]
       Linear: input[B, C_in, T] → unfold[B, T//K, C_in*K] → Linear → [B, C_out, T//K]
     """
@@ -66,10 +60,17 @@ class PatchEmbedLinear(nn.Module):
         super().__init__()
         C_out, C_in, K = conv.weight.shape
         self.kernel_size = K
-        self.linear = nn.Linear(C_in * K, C_out, bias=conv.bias is not None)
+        self.linear = nn.Linear(
+            C_in * K,
+            C_out,
+            bias=conv.bias is not None,
+            device=conv.weight.device,
+            dtype=conv.weight.dtype,
+        )
         # Conv weight [C_out, C_in, K] → Linear weight [C_out, C_in*K]
-        self.linear.weight.data = conv.weight.data.reshape(C_out, -1).clone()
-        if conv.bias is not None:
+        if not conv.weight.is_meta:
+            self.linear.weight.data = conv.weight.data.reshape(C_out, -1).clone()
+        if conv.bias is not None and not conv.bias.is_meta:
             self.linear.bias.data = conv.bias.data.clone()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -87,8 +88,8 @@ class PatchEmbedLinear(nn.Module):
 class UnPatchLinear(nn.Module):
     """Replace ConvTranspose1d(C_in, C_out, K, stride=K) with Linear + reshape.
     
-    TRT 10.16 has NO kernels for 1D transposed convolutions with patch_size shapes.
-    This is mathematically equivalent:
+    TensorRT has historically lacked reliable kernels for these 1D transposed
+    convolution patch shapes. This is mathematically equivalent:
       ConvTranspose1d: input[B, C_in, T//K] → output[B, C_out, T]
       Linear: input[B, T//K, C_in] → Linear → [B, T//K, C_out*K] → fold → [B, C_out, T]
     """
@@ -97,10 +98,17 @@ class UnPatchLinear(nn.Module):
         C_in, C_out, K = deconv.weight.shape
         self.kernel_size = K
         self.C_out = C_out
-        self.linear = nn.Linear(C_in, C_out * K, bias=deconv.bias is not None)
+        self.linear = nn.Linear(
+            C_in,
+            C_out * K,
+            bias=deconv.bias is not None,
+            device=deconv.weight.device,
+            dtype=deconv.weight.dtype,
+        )
         # ConvTranspose1d weight [C_in, C_out, K] → Linear weight [C_out*K, C_in]
-        self.linear.weight.data = deconv.weight.data.permute(1, 2, 0).reshape(C_out * K, C_in).clone()
-        if deconv.bias is not None:
+        if not deconv.weight.is_meta:
+            self.linear.weight.data = deconv.weight.data.permute(1, 2, 0).reshape(C_out * K, C_in).clone()
+        if deconv.bias is not None and not deconv.bias.is_meta:
             # ConvTranspose1d bias [C_out] → Linear bias [C_out*K] (repeat per patch)
             self.linear.bias.data = deconv.bias.data.repeat_interleave(K).clone()
 
@@ -133,7 +141,7 @@ class DiTForwardWrapper(nn.Module):
     Masks and position IDs are computed internally from T and S.
     """
     
-    def __init__(self, dit_model, precision="bf16_mixed"):
+    def __init__(self, dit_model, precision="q8map-fp16"):
         super().__init__()
         self.dit = dit_model
         self.config = dit_model.config
@@ -156,78 +164,31 @@ class DiTForwardWrapper(nn.Module):
         context_latents = input_latents[:, :, :128]
         hidden_states = input_latents[:, :, 128:]
         
-        # bf16 autocast: the dynamo exporter decomposes complex ops
-        # (view_as_complex → rotate_half) into real-number equivalents,
-        # so no Cast(to=COMPLEX128) appears in the ONNX graph.
-        if self.precision == "bf16_mixed":
-            autocast_dtype = torch.bfloat16
-        else:
-            autocast_dtype = torch.float32
-        with torch.amp.autocast('cuda', dtype=autocast_dtype):
-            outputs = self.dit(
-                hidden_states=hidden_states,
-                timestep=t,
-                timestep_r=t_r,
-                attention_mask=None,
-                encoder_hidden_states=enc_hidden,
-                encoder_attention_mask=None,
-                context_latents=context_latents,
-                use_cache=False,
-                past_key_values=None,
-                output_attentions=False,
-            )
+        outputs = self.dit(
+            hidden_states=hidden_states,
+            timestep=t,
+            timestep_r=t_r,
+            attention_mask=None,
+            encoder_hidden_states=enc_hidden,
+            encoder_attention_mask=None,
+            context_latents=context_latents,
+            use_cache=False,
+            past_key_values=None,
+            output_attentions=False,
+        )
         
         # outputs[0] is the velocity prediction [B, T, 64]
         velocity = outputs[0]
         return velocity
 
 
-def apply_bf16_mixed(dit_model):
-    """Apply the bf16_mixed precision recipe (XL models).
-    
-    bf16 bulk + fp32 island for proj_out ConvTranspose1d.
-    
-    bf16 has the SAME exponent range as fp32 (8 bits vs fp16's 5 bits),
-    so intermediate activations never overflow. This is the key difference
-    from fp16_mixed which NaN'd because the XL residual stream accumulated
-    values exceeding fp16's ±65504 range over 32 layers.
-    
-    The entire model runs in bf16 EXCEPT:
-      - proj_out ConvTranspose1d → wrapped in _Fp32CastWrapper because
-        TRT 10.16 has no bf16 deconv kernel for this shape.
-    
-    Uses STRONGLY_TYPED mode so TRT honors the bf16/fp32 split from the
-    ONNX graph. TRT's bf16 tensor cores provide the same throughput as fp16.
-    """
-    dit_model.to(torch.bfloat16)
-    print("[export_dit] Applied bf16 bulk conversion")
-    
-    # FP32 island: proj_out ConvTranspose1d (TRT has no bf16 deconv kernel)
-    # NOTE: This gets replaced by UnPatchLinear AFTER this function runs
-    # (replace_conv_with_linear handles it). But we still wrap it in
-    # _Fp32CastWrapper in case the Conv→Linear replacement changes.
-    if hasattr(dit_model, 'proj_out') and isinstance(dit_model.proj_out, nn.Sequential):
-        for i, mod in enumerate(dit_model.proj_out):
-            if isinstance(mod, nn.ConvTranspose1d):
-                dit_model.proj_out[i] = _Fp32CastWrapper(mod)
-                print(f"[export_dit] FP32 island: proj_out[{i}] ConvTranspose1d → _Fp32CastWrapper")
-                break
-    
-    return dit_model
-
-
 def replace_conv_with_linear(dit_model):
     """Replace Conv1d/ConvTranspose1d with equivalent Linear ops.
     
-    TRT 10.16 has NO kernels for 1D convolutions with patch_size=2 in ANY
-    precision mode (fp16, bf16, fp32, or mixed). PatchEmbedLinear/UnPatchLinear
-    reformulate these as reshape+matmul which TRT handles perfectly.
+    PatchEmbedLinear/UnPatchLinear reformulate patch convolutions as
+    reshape+matmul, which TensorRT handles more consistently.
     
-    Must be called for ALL precision recipes, not just mixed precision.
-    
-    Handles _Fp32CastWrapper: if a ConvTranspose1d is already wrapped in
-    _Fp32CastWrapper (from bf16_mixed recipe), we unwrap it, convert to
-    UnPatchLinear, and re-wrap in _Fp32CastWrapper.
+    Must be called for all supported precision recipes.
     """
     if hasattr(dit_model, 'proj_in') and isinstance(dit_model.proj_in, nn.Sequential):
         for i, mod in enumerate(dit_model.proj_in):
@@ -240,16 +201,1891 @@ def replace_conv_with_linear(dit_model):
             if isinstance(mod, nn.ConvTranspose1d):
                 dit_model.proj_out[i] = UnPatchLinear(mod)
                 print(f"[export_dit] Conv→Linear: proj_out[{i}] ConvTranspose1d → UnPatchLinear")
-            elif isinstance(mod, _Fp32CastWrapper) and isinstance(mod.inner, nn.ConvTranspose1d):
-                # Unwrap, convert, re-wrap
-                linear_mod = UnPatchLinear(mod.inner)
-                dit_model.proj_out[i] = _Fp32CastWrapper(linear_mod)
-                print(f"[export_dit] Conv→Linear: proj_out[{i}] Fp32Cast(ConvTranspose1d) → Fp32Cast(UnPatchLinear)")
     
     return dit_model
 
 
-def load_dit_model(model_dir: str, device: str = "cuda", precision: str = "bf16_mixed"):
+def _safetensor_paths(model_dir: Path) -> list[Path]:
+    index_path = model_dir / "model.safetensors.index.json"
+    single_path = model_dir / "model.safetensors"
+    if index_path.exists():
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        return [model_dir / name for name in sorted(set(index["weight_map"].values()))]
+    if single_path.exists():
+        return [single_path]
+    raise SystemExit(f"[export_dit] ERROR: No model.safetensors found in {model_dir}")
+
+
+def _load_safetensor_header(path: Path) -> tuple[dict, int]:
+    import struct
+
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    return header, 8 + header_len
+
+
+def _build_safetensor_index(model_dir: Path) -> dict[str, dict]:
+    entries: dict[str, dict] = {}
+    for path in _safetensor_paths(model_dir):
+        header, data_start = _load_safetensor_header(path)
+        for name, info in header.items():
+            if name == "__metadata__":
+                continue
+            begin, end = info["data_offsets"]
+            entries[name] = {
+                "path": path,
+                "dtype": info["dtype"],
+                "shape": list(info["shape"]),
+                "offset": data_start + int(begin),
+                "length": int(end) - int(begin),
+            }
+    return entries
+
+
+def _copy_file_range(src_path: Path, src_offset: int, length: int, out, chunk_bytes: int = 16 * 1024 * 1024) -> None:
+    remaining = int(length)
+    with open(src_path, "rb") as src:
+        src.seek(int(src_offset))
+        while remaining:
+            block = src.read(min(chunk_bytes, remaining))
+            if not block:
+                raise IOError(f"unexpected EOF while copying {src_path}")
+            out.write(block)
+            remaining -= len(block)
+
+
+def _shape_numel(shape: list[int] | tuple[int, ...]) -> int:
+    total = 1
+    for dim in shape:
+        total *= int(dim)
+    return total
+
+
+def _reserve_external_range(out, length: int) -> tuple[int, int]:
+    offset = out.tell()
+    if length:
+        out.seek(length - 1, os.SEEK_CUR)
+        out.write(b"\0")
+        out.flush()
+    return offset, int(length)
+
+
+def _write_numpy_external(out, arr) -> tuple[int, int]:
+    import numpy as np
+
+    contiguous = np.ascontiguousarray(arr)
+    offset = out.tell()
+    out.write(memoryview(contiguous).cast("B"))
+    return offset, int(contiguous.nbytes)
+
+
+def _constant_tensor_from_node(node):
+    import numpy as np
+    from onnx import numpy_helper
+
+    if node.op_type != "Constant" or len(node.output) != 1:
+        return None
+    name = node.output[0]
+    for attr in node.attribute:
+        if attr.name == "value":
+            tensor = type(attr.t)()
+            tensor.CopyFrom(attr.t)
+            tensor.name = name
+            return tensor
+        if attr.name == "value_int":
+            return numpy_helper.from_array(np.asarray(attr.i, dtype=np.int64), name=name)
+        if attr.name == "value_ints":
+            return numpy_helper.from_array(np.asarray(list(attr.ints), dtype=np.int64), name=name)
+        if attr.name == "value_float":
+            return numpy_helper.from_array(np.asarray(attr.f, dtype=np.float32), name=name)
+        if attr.name == "value_floats":
+            return numpy_helper.from_array(np.asarray(list(attr.floats), dtype=np.float32), name=name)
+    return None
+
+
+def _static_tensor_from_node(node, constant_values: dict):
+    import numpy as np
+    from onnx import numpy_helper
+
+    tensor = _constant_tensor_from_node(node)
+    if tensor is not None:
+        return tensor
+    if len(node.output) != 1:
+        return None
+    name = node.output[0]
+    try:
+        if node.op_type == "Identity" and len(node.input) == 1 and node.input[0] in constant_values:
+            return numpy_helper.from_array(np.asarray(constant_values[node.input[0]]), name=name)
+        if node.op_type == "Reshape" and len(node.input) >= 2:
+            if node.input[0] not in constant_values or node.input[1] not in constant_values:
+                return None
+            shape = [int(x) for x in np.asarray(constant_values[node.input[1]]).reshape(-1)]
+            arr = np.reshape(constant_values[node.input[0]], shape)
+            return numpy_helper.from_array(np.asarray(arr), name=name)
+    except Exception:
+        return None
+    return None
+
+
+def _write_tensor_proto_external(tensor, data_path: str, data_location: str):
+    import numpy as np
+    from onnx import TensorProto, numpy_helper
+
+    if tensor.data_type == TensorProto.STRING:
+        return None
+    arr = numpy_helper.to_array(tensor)
+    if arr.dtype == np.dtype("O"):
+        return None
+    with open(data_path, "ab") as data_out:
+        offset, length = _write_numpy_external(data_out, arr)
+    return _external_initializer(
+        tensor.name,
+        int(tensor.data_type),
+        [int(dim) for dim in tensor.dims],
+        data_location,
+        offset,
+        length,
+    )
+
+
+def _fold_constant_nodes_to_initializers_for_trt(
+    model,
+    data_path: str | None = None,
+    data_location: str | None = None,
+) -> dict:
+    """Convert static Constant nodes into initializers for TensorRT parser rules."""
+    from onnx import TensorProto
+
+    consumed_names = {input_name for node in model.graph.node for input_name in node.input if input_name}
+    graph_output_names = {output.name for output in model.graph.output}
+    initializer_names = {init.name for init in model.graph.initializer}
+    constant_values = _constant_arrays(model)
+    folded = []
+    skipped = []
+    removed_dead_constants = []
+    new_initializers = []
+    new_nodes = []
+
+    for node in model.graph.node:
+        tensor = _static_tensor_from_node(node, constant_values)
+        if tensor is not None and node.output and node.output[0] not in consumed_names and node.output[0] not in graph_output_names:
+            if node.op_type == "Constant":
+                removed_dead_constants.append(node.output[0])
+                continue
+            new_nodes.append(node)
+            continue
+        if tensor is None:
+            new_nodes.append(node)
+            continue
+
+        name = node.output[0]
+        if name in initializer_names:
+            new_nodes.append(node)
+            skipped.append(name)
+            continue
+        if data_path and data_location:
+            initializer = _write_tensor_proto_external(tensor, data_path, data_location)
+            if initializer is None:
+                new_nodes.append(node)
+                skipped.append(name)
+                continue
+        else:
+            initializer = type(tensor)()
+            initializer.CopyFrom(tensor)
+            initializer.data_location = TensorProto.DEFAULT
+        new_initializers.append(initializer)
+        initializer_names.add(name)
+        try:
+            from onnx import numpy_helper
+            constant_values[name] = numpy_helper.to_array(tensor)
+        except Exception:
+            pass
+        folded.append(name)
+
+    if folded or removed_dead_constants:
+        del model.graph.node[:]
+        model.graph.node.extend(new_nodes)
+        model.graph.initializer.extend(new_initializers)
+
+    return {
+        "constant_nodes_folded_to_initializers": len(folded),
+        "folded_initializer_names": folded,
+        "dead_constant_nodes_removed": len(removed_dead_constants),
+        "skipped_constant_names": skipped,
+    }
+
+
+def _source_key_for_exported_param(param_name: str) -> str:
+    if param_name.startswith("dit."):
+        return "decoder." + param_name[len("dit."):]
+    if param_name.startswith("decoder."):
+        return param_name
+    return "decoder." + param_name
+
+
+def _graph_signature_initializer_targets(onnx_program) -> dict[str, str]:
+    targets: dict[str, str] = {}
+    graph_signature = getattr(getattr(onnx_program, "exported_program", None), "graph_signature", None)
+    if graph_signature is None:
+        return targets
+    for spec in getattr(graph_signature, "input_specs", []):
+        kind = str(getattr(spec, "kind", ""))
+        if not (kind.endswith("PARAMETER") or kind.endswith("BUFFER")):
+            continue
+        arg = getattr(spec, "arg", None)
+        arg_name = getattr(arg, "name", None)
+        target = getattr(spec, "target", None)
+        if arg_name and target:
+            targets[str(arg_name)] = str(target)
+    return targets
+
+
+def _metadata_props(obj) -> dict[str, str]:
+    raw_props = getattr(obj, "metadata_props", {})
+    if hasattr(raw_props, "items"):
+        return {str(key): str(value) for key, value in raw_props.items()}
+    props = {}
+    for prop in raw_props:
+        key = getattr(prop, "key", None)
+        value = getattr(prop, "value", None)
+        if key is not None and value is not None:
+            props[str(key)] = str(value)
+    return props
+
+
+def _onnx_ir_initializer_targets(onnx_program) -> dict[str, str]:
+    targets_by_arg = _graph_signature_initializer_targets(onnx_program)
+    result: dict[str, str] = {}
+    graph = getattr(getattr(onnx_program, "model", None), "graph", None)
+    if graph is None:
+        return result
+    initializers = getattr(graph, "initializers", {})
+    items = initializers.items() if hasattr(initializers, "items") else []
+    for name, init in items:
+        props = _metadata_props(init)
+        arg_name = props.get("pkg.torch.onnx.original_node_name") or str(name)
+        target = targets_by_arg.get(arg_name)
+        if target:
+            result[str(name)] = target
+    return result
+
+
+def _onnx_ir_dtype_to_tensor_proto(dtype) -> int:
+    from onnx import TensorProto
+
+    name = str(dtype).split(".")[-1].upper()
+    mapping = {
+        "FLOAT": TensorProto.FLOAT,
+        "FLOAT16": TensorProto.FLOAT16,
+        "BFLOAT16": TensorProto.BFLOAT16,
+        "INT64": TensorProto.INT64,
+        "INT32": TensorProto.INT32,
+    }
+    if name not in mapping:
+        raise SystemExit(f"unsupported ONNX IR initializer dtype: {dtype}")
+    return mapping[name]
+
+
+def _onnx_ir_initializer_specs(onnx_program) -> dict[str, dict]:
+    graph = getattr(getattr(onnx_program, "model", None), "graph", None)
+    if graph is None:
+        return {}
+    initializers = getattr(graph, "initializers", {})
+    items = initializers.items() if hasattr(initializers, "items") else []
+    specs: dict[str, dict] = {}
+    for name, init in items:
+        shape = [int(dim) for dim in getattr(init, "shape", [])]
+        specs[str(name)] = {
+            "dims": shape,
+            "data_type": _onnx_ir_dtype_to_tensor_proto(getattr(init, "dtype", None)),
+        }
+    return specs
+
+
+def _rename_graph_uses(model_proto, old_name: str, new_name: str) -> None:
+    if old_name == new_name:
+        return
+    for node in model_proto.graph.node:
+        for i, ref in enumerate(node.input):
+            if ref == old_name:
+                node.input[i] = new_name
+    for value_info in list(model_proto.graph.input) + list(model_proto.graph.value_info) + list(model_proto.graph.output):
+        if value_info.name == old_name:
+            value_info.name = new_name
+
+
+def _remove_graph_inputs(model_proto, names: set[str]) -> None:
+    kept = [value_info for value_info in model_proto.graph.input if value_info.name not in names]
+    del model_proto.graph.input[:]
+    model_proto.graph.input.extend(kept)
+
+
+def _remove_initializer_graph_inputs(model_proto) -> int:
+    initializer_names = {init.name for init in model_proto.graph.initializer}
+    before = len(model_proto.graph.input)
+    _remove_graph_inputs(model_proto, initializer_names)
+    return before - len(model_proto.graph.input)
+
+
+def _external_initializer(name: str, data_type: int, dims: list[int], location: str, offset: int, length: int):
+    from onnx import TensorProto, helper
+
+    init = helper.make_tensor(name=name, data_type=data_type, dims=dims, vals=[])
+    init.data_location = TensorProto.EXTERNAL
+    del init.external_data[:]
+    for key, value in (
+        ("location", location),
+        ("offset", str(int(offset))),
+        ("length", str(int(length))),
+    ):
+        entry = init.external_data.add()
+        entry.key = key
+        entry.value = value
+    return init
+
+
+def _validate_external_data_artifacts(output_path: str) -> dict:
+    import onnx
+    from onnx import TensorProto
+
+    model = onnx.load(output_path, load_external_data=False)
+    output_dir = Path(output_path).parent
+    missing_external = []
+    embedded = []
+    by_location: dict[str, dict] = {}
+
+    for init in model.graph.initializer:
+        if init.data_location != TensorProto.EXTERNAL:
+            embedded.append(init.name)
+            continue
+        entries = {item.key: item.value for item in init.external_data}
+        location = entries.get("location")
+        offset = int(entries.get("offset", "0"))
+        length_value = entries.get("length")
+        if not location or length_value is None:
+            missing_external.append(init.name)
+            continue
+        length = int(length_value)
+        info = by_location.setdefault(location, {"max_end": 0, "bytes": 0, "count": 0})
+        info["max_end"] = max(info["max_end"], offset + length)
+        info["bytes"] += length
+        info["count"] += 1
+
+    if embedded:
+        raise SystemExit(
+            "low-memory export left embedded ONNX initializer(s); expected all weights external: "
+            + ", ".join(embedded[:12])
+            + (" ..." if len(embedded) > 12 else "")
+        )
+    if missing_external:
+        raise SystemExit(
+            "low-memory export wrote initializer(s) without complete external-data metadata: "
+            + ", ".join(missing_external[:12])
+            + (" ..." if len(missing_external) > 12 else "")
+        )
+    if not by_location:
+        raise SystemExit("low-memory export produced no external initializers")
+
+    files = []
+    for location, info in sorted(by_location.items()):
+        path = output_dir / location
+        if not path.is_file():
+            raise SystemExit(f"low-memory export is missing external data file: {path}")
+        size = path.stat().st_size
+        if size < info["max_end"]:
+            raise SystemExit(
+                f"external data file is truncated: {path} has {size} bytes, "
+                f"but initializers reference up to {info['max_end']} bytes"
+            )
+        files.append(
+            {
+                "path": location,
+                "size_bytes": size,
+                "referenced_bytes": info["bytes"],
+                "initializer_count": info["count"],
+            }
+        )
+
+    return {
+        "initializer_count": len(model.graph.initializer),
+        "external_data_files": files,
+        "external_data_total_size_bytes": sum(item["size_bytes"] for item in files),
+        "external_data_referenced_bytes": sum(item["referenced_bytes"] for item in files),
+    }
+
+
+def _tensor_value_info_shapes(model) -> dict[str, list[int | None]]:
+    shapes: dict[str, list[int | None]] = {}
+    for value_info in list(model.graph.input) + list(model.graph.value_info) + list(model.graph.output):
+        tensor_type = value_info.type.tensor_type
+        if not tensor_type.HasField("shape"):
+            continue
+        dims: list[int | None] = []
+        for dim in tensor_type.shape.dim:
+            dims.append(int(dim.dim_value) if dim.HasField("dim_value") else None)
+        shapes[value_info.name] = dims
+    return shapes
+
+
+def _constant_arrays(model):
+    import onnx
+    import numpy as np
+    from onnx import numpy_helper
+
+    values = {}
+    for init in model.graph.initializer:
+        if init.data_location != onnx.TensorProto.EXTERNAL:
+            values[init.name] = numpy_helper.to_array(init)
+    for node in model.graph.node:
+        if node.op_type != "Constant" or len(node.output) != 1:
+            continue
+        for attr in node.attribute:
+            if attr.name == "value":
+                values[node.output[0]] = numpy_helper.to_array(attr.t)
+            elif attr.name == "value_int":
+                values[node.output[0]] = np.asarray(attr.i, dtype=np.int64)
+            elif attr.name == "value_ints":
+                values[node.output[0]] = np.asarray(list(attr.ints), dtype=np.int64)
+    return values
+
+
+def _static_int_array(constant_arrays: dict, name: str):
+    import numpy as np
+
+    if not name:
+        return None
+    arr = constant_arrays.get(name)
+    if arr is None or not np.issubdtype(arr.dtype, np.integer):
+        return None
+    return arr.astype(np.int64, copy=False)
+
+
+def _node_attr_int(node, name: str, default: int) -> int:
+    import onnx
+
+    for attr in node.attribute:
+        if attr.name == name and attr.type == onnx.AttributeProto.INT:
+            return int(attr.i)
+    return int(default)
+
+
+def _normalize_axis(axis: int, rank: int | None) -> int:
+    if rank is not None and axis < 0:
+        return int(axis + rank)
+    return int(axis)
+
+
+def _rewrite_split_to_sequence_for_trt(model) -> dict:
+    """Lower SplitToSequence+SequenceAt pairs to TensorRT-supported Split nodes."""
+    from collections import defaultdict
+    from onnx import TensorProto, helper
+
+    constant_arrays = _constant_arrays(model)
+    shapes = _tensor_value_info_shapes(model)
+    consumers: dict[str, list] = defaultdict(list)
+    for node in model.graph.node:
+        for input_name in node.input:
+            if input_name:
+                consumers[input_name].append(node)
+
+    remove_ids = set()
+    inserted_split_count = 0
+    removed_sequence_at_count = 0
+    new_nodes = []
+
+    for node in model.graph.node:
+        if id(node) in remove_ids:
+            continue
+        if node.op_type != "SplitToSequence":
+            new_nodes.append(node)
+            continue
+        if len(node.input) < 1 or len(node.output) != 1:
+            raise SystemExit(f"cannot rewrite malformed SplitToSequence node: {node.name or node.output}")
+
+        sequence_name = node.output[0]
+        sequence_consumers = consumers.get(sequence_name, [])
+        sequence_at_nodes = [consumer for consumer in sequence_consumers if consumer.op_type == "SequenceAt"]
+        unsupported = [consumer for consumer in sequence_consumers if consumer.op_type != "SequenceAt"]
+        if unsupported:
+            names = ", ".join((consumer.name or consumer.op_type) for consumer in unsupported[:6])
+            raise SystemExit(
+                f"cannot rewrite SplitToSequence {node.name or sequence_name}: "
+                f"unsupported sequence consumer(s): {names}"
+            )
+        if not sequence_at_nodes:
+            inserted_split_count += 1
+            continue
+
+        raw_axis = _node_attr_int(node, "axis", 0)
+        keepdims = _node_attr_int(node, "keepdims", 1)
+        input_shape = shapes.get(node.input[0])
+        output_shape = shapes.get(sequence_at_nodes[0].output[0]) if sequence_at_nodes[0].output else None
+        rank = len(input_shape) if input_shape is not None else (len(output_shape) if output_shape is not None else None)
+        axis = _normalize_axis(raw_axis, rank)
+
+        indexed_outputs: dict[int, list[str]] = defaultdict(list)
+        max_index = -1
+        for sequence_at in sequence_at_nodes:
+            if len(sequence_at.output) != 1:
+                raise SystemExit(f"cannot rewrite malformed SequenceAt node: {sequence_at.name or sequence_at.output}")
+            if len(sequence_at.input) >= 2 and sequence_at.input[1]:
+                index_arr = _static_int_array(constant_arrays, sequence_at.input[1])
+                if index_arr is None or index_arr.size != 1:
+                    raise SystemExit(f"cannot rewrite dynamic SequenceAt index: {sequence_at.name or sequence_at.output}")
+                index = int(index_arr.reshape(-1)[0])
+            else:
+                index = 0
+            indexed_outputs[index].append(sequence_at.output[0])
+            max_index = max(max_index, index)
+            remove_ids.add(id(sequence_at))
+
+        split_input_name = node.input[1] if len(node.input) >= 2 and node.input[1] else ""
+        split_arr = _static_int_array(constant_arrays, split_input_name)
+        split_inputs = [node.input[0]]
+        split_attrs = {"axis": axis}
+        if split_arr is not None and split_arr.ndim > 0 and split_arr.size > 1:
+            output_count = int(split_arr.size)
+            split_inputs.append(split_input_name)
+        else:
+            if split_arr is not None and split_arr.size == 1:
+                split_size = int(split_arr.reshape(-1)[0])
+            else:
+                split_size = 1
+            dim = input_shape[axis] if input_shape is not None and 0 <= axis < len(input_shape) else None
+            if dim is not None and split_size > 0:
+                output_count = int((dim + split_size - 1) // split_size)
+            else:
+                output_count = max_index + 1
+            split_attrs["num_outputs"] = output_count
+
+        if output_count <= 0:
+            raise SystemExit(f"cannot rewrite SplitToSequence with zero outputs: {node.name or sequence_name}")
+        normalized_outputs = {}
+        for index, outputs in list(indexed_outputs.items()):
+            normalized_index = index + output_count if index < 0 else index
+            if normalized_index < 0 or normalized_index >= output_count:
+                raise SystemExit(
+                    f"SequenceAt index {index} is out of range for {node.name or sequence_name} "
+                    f"with {output_count} split outputs"
+                )
+            normalized_outputs[normalized_index] = outputs
+
+        split_outputs = [f"{sequence_name}_trt_split_{i}" for i in range(output_count)]
+        new_nodes.append(
+            helper.make_node(
+                "Split",
+                split_inputs,
+                split_outputs,
+                name=node.name or f"{sequence_name}/SplitForTensorRT",
+                **split_attrs,
+            )
+        )
+        inserted_split_count += 1
+
+        for index in range(output_count):
+            for output_name in normalized_outputs.get(index, []):
+                if keepdims:
+                    new_nodes.append(
+                        helper.make_node(
+                            "Identity",
+                            [split_outputs[index]],
+                            [output_name],
+                            name=f"{output_name}/SequenceAtIdentity",
+                        )
+                    )
+                else:
+                    axes_name = f"{output_name}_sequence_squeeze_axes"
+                    new_nodes.append(
+                        helper.make_node(
+                            "Constant",
+                            [],
+                            [axes_name],
+                            name=f"{output_name}/SequenceSqueezeAxes",
+                            value=helper.make_tensor(axes_name, TensorProto.INT64, [1], [axis]),
+                        )
+                    )
+                    new_nodes.append(
+                        helper.make_node(
+                            "Squeeze",
+                            [split_outputs[index], axes_name],
+                            [output_name],
+                            name=f"{output_name}/SequenceAtSqueeze",
+                        )
+                    )
+                removed_sequence_at_count += 1
+
+    if inserted_split_count:
+        del model.graph.node[:]
+        model.graph.node.extend(new_nodes)
+
+    return {
+        "split_to_sequence_rewritten": inserted_split_count,
+        "sequence_at_removed": removed_sequence_at_count,
+    }
+
+
+def _write_param_tensor_external(out, tensor: torch.Tensor, limit_mb: int = 256) -> tuple[int, int]:
+    import numpy as np
+
+    param = tensor.detach().cpu().contiguous()
+    nbytes = int(param.numel() * param.element_size())
+    if nbytes > limit_mb * 1024 * 1024:
+        raise SystemExit(
+            f"cannot materialize fallback parameter of {nbytes / 1e6:.1f} MB; "
+            "expected to stream it from safetensors instead"
+        )
+    offset = out.tell()
+    arr = np.asarray(param.numpy())
+    out.write(memoryview(arr).cast("B"))
+    return offset, nbytes
+
+
+def _read_f32_source_array(source: dict, limit_mb: int = 256):
+    import numpy as np
+
+    if source["dtype"] != "F32":
+        raise SystemExit(f"derived DiT tensor streaming expects FP32 safetensors, got {source['dtype']}")
+    if int(source["length"]) > limit_mb * 1024 * 1024:
+        raise SystemExit(
+            f"refusing to materialize derived tensor source of {int(source['length']) / 1e6:.1f} MB"
+        )
+    with open(source["path"], "rb") as f:
+        f.seek(int(source["offset"]))
+        block = f.read(int(source["length"]))
+    if len(block) != int(source["length"]):
+        raise IOError(f"unexpected EOF while reading {source['path']}")
+    return np.frombuffer(block, dtype="<f4").reshape(source["shape"]).copy()
+
+
+def _match_derived_array_to_dims(name: str, arr, dims: list[int]):
+    if list(arr.shape) == dims:
+        return arr
+    if arr.ndim == 2 and list(arr.T.shape) == dims:
+        return arr.T.copy()
+    raise SystemExit(f"derived tensor shape mismatch for {name}: derived {list(arr.shape)} vs ONNX {dims}")
+
+
+def _derived_dit_array_for_exported_param(name: str, source_index: dict[str, dict], dims: list[int]):
+    import numpy as np
+
+    match = re.match(r"^dit\.proj_in\.([0-9]+)\.linear\.(weight|bias)$", name)
+    if match:
+        idx, kind = match.groups()
+        source_name = f"decoder.proj_in.{idx}.{'weight' if kind == 'weight' else 'bias'}"
+        source = source_index.get(source_name)
+        if source is None:
+            return None
+        arr = _read_f32_source_array(source)
+        if kind == "weight":
+            arr = arr.reshape(arr.shape[0], -1)
+        return _match_derived_array_to_dims(name, arr.astype(np.float32, copy=False), dims)
+
+    match = re.match(r"^dit\.proj_out\.([0-9]+)\.linear\.(weight|bias)$", name)
+    if match:
+        idx, kind = match.groups()
+        source_name = f"decoder.proj_out.{idx}.{'weight' if kind == 'weight' else 'bias'}"
+        source = source_index.get(source_name)
+        if source is None:
+            return None
+        arr = _read_f32_source_array(source)
+        if kind == "weight":
+            arr = arr.transpose(1, 2, 0).reshape(arr.shape[1] * arr.shape[2], arr.shape[0])
+        else:
+            weight_source = source_index.get(f"decoder.proj_out.{idx}.weight")
+            if weight_source is None or len(weight_source["shape"]) != 3:
+                raise SystemExit(f"cannot derive repeat factor for {name}")
+            arr = np.repeat(arr, int(weight_source["shape"][2]))
+        return _match_derived_array_to_dims(name, arr.astype(np.float32, copy=False), dims)
+
+    return None
+
+
+def _derived_runtime_buffer_array(name: str, wrapper: nn.Module, dims: list[int]):
+    import numpy as np
+
+    if not (
+        name.endswith(".rotary_emb.inv_freq")
+        or name.endswith(".rotary_emb.original_inv_freq")
+    ):
+        return None
+    dit = getattr(wrapper, "dit", None)
+    rotary = getattr(dit, "rotary_emb", None)
+    config = getattr(dit, "config", None)
+    if rotary is None or config is None:
+        return None
+    try:
+        rotary_cpu = type(rotary)(config=config, device="cpu")
+        buffer_name = name.rsplit(".", 1)[-1]
+        tensor = getattr(rotary_cpu, buffer_name)
+    except Exception as exc:
+        raise SystemExit(f"cannot derive low-memory rotary buffer {name}: {exc}") from None
+    arr = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+    return _match_derived_array_to_dims(name, arr, dims)
+
+
+def _source_layout(source: dict, onnx_dims: list[int]) -> tuple[list[int], bool]:
+    source_dims = [int(x) for x in source["shape"]]
+    if source_dims == onnx_dims:
+        return source_dims, False
+    if len(source_dims) == 2 and source_dims[::-1] == onnx_dims:
+        return source_dims, True
+    raise SystemExit(f"shape mismatch: ONNX {onnx_dims} vs safetensors {source_dims}")
+
+
+def _read_f32_rows(source: dict, source_dims: list[int], row_start: int, rows: int):
+    import numpy as np
+
+    if source["dtype"] != "F32":
+        raise SystemExit(f"low-memory streaming expects FP32 safetensors, got {source['dtype']}")
+    row_width = _shape_numel(source_dims[1:])
+    nbytes = int(rows) * row_width * 4
+    with open(source["path"], "rb") as f:
+        f.seek(int(source["offset"]) + int(row_start) * row_width * 4)
+        block = f.read(nbytes)
+    if len(block) != nbytes:
+        raise IOError(f"unexpected EOF while reading {source['path']}")
+    return np.frombuffer(block, dtype="<f4").reshape((int(rows), *source_dims[1:]))
+
+
+def _rows_per_chunk(shape: list[int], chunk_bytes: int) -> int:
+    row_bytes = max(1, _shape_numel(shape[1:]) * 4)
+    return max(1, int(chunk_bytes) // row_bytes)
+
+
+def _stream_f32_as_f16(source: dict, out, chunk_bytes: int) -> tuple[int, int]:
+    import numpy as np
+
+    if source["dtype"] != "F32":
+        raise SystemExit(f"low-memory FP16 streaming expects FP32 safetensors, got {source['dtype']}")
+    offset = out.tell()
+    remaining = int(source["length"])
+    if remaining % 4:
+        raise SystemExit(f"FP32 safetensor byte length is not divisible by 4 for {source['path']}")
+    max_bytes = max(4, int(chunk_bytes) // 4 * 4)
+    with open(source["path"], "rb") as f:
+        f.seek(int(source["offset"]))
+        while remaining:
+            block = f.read(min(max_bytes, remaining))
+            if not block:
+                raise IOError(f"unexpected EOF while reading {source['path']}")
+            arr = np.frombuffer(block, dtype="<f4")
+            out_arr = arr.astype("<f2")
+            out.write(memoryview(out_arr).cast("B"))
+            remaining -= len(block)
+    return offset, int(source["length"] // 2)
+
+
+def _stream_f32_transposed(
+    source: dict,
+    source_dims: list[int],
+    data_path: str,
+    out,
+    dst_dtype,
+    chunk_bytes: int,
+    transform=None,
+) -> tuple[int, int]:
+    import numpy as np
+
+    if len(source_dims) != 2:
+        raise SystemExit(f"streamed transpose only supports 2D tensors, got {source_dims}")
+    dst_shape = (int(source_dims[1]), int(source_dims[0]))
+    dtype = np.dtype(dst_dtype)
+    offset, length = _reserve_external_range(out, _shape_numel(dst_shape) * dtype.itemsize)
+    mapped = np.memmap(data_path, dtype=dtype, mode="r+", offset=offset, shape=dst_shape, order="C")
+    rows_per_chunk = _rows_per_chunk(source_dims, chunk_bytes)
+    for row_start in range(0, source_dims[0], rows_per_chunk):
+        rows = min(rows_per_chunk, source_dims[0] - row_start)
+        chunk = _read_f32_rows(source, source_dims, row_start, rows)
+        converted = transform(chunk, row_start) if transform is not None else chunk.astype(dtype, copy=False)
+        mapped[:, row_start:row_start + rows] = converted.T
+    mapped.flush()
+    del mapped
+    out.seek(offset + length)
+    return offset, int(length)
+
+
+def _compute_w8_scale_streaming(
+    source: dict,
+    source_dims: list[int],
+    onnx_dims: list[int],
+    transposed: bool,
+    axis: int,
+    chunk_bytes: int,
+):
+    import numpy as np
+
+    if len(source_dims) != 2 or len(onnx_dims) != 2:
+        raise SystemExit(f"W8A16 streaming currently supports 2D weights only, got {source_dims} -> {onnx_dims}")
+    if axis < 0:
+        axis += len(onnx_dims)
+    if axis not in (0, 1):
+        raise SystemExit(f"W8A16 axis {axis} is out of range for {onnx_dims}")
+
+    max_abs = np.zeros((onnx_dims[axis],), dtype=np.float32)
+    rows_per_chunk = _rows_per_chunk(source_dims, chunk_bytes)
+    for row_start in range(0, source_dims[0], rows_per_chunk):
+        rows = min(rows_per_chunk, source_dims[0] - row_start)
+        chunk = _read_f32_rows(source, source_dims, row_start, rows)
+        abs_chunk = np.abs(chunk)
+        if not transposed and axis == 0:
+            max_abs[row_start:row_start + rows] = np.max(abs_chunk, axis=1)
+        elif not transposed and axis == 1:
+            max_abs = np.maximum(max_abs, np.max(abs_chunk, axis=0))
+        elif transposed and axis == 0:
+            max_abs = np.maximum(max_abs, np.max(abs_chunk, axis=0))
+        else:
+            max_abs[row_start:row_start + rows] = np.max(abs_chunk, axis=1)
+
+    scale = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
+    return scale
+
+
+def _quantize_chunk_w8(chunk, scale, axis: int, transposed: bool, row_start: int):
+    import numpy as np
+
+    if not transposed and axis == 0:
+        denom = scale[row_start:row_start + chunk.shape[0]].astype(np.float32).reshape(-1, 1)
+    elif not transposed and axis == 1:
+        denom = scale.astype(np.float32).reshape(1, -1)
+    elif transposed and axis == 0:
+        denom = scale.astype(np.float32).reshape(1, -1)
+    else:
+        denom = scale[row_start:row_start + chunk.shape[0]].astype(np.float32).reshape(-1, 1)
+    q = np.rint(chunk / denom)
+    return np.clip(q, -127, 127).astype(np.int8)
+
+
+def _stream_w8_quantized(
+    source: dict,
+    source_dims: list[int],
+    onnx_dims: list[int],
+    transposed: bool,
+    axis: int,
+    scale,
+    data_path: str,
+    out,
+    chunk_bytes: int,
+) -> tuple[int, int]:
+    import numpy as np
+
+    if transposed:
+        return _stream_f32_transposed(
+            source,
+            source_dims,
+            data_path,
+            out,
+            np.int8,
+            chunk_bytes,
+            transform=lambda chunk, row_start: _quantize_chunk_w8(chunk, scale, axis, True, row_start),
+        )
+
+    offset = out.tell()
+    rows_per_chunk = _rows_per_chunk(source_dims, chunk_bytes)
+    for row_start in range(0, source_dims[0], rows_per_chunk):
+        rows = min(rows_per_chunk, source_dims[0] - row_start)
+        chunk = _read_f32_rows(source, source_dims, row_start, rows)
+        q = _quantize_chunk_w8(chunk, scale, axis, False, row_start)
+        out.write(memoryview(q).cast("B"))
+    return offset, _shape_numel(onnx_dims)
+
+
+def _write_low_memory_precision_manifest(
+    output_path: str,
+    wrapper: nn.Module,
+    precision: str,
+    downcast_to_fp16: list[str],
+    quantized_to_int8: list[str],
+    rewrite_report: dict | None = None,
+    w8_axes: dict[str, int] | None = None,
+) -> dict:
+    all_param_names = [name for name, _ in wrapper.named_parameters()]
+    matrix_param_names = [name for name, p in wrapper.named_parameters() if p.dim() >= 2]
+    non_matrix_param_names = sorted(set(all_param_names) - set(matrix_param_names))
+    fp16_names, fp32_matrix_names = classify_tensor_names(matrix_param_names)
+    pattern_match_counts = {
+        pattern: sum(1 for name in matrix_param_names if re.match(pattern, name))
+        for pattern in TRT_FP16_WEIGHT_ALLOWLIST_PATTERNS
+    }
+    unmatched_patterns = [pattern for pattern, count in pattern_match_counts.items() if count == 0]
+    preserved_names = sorted(fp32_matrix_names + non_matrix_param_names)
+    report = {
+        "precision_policy": precision,
+        "matched_allowlist": fp16_names if precision in {"q8map-fp16", "w8a16"} else [],
+        "downcast_to_fp16": sorted(downcast_to_fp16),
+        "quantized_to_int8": sorted(quantized_to_int8),
+        "preserved_fp32": sorted(all_param_names) if precision == "fp32" else preserved_names,
+        "missing_initializers": [],
+        "allowlist_patterns": TRT_FP16_WEIGHT_ALLOWLIST_PATTERNS,
+        "allowlist_pattern_match_counts": pattern_match_counts,
+        "unmatched_allowlist_patterns": unmatched_patterns,
+        "all_parameter_count": len(all_param_names),
+        "matrix_parameter_count": len(matrix_param_names),
+        "non_matrix_parameter_count": len(non_matrix_param_names),
+        "preserved_fp32_matrix": fp32_matrix_names,
+        "preserved_fp32_non_matrix": non_matrix_param_names,
+        "low_memory_export": True,
+    }
+    if rewrite_report:
+        report["rewrite"] = rewrite_report
+    if precision == "w8a16":
+        report["dequantized_to_fp16"] = sorted(quantized_to_int8)
+        report["w8a16_axis_by_name"] = w8_axes or {}
+        report["weight_only_quantization"] = {
+            "weight_dtype": "int8",
+            "activation_dtype": "fp16",
+            "scale_dtype": "fp16",
+            "zero_point_dtype": "int8",
+            "granularity": "per-output-channel",
+            "scheme": "symmetric",
+            "q_range": [-127, 127],
+        }
+    if precision in {"q8map-fp16", "w8a16"}:
+        if not fp16_names:
+            raise SystemExit(f"hardcoded DiT {precision} allowlist matched zero exported parameters")
+        if unmatched_patterns:
+            raise SystemExit(
+                f"hardcoded DiT {precision} allowlist pattern(s) matched zero exported parameters: "
+                + ", ".join(unmatched_patterns)
+            )
+    write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
+    write_json(Path(output_path).with_suffix(".precision.json"), report)
+    return report
+
+
+def _externalize_initializers_from_safetensors(
+    onnx_program,
+    output_path: str,
+    model_dir: Path,
+    wrapper: nn.Module,
+    precision: str = "fp32",
+    chunk_mb: int = 16,
+    graph_shell_path: str | None = None,
+) -> dict:
+    """Attach ONNX weights by streaming raw safetensors bytes into external data."""
+    import onnx
+    import numpy as np
+    from onnx import TensorProto
+
+    model_proto = onnx.load(graph_shell_path or output_path, load_external_data=False)
+    target_by_init = _onnx_ir_initializer_targets(onnx_program)
+    if not target_by_init:
+        raise SystemExit("low-memory export could not recover PyTorch parameter names from ONNX metadata")
+    initializer_specs = _onnx_ir_initializer_specs(onnx_program)
+    if not initializer_specs:
+        raise SystemExit("low-memory export could not recover initializer specs from ONNX IR metadata")
+
+    if precision not in {"fp32", "q8map-fp16", "w8a16"}:
+        raise SystemExit(f"unknown low-memory precision policy: {precision}")
+
+    source_index = _build_safetensor_index(model_dir)
+    wrapper_params = dict(wrapper.named_parameters())
+    wrapper_tensors = {
+        **wrapper_params,
+        **dict(wrapper.named_buffers()),
+    }
+    matrix_param_names = [name for name, p in wrapper.named_parameters() if p.dim() >= 2]
+    fp16_names, _ = classify_tensor_names(matrix_param_names)
+    selected_names = set(fp16_names) if precision in {"q8map-fp16", "w8a16"} else set()
+    chunk_bytes = max(1, int(chunk_mb)) * 1024 * 1024
+
+    data_path = output_path + ".data"
+    if os.path.exists(data_path):
+        os.remove(data_path)
+    data_location = os.path.basename(data_path)
+
+    records = []
+    removed_inputs = set()
+
+    for init_name, target_name in sorted(target_by_init.items()):
+        init_spec = initializer_specs.get(init_name)
+        if init_spec is None:
+            continue
+        if init_spec["data_type"] != TensorProto.FLOAT:
+            raise SystemExit(f"low-memory export currently supports FP32 initializers only, got {init_name}")
+
+        dims = [int(dim) for dim in init_spec["dims"]]
+        source_key = _source_key_for_exported_param(target_name)
+        source = source_index.get(source_key)
+        source_dims = None
+        transposed = False
+        derived_array = None
+        if source is not None:
+            if source["dtype"] != "F32":
+                raise SystemExit(
+                    f"low-memory export expected FP32 safetensors after GGUF conversion, "
+                    f"but {source_key} is {source['dtype']}"
+                )
+            source_dims, transposed = _source_layout(source, dims)
+        else:
+            derived_array = _derived_dit_array_for_exported_param(target_name, source_index, dims)
+            if derived_array is None:
+                derived_array = _derived_runtime_buffer_array(target_name, wrapper, dims)
+            if derived_array is not None:
+                source_dims = [int(x) for x in derived_array.shape]
+            else:
+                param = wrapper_tensors.get(target_name)
+                if param is None or getattr(param, "is_meta", False):
+                    raise SystemExit(
+                        f"no safetensors source or low-memory derivation found for {target_name}"
+                    )
+                param_shape = [int(x) for x in param.shape]
+                if param_shape == dims:
+                    source_dims = param_shape
+                elif len(param_shape) == 2 and param_shape[::-1] == dims:
+                    source_dims = param_shape
+                    transposed = True
+                else:
+                    raise SystemExit(f"fallback parameter shape mismatch for {target_name}: {param_shape} vs {dims}")
+            if derived_array is None:
+                param = wrapper_tensors.get(target_name)
+            else:
+                param = None
+
+        _rename_graph_uses(model_proto, init_name, target_name)
+        removed_inputs.add(init_name)
+        removed_inputs.add(target_name)
+        records.append(
+            {
+                "init_name": init_name,
+                "target_name": target_name,
+                "dims": dims,
+                "source_key": source_key,
+                "source": source,
+                "source_dims": source_dims,
+                "transposed": transposed,
+                "derived_array": derived_array,
+            }
+        )
+
+    record_names = {record["target_name"] for record in records}
+    selected_initializer_names = set()
+    if precision in {"q8map-fp16", "w8a16"}:
+        selected_initializer_names = selected_names & record_names
+        missing = sorted(selected_names - selected_initializer_names)
+        if missing:
+            raise SystemExit(
+                f"hardcoded DiT {precision} allowlist matched parameters missing from ONNX initializers: "
+                + ", ".join(missing[:12])
+                + (" ..." if len(missing) > 12 else "")
+            )
+
+    _remove_graph_inputs(model_proto, removed_inputs)
+    w8_axes: dict[str, int] = {}
+    if precision == "w8a16":
+        w8_axes = _collect_w8a16_weight_axes(model_proto, selected_initializer_names)
+        missing_axes = sorted(selected_initializer_names - set(w8_axes))
+        if missing_axes:
+            raise SystemExit(
+                "hardcoded DiT W8A16 allowlist matched parameters that were not MatMul/Gemm weights: "
+                + ", ".join(missing_axes[:12])
+                + (" ..." if len(missing_axes) > 12 else "")
+            )
+
+    copied_fp32 = 0
+    streamed_fp16 = 0
+    streamed_int8 = 0
+    fallback = 0
+    transposed = []
+    added_initializers = []
+    downcast_to_fp16 = []
+    quantized_to_int8 = []
+    scale_names: dict[str, str] = {}
+    zero_point_names: dict[str, str] = {}
+
+    with open(data_path, "wb") as data_out:
+        for record in records:
+            name = record["target_name"]
+            dims = record["dims"]
+            source = record["source"]
+            source_dims = record["source_dims"]
+            is_transposed = bool(record["transposed"])
+            derived_array = record["derived_array"]
+            if is_transposed:
+                transposed.append(name)
+
+            if precision == "w8a16" and name in selected_initializer_names:
+                axis = w8_axes[name]
+                scale = _compute_w8_scale_streaming(source, source_dims, dims, is_transposed, axis, chunk_bytes) if source else None
+                if source is not None:
+                    offset, length = _stream_w8_quantized(
+                        source,
+                        source_dims,
+                        dims,
+                        is_transposed,
+                        axis,
+                        scale,
+                        data_path,
+                        data_out,
+                        chunk_bytes,
+                    )
+                elif derived_array is not None:
+                    q, scale = _quantize_symmetric_int8_per_channel(derived_array, axis)
+                    offset, length = _write_numpy_external(data_out, q)
+                else:
+                    param = wrapper_tensors[name].detach().cpu().contiguous()
+                    arr = param.numpy().T if is_transposed else param.numpy()
+                    q, scale = _quantize_symmetric_int8_per_channel(arr, axis)
+                    offset, length = _write_numpy_external(data_out, q)
+                    fallback += 1
+                added_initializers.append(_external_initializer(name, TensorProto.INT8, dims, data_location, offset, length))
+
+                scale_name = f"{name}.w8_scale"
+                zero_name = f"{name}.w8_zero_point"
+                scale_offset, scale_length = _write_numpy_external(data_out, np.ascontiguousarray(scale, dtype=np.float16))
+                zero = np.zeros((dims[axis],), dtype=np.int8)
+                zero_offset, zero_length = _write_numpy_external(data_out, zero)
+                added_initializers.append(
+                    _external_initializer(scale_name, TensorProto.FLOAT16, [dims[axis]], data_location, scale_offset, scale_length)
+                )
+                added_initializers.append(
+                    _external_initializer(zero_name, TensorProto.INT8, [dims[axis]], data_location, zero_offset, zero_length)
+                )
+                scale_names[name] = scale_name
+                zero_point_names[name] = zero_name
+                quantized_to_int8.append(name)
+                streamed_int8 += 1
+                continue
+
+            if precision == "q8map-fp16" and name in selected_initializer_names:
+                if source is not None:
+                    if is_transposed:
+                        offset, length = _stream_f32_transposed(source, source_dims, data_path, data_out, "<f2", chunk_bytes)
+                    else:
+                        offset, length = _stream_f32_as_f16(source, data_out, chunk_bytes)
+                elif derived_array is not None:
+                    offset, length = _write_numpy_external(data_out, derived_array.astype(np.float16))
+                else:
+                    param = wrapper_tensors[name].detach().cpu().contiguous()
+                    arr = param.numpy().T if is_transposed else param.numpy()
+                    offset, length = _write_numpy_external(data_out, arr.astype(np.float16))
+                    fallback += 1
+                added_initializers.append(_external_initializer(name, TensorProto.FLOAT16, dims, data_location, offset, length))
+                downcast_to_fp16.append(name)
+                streamed_fp16 += 1
+                continue
+
+            if source is not None:
+                if is_transposed:
+                    offset, length = _stream_f32_transposed(source, source_dims, data_path, data_out, "<f4", chunk_bytes)
+                else:
+                    offset = data_out.tell()
+                    _copy_file_range(source["path"], source["offset"], source["length"], data_out, chunk_bytes)
+                    length = int(source["length"])
+                copied_fp32 += 1
+            elif derived_array is not None:
+                offset, length = _write_numpy_external(data_out, derived_array.astype(np.float32, copy=False))
+                fallback += 1
+            else:
+                param = wrapper_tensors[name].detach().cpu().contiguous()
+                arr = param.numpy().T if is_transposed else param.numpy()
+                offset, length = _write_numpy_external(data_out, arr.astype(np.float32, copy=False))
+                fallback += 1
+            added_initializers.append(_external_initializer(name, TensorProto.FLOAT, dims, data_location, offset, length))
+
+    del model_proto.graph.initializer[:]
+    model_proto.graph.initializer.extend(added_initializers)
+
+    rewrite_report = {}
+    if precision == "q8map-fp16":
+        rewrite_report = _rewrite_fp16_weight_ops(model_proto, set(downcast_to_fp16))
+    elif precision == "w8a16":
+        quant_report = {
+            "quantized": sorted(quantized_to_int8),
+            "missing": [],
+            "skipped": [],
+            "scale_names": scale_names,
+            "zero_point_names": zero_point_names,
+            "axis_by_name": {name: int(w8_axes[name]) for name in quantized_to_int8},
+        }
+        rewrite_report = _rewrite_w8a16_weight_ops(model_proto, quant_report)
+        if not rewrite_report.get("rewritten_nodes"):
+            raise SystemExit("W8A16 quantized weights but rewrote zero MatMul/Gemm nodes")
+
+    sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model_proto)
+    if sequence_rewrite_report["split_to_sequence_rewritten"]:
+        rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
+    constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(
+        model_proto,
+        data_path=data_path,
+        data_location=data_location,
+    )
+    if constant_fold_report["constant_nodes_folded_to_initializers"]:
+        rewrite_report["constant_initializer_fold"] = constant_fold_report
+    removed_initializer_inputs = _remove_initializer_graph_inputs(model_proto)
+    if removed_initializer_inputs:
+        rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
+
+    onnx.save(model_proto, output_path)
+    onnx.checker.check_model(output_path)
+    artifact_report = _validate_external_data_artifacts(output_path)
+    precision_report = _write_low_memory_precision_manifest(
+        output_path,
+        wrapper,
+        precision,
+        downcast_to_fp16,
+        quantized_to_int8,
+        rewrite_report,
+        {name: int(w8_axes[name]) for name in quantized_to_int8} if precision == "w8a16" else None,
+    )
+
+    manifest = {
+        "version": 2,
+        "onnx_path": os.path.basename(output_path),
+        "weights_transposed": sorted(transposed),
+        "weights_renamed": len(records),
+        "external_initializers": len(model_proto.graph.initializer),
+        "low_memory_export": True,
+        "streamed_fp32_from_safetensors": copied_fp32,
+        "streamed_fp16_from_safetensors": streamed_fp16,
+        "streamed_int8_from_safetensors": streamed_int8,
+        "streamed_from_safetensors": copied_fp32 + streamed_fp16 + streamed_int8,
+        "materialized_fallback_parameters": fallback,
+        "constant_nodes_folded_to_initializers": constant_fold_report["constant_nodes_folded_to_initializers"],
+        "external_data": os.path.basename(data_path),
+        "stream_chunk_mb": int(chunk_mb),
+        "external_data_files": artifact_report["external_data_files"],
+        "external_data_total_size_bytes": artifact_report["external_data_total_size_bytes"],
+        "external_data_referenced_bytes": artifact_report["external_data_referenced_bytes"],
+    }
+    manifest_path = output_path + ".refit_manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    return {"manifest": manifest, "precision_report": precision_report}
+
+
+def _node_attr(onnx, node, name: str, default):
+    for attr in node.attribute:
+        if attr.name != name:
+            continue
+        if attr.type == onnx.AttributeProto.INT:
+            return attr.i
+        if attr.type == onnx.AttributeProto.FLOAT:
+            return attr.f
+    return default
+
+
+def _producer_by_output(model) -> dict[str, object]:
+    return {out: node for node in model.graph.node for out in node.output if out}
+
+
+def _transpose_perm(onnx, node, rank: int | None = None) -> list[int] | None:
+    for attr in node.attribute:
+        if attr.name == "perm":
+            return [int(x) for x in attr.ints]
+    if rank is not None:
+        return list(reversed(range(rank)))
+    return None
+
+
+def _trace_selected_source_axis(model, input_name: str, selected_names: set[str], output_axis: int | None = None):
+    import onnx
+
+    producers = _producer_by_output(model)
+    name = input_name
+    axis = output_axis
+    seen = set()
+    while name and name not in seen:
+        seen.add(name)
+        if name in selected_names:
+            return name, axis
+        node = producers.get(name)
+        if node is None:
+            return None
+        if node.op_type in {"Identity", "Cast"}:
+            name = node.input[0] if node.input else ""
+            continue
+        if node.op_type == "Transpose":
+            if axis is not None:
+                perm = _transpose_perm(onnx, node, axis + 1)
+                if perm is None or axis >= len(perm):
+                    return None
+                axis = int(perm[axis])
+            name = node.input[0] if node.input else ""
+            continue
+        return None
+    return None
+
+
+def _trace_selected_source(model, input_name: str, selected_names: set[str]) -> str | None:
+    result = _trace_selected_source_axis(model, input_name, selected_names, None)
+    return result[0] if result else None
+
+
+def _rewrite_fp16_weight_ops(model, fp16_initializer_names: set[str]) -> dict:
+    """Route only selected MatMul/Gemm weights through FP16 compute islands."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    initializer_names = {init.name for init in model.graph.initializer}
+    rewritten = []
+    new_nodes = []
+
+    for node in model.graph.node:
+        if node.op_type not in {"Gemm", "MatMul"}:
+            new_nodes.append(node)
+            continue
+
+        if node.op_type == "MatMul":
+            if len(node.input) != 2 or len(node.output) != 1:
+                raise SystemExit(f"cannot rewrite MatMul node with unexpected arity: {node.name or node.output}")
+            weight_source = _trace_selected_source(model, node.input[1], fp16_initializer_names)
+            if weight_source is None:
+                new_nodes.append(node)
+                continue
+            out = node.output[0]
+            matmul_inputs = list(node.input)
+            if matmul_inputs[0] not in initializer_names and _trace_selected_source(model, matmul_inputs[0], fp16_initializer_names) is None:
+                cast_name = f"{out}_input0_fp16"
+                new_nodes.append(
+                    helper.make_node(
+                        "Cast",
+                        [matmul_inputs[0]],
+                        [cast_name],
+                        name=f"{node.name or out}/CastInput0ToFP16",
+                        to=TensorProto.FLOAT16,
+                    )
+                )
+                matmul_inputs[0] = cast_name
+            fp16_out = f"{out}_fp16"
+            new_nodes.append(helper.make_node("MatMul", matmul_inputs, [fp16_out], name=node.name))
+            new_nodes.append(
+                helper.make_node(
+                    "Cast",
+                    [fp16_out],
+                    [out],
+                    name=f"{node.name or out}/CastOutputToFP32",
+                    to=TensorProto.FLOAT,
+                )
+            )
+            rewritten.append({"op_type": "MatMul", "node": node.name, "weights": [weight_source]})
+            continue
+
+        if node.op_type == "Gemm":
+            if len(node.input) < 2 or len(node.output) != 1:
+                raise SystemExit(f"cannot rewrite Gemm node with unexpected arity: {node.name or node.output}")
+            weight_source = _trace_selected_source(model, node.input[1], fp16_initializer_names)
+            if weight_source is None:
+                new_nodes.append(node)
+                continue
+            alpha = float(_node_attr(onnx, node, "alpha", 1.0))
+            beta = float(_node_attr(onnx, node, "beta", 1.0))
+            trans_a = int(_node_attr(onnx, node, "transA", 0))
+            trans_b = int(_node_attr(onnx, node, "transB", 0))
+            if alpha != 1.0 or beta != 1.0:
+                raise SystemExit(f"cannot rewrite Gemm with alpha/beta != 1: {node.name or node.output}")
+
+            out = node.output[0]
+            a_name = node.input[0]
+            b_name = node.input[1]
+            c_name = node.input[2] if len(node.input) >= 3 and node.input[2] else ""
+
+            a_fp16 = f"{out}_a_fp16"
+            new_nodes.append(
+                helper.make_node("Cast", [a_name], [a_fp16], name=f"{node.name or out}/CastAToFP16", to=TensorProto.FLOAT16)
+            )
+            matmul_a = a_fp16
+            if trans_a:
+                matmul_a = f"{out}_a_fp16_t"
+                new_nodes.append(helper.make_node("Transpose", [a_fp16], [matmul_a], name=f"{node.name or out}/TransposeA"))
+
+            matmul_b = b_name
+            if trans_b:
+                matmul_b = f"{out}_b_fp16_t"
+                new_nodes.append(helper.make_node("Transpose", [b_name], [matmul_b], name=f"{node.name or out}/TransposeB"))
+
+            fp16_out = f"{out}_fp16"
+            fp32_out = out if not c_name else f"{out}_fp32"
+            new_nodes.append(helper.make_node("MatMul", [matmul_a, matmul_b], [fp16_out], name=node.name))
+            new_nodes.append(
+                helper.make_node("Cast", [fp16_out], [fp32_out], name=f"{node.name or out}/CastOutputToFP32", to=TensorProto.FLOAT)
+            )
+            if c_name:
+                new_nodes.append(helper.make_node("Add", [fp32_out, c_name], [out], name=f"{node.name or out}/AddBias"))
+            rewritten.append({"op_type": "Gemm", "node": node.name, "weights": [weight_source], "bias": c_name or None})
+            continue
+
+    del model.graph.node[:]
+    model.graph.node.extend(new_nodes)
+    return {"rewritten_nodes": rewritten}
+
+
+def _quantize_symmetric_int8_per_channel(arr, axis: int):
+    import numpy as np
+
+    arr_f32 = np.asarray(arr, dtype=np.float32)
+    reduce_axes = tuple(i for i in range(arr_f32.ndim) if i != axis)
+    max_abs = np.max(np.abs(arr_f32), axis=reduce_axes)
+    scale = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
+    scale_shape = [1] * arr_f32.ndim
+    scale_shape[axis] = arr_f32.shape[axis]
+    q = np.rint(arr_f32 / scale.reshape(scale_shape))
+    q = np.clip(q, -127, 127).astype(np.int8)
+    return q, scale.astype(np.float16)
+
+
+def _collect_w8a16_weight_axes(model, selected_names: set[str]) -> dict[str, int]:
+    import onnx
+
+    axes: dict[str, int] = {}
+
+    def add_axis(name: str, axis: int, node_name: str) -> None:
+        prev = axes.get(name)
+        if prev is not None and prev != axis:
+            raise SystemExit(
+                f"cannot assign two W8A16 quantization axes for {name}: {prev} vs {axis} at {node_name}"
+            )
+        axes[name] = axis
+
+    for node in model.graph.node:
+        if node.op_type not in {"Gemm", "MatMul"}:
+            continue
+        node_name = node.name or (node.output[0] if node.output else node.op_type)
+        if node.op_type == "MatMul":
+            if len(node.input) != 2:
+                raise SystemExit(f"cannot W8A16-rewrite MatMul with unexpected arity: {node_name}")
+            traced = _trace_selected_source_axis(model, node.input[1], selected_names, 1)
+            if traced is None:
+                continue
+            weight_name, source_axis = traced
+            add_axis(weight_name, source_axis, node_name)
+            continue
+        if node.op_type == "Gemm":
+            if len(node.input) < 2:
+                raise SystemExit(f"cannot W8A16-rewrite Gemm with unexpected arity: {node_name}")
+            trans_b = int(_node_attr(onnx, node, "transB", 0))
+            traced = _trace_selected_source_axis(model, node.input[1], selected_names, 0 if trans_b else 1)
+            if traced is None:
+                continue
+            weight_name, source_axis = traced
+            add_axis(weight_name, source_axis, node_name)
+    return axes
+
+
+def _quantize_w8a16_initializers(model, selected_names: set[str], axes: dict[str, int]) -> dict:
+    import numpy as np
+    from onnx import TensorProto, helper, numpy_helper
+
+    initializers = {init.name: init for init in model.graph.initializer}
+    quantized = []
+    missing = []
+    skipped = []
+    scale_names: dict[str, str] = {}
+    zero_point_names: dict[str, str] = {}
+    axis_by_name: dict[str, int] = {}
+
+    for name in sorted(selected_names):
+        init = initializers.get(name)
+        if init is None:
+            missing.append(name)
+            continue
+        if name not in axes:
+            skipped.append(name)
+            continue
+        arr = numpy_helper.to_array(init)
+        if arr.ndim < 2:
+            skipped.append(name)
+            continue
+        axis = axes[name]
+        if axis < 0:
+            axis += arr.ndim
+        if axis < 0 or axis >= arr.ndim:
+            raise SystemExit(f"W8A16 axis {axis} is out of range for {name} shape {arr.shape}")
+        q, scale = _quantize_symmetric_int8_per_channel(arr, axis)
+        init.CopyFrom(numpy_helper.from_array(q, name=name))
+        init.data_type = TensorProto.INT8
+
+        scale_name = f"{name}.w8_scale"
+        zero_name = f"{name}.w8_zero_point"
+        zero = np.zeros(scale.shape, dtype=np.int8)
+        model.graph.initializer.extend(
+            [
+                numpy_helper.from_array(scale, name=scale_name),
+                numpy_helper.from_array(zero, name=zero_name),
+            ]
+        )
+        scale_names[name] = scale_name
+        zero_point_names[name] = zero_name
+        axis_by_name[name] = axis
+        quantized.append(name)
+
+    return {
+        "quantized": quantized,
+        "missing": missing,
+        "skipped": skipped,
+        "scale_names": scale_names,
+        "zero_point_names": zero_point_names,
+        "axis_by_name": axis_by_name,
+    }
+
+
+def _rewrite_w8a16_weight_ops(model, quant_report: dict) -> dict:
+    """Route selected INT8 weights through DQ-to-FP16 compute islands."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    quantized_names = set(quant_report["quantized"])
+    scale_names = quant_report["scale_names"]
+    zero_point_names = quant_report["zero_point_names"]
+    axis_by_name = quant_report["axis_by_name"]
+    initializer_names = {init.name for init in model.graph.initializer}
+    rewritten = []
+    dq_outputs: dict[str, str] = {}
+    prelude_nodes = []
+    new_nodes = []
+
+    def dq_for_weight(weight_name: str) -> str:
+        existing = dq_outputs.get(weight_name)
+        if existing:
+            return existing
+        dq_name = f"{weight_name}.w8_dequant_fp16"
+        prelude_nodes.append(
+            helper.make_node(
+                "DequantizeLinear",
+                [weight_name, scale_names[weight_name], zero_point_names[weight_name]],
+                [dq_name],
+                name=f"{weight_name}/W8A16Dequantize",
+                axis=axis_by_name[weight_name],
+            )
+        )
+        dq_outputs[weight_name] = dq_name
+        return dq_name
+
+    for weight_name in sorted(quantized_names):
+        dq_for_weight(weight_name)
+
+    def replace_quantized_source(ref: str) -> str:
+        if ref in quantized_names:
+            return dq_for_weight(ref)
+        return ref
+
+    for node in model.graph.node:
+        if node.op_type not in {"Gemm", "MatMul"}:
+            copied = helper.make_node(
+                node.op_type,
+                [replace_quantized_source(ref) for ref in node.input],
+                list(node.output),
+                name=node.name,
+                domain=node.domain,
+            )
+            copied.attribute.extend(node.attribute)
+            new_nodes.append(copied)
+            continue
+
+        if node.op_type == "MatMul":
+            if len(node.input) != 2 or len(node.output) != 1:
+                raise SystemExit(f"cannot W8A16-rewrite MatMul with unexpected arity: {node.name or node.output}")
+            weight_source = _trace_selected_source(model, node.input[1], quantized_names)
+            if weight_source is None:
+                copied = helper.make_node(
+                    node.op_type,
+                    [replace_quantized_source(ref) for ref in node.input],
+                    list(node.output),
+                    name=node.name,
+                    domain=node.domain,
+                )
+                copied.attribute.extend(node.attribute)
+                new_nodes.append(copied)
+                continue
+            out = node.output[0]
+            matmul_inputs = [replace_quantized_source(ref) for ref in node.input]
+            if matmul_inputs[0] not in initializer_names and _trace_selected_source(model, node.input[0], quantized_names) is None:
+                cast_name = f"{out}_input0_fp16"
+                new_nodes.append(
+                    helper.make_node(
+                        "Cast",
+                        [matmul_inputs[0]],
+                        [cast_name],
+                        name=f"{node.name or out}/CastInput0ToFP16",
+                        to=TensorProto.FLOAT16,
+                    )
+                )
+                matmul_inputs[0] = cast_name
+            fp16_out = f"{out}_fp16"
+            new_nodes.append(helper.make_node("MatMul", matmul_inputs, [fp16_out], name=node.name))
+            new_nodes.append(
+                helper.make_node(
+                    "Cast",
+                    [fp16_out],
+                    [out],
+                    name=f"{node.name or out}/CastOutputToFP32",
+                    to=TensorProto.FLOAT,
+                )
+            )
+            rewritten.append({"op_type": "MatMul", "node": node.name, "weights": [weight_source]})
+            continue
+
+        if node.op_type == "Gemm":
+            if len(node.input) < 2 or len(node.output) != 1:
+                raise SystemExit(f"cannot W8A16-rewrite Gemm with unexpected arity: {node.name or node.output}")
+            weight_source = _trace_selected_source(model, node.input[1], quantized_names)
+            if weight_source is None:
+                copied = helper.make_node(
+                    node.op_type,
+                    [replace_quantized_source(ref) for ref in node.input],
+                    list(node.output),
+                    name=node.name,
+                    domain=node.domain,
+                )
+                copied.attribute.extend(node.attribute)
+                new_nodes.append(copied)
+                continue
+            alpha = float(_node_attr(onnx, node, "alpha", 1.0))
+            beta = float(_node_attr(onnx, node, "beta", 1.0))
+            trans_a = int(_node_attr(onnx, node, "transA", 0))
+            trans_b = int(_node_attr(onnx, node, "transB", 0))
+            if alpha != 1.0 or beta != 1.0:
+                raise SystemExit(f"cannot W8A16-rewrite Gemm with alpha/beta != 1: {node.name or node.output}")
+
+            out = node.output[0]
+            a_name = replace_quantized_source(node.input[0])
+            b_name = replace_quantized_source(node.input[1])
+            c_name = node.input[2] if len(node.input) >= 3 and node.input[2] else ""
+            a_fp16 = f"{out}_a_fp16"
+            new_nodes.append(
+                helper.make_node("Cast", [a_name], [a_fp16], name=f"{node.name or out}/CastAToFP16", to=TensorProto.FLOAT16)
+            )
+            matmul_a = a_fp16
+            if trans_a:
+                matmul_a = f"{out}_a_fp16_t"
+                new_nodes.append(helper.make_node("Transpose", [a_fp16], [matmul_a], name=f"{node.name or out}/TransposeA"))
+            matmul_b = b_name
+            if trans_b:
+                matmul_b = f"{out}_b_fp16_t"
+                new_nodes.append(helper.make_node("Transpose", [b_name], [matmul_b], name=f"{node.name or out}/TransposeB"))
+            fp16_out = f"{out}_fp16"
+            fp32_out = out if not c_name else f"{out}_fp32"
+            new_nodes.append(helper.make_node("MatMul", [matmul_a, matmul_b], [fp16_out], name=node.name))
+            new_nodes.append(
+                helper.make_node("Cast", [fp16_out], [fp32_out], name=f"{node.name or out}/CastOutputToFP32", to=TensorProto.FLOAT)
+            )
+            if c_name:
+                new_nodes.append(helper.make_node("Add", [fp32_out, c_name], [out], name=f"{node.name or out}/AddBias"))
+            rewritten.append({"op_type": "Gemm", "node": node.name, "weights": [weight_source], "bias": c_name or None})
+            continue
+
+    del model.graph.node[:]
+    model.graph.node.extend(prelude_nodes)
+    model.graph.node.extend(new_nodes)
+    return {"rewritten_nodes": rewritten, "dequantize_node_count": len(dq_outputs)}
+
+
+def _save_model_external(model, output_path: str) -> None:
+    import onnx
+
+    data_path = output_path + ".data"
+    if os.path.exists(data_path):
+        os.remove(data_path)
+    onnx.save_model(
+        model,
+        output_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(data_path),
+        size_threshold=1024,
+        convert_attribute=False,
+    )
+    onnx.checker.check_model(output_path)
+
+
+def apply_precision_policy_to_onnx(output_path: str, wrapper: nn.Module, precision: str) -> dict:
+    """Apply the hardcoded DiT precision policy and emit a manifest."""
+    import onnx
+    import numpy as np
+    from onnx import TensorProto, numpy_helper
+
+    all_param_names = [name for name, _ in wrapper.named_parameters()]
+    matrix_param_names = [name for name, p in wrapper.named_parameters() if p.dim() >= 2]
+    non_matrix_param_names = sorted(set(all_param_names) - set(matrix_param_names))
+    fp16_names, fp32_matrix_names = classify_tensor_names(matrix_param_names)
+    preserved_names = sorted(fp32_matrix_names + non_matrix_param_names)
+    pattern_match_counts = {
+        pattern: sum(1 for name in matrix_param_names if re.match(pattern, name))
+        for pattern in TRT_FP16_WEIGHT_ALLOWLIST_PATTERNS
+    }
+    unmatched_patterns = [pattern for pattern, count in pattern_match_counts.items() if count == 0]
+    common_report = {
+        "allowlist_patterns": TRT_FP16_WEIGHT_ALLOWLIST_PATTERNS,
+        "allowlist_pattern_match_counts": pattern_match_counts,
+        "unmatched_allowlist_patterns": unmatched_patterns,
+        "all_parameter_count": len(all_param_names),
+        "matrix_parameter_count": len(matrix_param_names),
+        "non_matrix_parameter_count": len(non_matrix_param_names),
+        "preserved_fp32_matrix": fp32_matrix_names,
+        "preserved_fp32_non_matrix": non_matrix_param_names,
+    }
+    if precision == "fp32":
+        model = onnx.load(output_path)
+        rewrite_report = {}
+        sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model)
+        if sequence_rewrite_report["split_to_sequence_rewritten"]:
+            rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
+        constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(model)
+        if constant_fold_report["constant_nodes_folded_to_initializers"]:
+            rewrite_report["constant_initializer_fold"] = constant_fold_report
+        removed_initializer_inputs = _remove_initializer_graph_inputs(model)
+        if removed_initializer_inputs:
+            rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
+        if rewrite_report:
+            _save_model_external(model, output_path)
+        report = {
+            "precision_policy": "fp32",
+            "matched_allowlist": [],
+            "downcast_to_fp16": [],
+            "quantized_to_int8": [],
+            "preserved_fp32": sorted(all_param_names),
+            "missing_initializers": [],
+            **common_report,
+        }
+        if rewrite_report:
+            report["rewrite"] = rewrite_report
+        write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
+        return report
+    if precision == "w8a16":
+        if not fp16_names:
+            raise SystemExit("hardcoded DiT W8A16 allowlist matched zero exported parameters")
+        if unmatched_patterns:
+            raise SystemExit(
+                "hardcoded DiT W8A16 allowlist pattern(s) matched zero exported parameters: "
+                + ", ".join(unmatched_patterns)
+            )
+
+        model = onnx.load(output_path)
+        initializers = {init.name: init for init in model.graph.initializer}
+        selected_initializer_names = {name for name in fp16_names if name in initializers}
+        missing = sorted(set(fp16_names) - selected_initializer_names)
+        if missing:
+            raise SystemExit(
+                "hardcoded DiT W8A16 allowlist matched parameters missing from ONNX initializers: "
+                + ", ".join(missing[:12])
+                + (" ..." if len(missing) > 12 else "")
+            )
+        axes = _collect_w8a16_weight_axes(model, selected_initializer_names)
+        quant_report = _quantize_w8a16_initializers(model, selected_initializer_names, axes)
+        if quant_report["missing"]:
+            raise SystemExit(
+                "hardcoded DiT W8A16 allowlist matched parameters missing from ONNX initializers: "
+                + ", ".join(quant_report["missing"][:12])
+                + (" ..." if len(quant_report["missing"]) > 12 else "")
+            )
+        if quant_report["skipped"]:
+            raise SystemExit(
+                "hardcoded DiT W8A16 allowlist matched parameters that were not MatMul/Gemm weights: "
+                + ", ".join(quant_report["skipped"][:12])
+                + (" ..." if len(quant_report["skipped"]) > 12 else "")
+            )
+        if not quant_report["quantized"]:
+            raise SystemExit("hardcoded DiT W8A16 allowlist matched parameters but no ONNX initializers were quantized")
+
+        rewrite_report = _rewrite_w8a16_weight_ops(model, quant_report)
+        if not rewrite_report["rewritten_nodes"]:
+            raise SystemExit("W8A16 quantized weights but rewrote zero MatMul/Gemm nodes")
+        sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model)
+        if sequence_rewrite_report["split_to_sequence_rewritten"]:
+            rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
+        constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(model)
+        if constant_fold_report["constant_nodes_folded_to_initializers"]:
+            rewrite_report["constant_initializer_fold"] = constant_fold_report
+        removed_initializer_inputs = _remove_initializer_graph_inputs(model)
+        if removed_initializer_inputs:
+            rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
+        _save_model_external(model, output_path)
+
+        report = {
+            "precision_policy": precision,
+            "matched_allowlist": fp16_names,
+            "downcast_to_fp16": [],
+            "quantized_to_int8": quant_report["quantized"],
+            "dequantized_to_fp16": quant_report["quantized"],
+            "w8a16_axis_by_name": quant_report["axis_by_name"],
+            "preserved_fp32": preserved_names,
+            "missing_initializers": [],
+            "rewrite": rewrite_report,
+            "weight_only_quantization": {
+                "weight_dtype": "int8",
+                "activation_dtype": "fp16",
+                "scale_dtype": "fp16",
+                "zero_point_dtype": "int8",
+                "granularity": "per-output-channel",
+                "scheme": "symmetric",
+                "q_range": [-127, 127],
+            },
+            **common_report,
+        }
+        write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
+        write_json(Path(output_path).with_suffix(".precision.json"), report)
+        return report
+
+    if precision != "q8map-fp16":
+        raise SystemExit(f"unknown precision policy: {precision}")
+    if not fp16_names:
+        raise SystemExit("hardcoded DiT precision allowlist matched zero exported parameters")
+    if unmatched_patterns:
+        raise SystemExit(
+            "hardcoded DiT precision allowlist pattern(s) matched zero exported parameters: "
+            + ", ".join(unmatched_patterns)
+        )
+
+    model = onnx.load(output_path)
+    initializers = {init.name: init for init in model.graph.initializer}
+    converted = []
+    missing = []
+    fp16_initializer_names: set[str] = set()
+
+    for name in fp16_names:
+        init = initializers.get(name)
+        if init is None:
+            missing.append(name)
+            continue
+        arr = numpy_helper.to_array(init).astype(np.float16)
+        init.CopyFrom(numpy_helper.from_array(arr, name=name))
+        init.data_type = TensorProto.FLOAT16
+        converted.append(name)
+        fp16_initializer_names.add(name)
+
+    if not converted:
+        raise SystemExit("hardcoded DiT precision allowlist matched parameters but no ONNX initializers were downcast")
+    if missing:
+        raise SystemExit(
+            "hardcoded DiT precision allowlist matched parameters missing from ONNX initializers: "
+            + ", ".join(missing[:12])
+            + (" ..." if len(missing) > 12 else "")
+        )
+
+    rewrite_report = _rewrite_fp16_weight_ops(model, fp16_initializer_names)
+    sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model)
+    if sequence_rewrite_report["split_to_sequence_rewritten"]:
+        rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
+    constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(model)
+    if constant_fold_report["constant_nodes_folded_to_initializers"]:
+        rewrite_report["constant_initializer_fold"] = constant_fold_report
+    removed_initializer_inputs = _remove_initializer_graph_inputs(model)
+    if removed_initializer_inputs:
+        rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
+    _save_model_external(model, output_path)
+
+    report = {
+        "precision_policy": precision,
+        "matched_allowlist": fp16_names,
+        "downcast_to_fp16": converted,
+        "preserved_fp32": preserved_names,
+        "missing_initializers": missing,
+        "quantized_to_int8": [],
+        "rewrite": rewrite_report,
+        **common_report,
+    }
+    write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
+    write_json(Path(output_path).with_suffix(".precision.json"), report)
+    return report
+
+
+def load_dit_model(
+    model_dir: str,
+    device: str = "cpu",
+    precision: str = "q8map-fp16",
+    low_memory_export: bool = False,
+):
     """Load the AceStepDiTModel from a safetensors checkpoint."""
     model_dir = Path(model_dir)
     
@@ -272,7 +2108,7 @@ def load_dit_model(model_dir: str, device: str = "cuda", precision: str = "bf16_
     # Also add the Demon app root — model config files are re-export stubs
     # that import from the acestep package (from Demon).
     sys.path.insert(0, str(model_dir))
-    demon_root = Path(model_dir).resolve().parent.parent.parent / "Demon"
+    demon_root = Path(model_dir).parent.parent.parent / "Demon"
     if demon_root.exists():
         sys.path.insert(0, str(demon_root))
         print(f"[export_dit] Added {demon_root} to sys.path for acestep package")
@@ -312,60 +2148,61 @@ def load_dit_model(model_dir: str, device: str = "cuda", precision: str = "bf16_
     # Force SDPA for ONNX export (no flash attention)
     config._attn_implementation = "sdpa"
     
+    if low_memory_export and device != "cpu":
+        raise SystemExit("low-memory export keeps weights CPU-mapped; use --device cpu")
+
     print(f"[export_dit] Loading model from {model_dir}...")
     print(f"[export_dit] Precision recipe: {precision}")
+    if low_memory_export:
+        print("[export_dit] Low-memory export: meta init only; weights stream after graph export")
     t0 = time.time()
     
     # Create just the DiT model (decoder) — no need for full model
-    dit_model = AceStepDiTModel(config)
-    
-    # Load weights — handle both single-file and sharded safetensors
-    from safetensors.torch import load_file
-    
-    index_path = model_dir / "model.safetensors.index.json"
-    single_path = model_dir / "model.safetensors"
-    
-    if index_path.exists():
-        # Sharded: load index to find all shard files
-        import json as _json
-        with open(index_path) as f:
-            index = _json.load(f)
-        shard_files = sorted(set(index["weight_map"].values()))
-        print(f"[export_dit] Loading {len(shard_files)} shards...")
-        state_dict = {}
-        for shard in shard_files:
-            shard_path = model_dir / shard
-            print(f"[export_dit]   Loading {shard}...")
-            state_dict.update(load_file(str(shard_path)))
-    elif single_path.exists():
-        state_dict = load_file(str(single_path))
+    if low_memory_export:
+        with torch.device("meta"):
+            dit_model = AceStepDiTModel(config)
+        dit_model = dit_model.to(dtype=torch.float32)
+        missing = []
+        unexpected = []
     else:
-        print(f"[export_dit] ERROR: No model.safetensors found in {model_dir}")
-        sys.exit(1)
-    
-    # Filter and remap: "decoder.X" -> "X" for the DiT model
-    dit_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith("decoder."):
-            dit_state_dict[k[len("decoder."):]] = v
-    
-    missing, unexpected = dit_model.load_state_dict(dit_state_dict, strict=False)
+        # Load weights — handle both single-file and sharded safetensors
+        from safetensors.torch import load_file
+
+        shard_paths = _safetensor_paths(model_dir)
+        if len(shard_paths) > 1:
+            print(f"[export_dit] Loading {len(shard_paths)} shards...")
+            state_dict = {}
+            for shard_path in shard_paths:
+                print(f"[export_dit]   Loading {shard_path.name}...")
+                state_dict.update(load_file(str(shard_path)))
+        else:
+            state_dict = load_file(str(shard_paths[0]))
+
+        # Filter and remap: "decoder.X" -> "X" for the DiT model
+        dit_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("decoder."):
+                dit_state_dict[k[len("decoder."):]] = v
+
+        missing, unexpected = dit_model.load_state_dict(dit_state_dict, strict=False)
     if missing:
-        print(f"[export_dit] Warning: {len(missing)} missing keys (first 5: {missing[:5]})")
+        prefix = "ERROR" if low_memory_export else "Warning"
+        print(f"[export_dit] {prefix}: {len(missing)} missing keys (first 5: {missing[:5]})")
+        if low_memory_export:
+            raise SystemExit("low-memory export cannot continue with meta tensors left unloaded")
     if unexpected:
         print(f"[export_dit] Warning: {len(unexpected)} unexpected keys")
     
-    # Apply precision recipe AFTER loading weights (so weights are converted correctly)
-    if precision == "bf16_mixed":
-        dit_model = dit_model.to(device=device)  # move to GPU first
-        dit_model = apply_bf16_mixed(dit_model)
-    elif precision == "fp32":
+    # Supported handoff policies keep the PyTorch export in FP32. q8map-fp16
+    # and w8a16 transform selected ONNX initializers after export according to
+    # the hardcoded Q8_0-equivalent map.
+    if precision not in {"q8map-fp16", "w8a16", "fp32"}:
+        raise ValueError(f"Unknown precision: {precision}. Use 'q8map-fp16', 'w8a16', or 'fp32'.")
+    if not low_memory_export:
         dit_model = dit_model.to(device=device, dtype=torch.float32)
-    else:
-        raise ValueError(f"Unknown precision: {precision}. Use 'bf16_mixed' or 'fp32'.")
     
     # Replace Conv1d/ConvTranspose1d with Linear equivalents for ALL precision modes.
-    # TRT 10.16 has no kernels for 1D convolutions with patch_size=2.
+    # TensorRT handles the patch path more reliably as reshape+matmul.
     dit_model = replace_conv_with_linear(dit_model)
     
     dit_model.eval()
@@ -385,15 +2222,18 @@ def load_dit_model(model_dir: str, device: str = "cuda", precision: str = "bf16_
     return dit_model, config
 
 
-def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision: str = "bf16_mixed"):
+def export_onnx(dit_model, config, output_path: str, opset: int = 18,
+                precision: str = "q8map-fp16", source_model: str = "",
+                model_dir: str = "", low_memory_export: bool = False,
+                stream_chunk_mb: int = 16):
     """Export the DiT forward pass to ONNX."""
     device = next(dit_model.parameters()).device
     
-    # Dummy inputs match precision recipe
-    if precision == "bf16_mixed":
-        tensor_dtype = torch.bfloat16
-    else:
-        tensor_dtype = torch.float32
+    if precision not in {"q8map-fp16", "w8a16", "fp32"}:
+        raise SystemExit(f"unknown precision policy: {precision}")
+
+    # The hardcoded policy is applied to ONNX initializers after FP32 export.
+    tensor_dtype = torch.float32
     
     wrapper = DiTForwardWrapper(dit_model, precision=precision)
     wrapper.eval()
@@ -413,16 +2253,19 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision:
     print(f"[export_dit] Input dtype: {tensor_dtype}, t/t_r dtype: fp32")
     
     # Test forward pass first
-    print("[export_dit] Testing forward pass...")
-    with torch.no_grad():
-        test_out = wrapper(dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r)
-    print(f"[export_dit] Output shape: {list(test_out.shape)} (expected [{B}, {T}, 64])")
-    print(f"[export_dit] Output dtype: {test_out.dtype}")
-    
-    # Check for NaN
-    if torch.isnan(test_out).any():
-        print("[export_dit] ERROR: Output contains NaN! Aborting export.")
-        sys.exit(1)
+    if low_memory_export:
+        print("[export_dit] Skipping PyTorch forward preflight for low-memory export")
+    else:
+        print("[export_dit] Testing forward pass...")
+        with torch.no_grad():
+            test_out = wrapper(dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r)
+        print(f"[export_dit] Output shape: {list(test_out.shape)} (expected [{B}, {T}, 64])")
+        print(f"[export_dit] Output dtype: {test_out.dtype}")
+
+        # Check for NaN
+        if torch.isnan(test_out).any():
+            print("[export_dit] ERROR: Output contains NaN! Aborting export.")
+            sys.exit(1)
     
     # Export to ONNX
     print(f"[export_dit] Exporting to ONNX (opset {opset})...")
@@ -441,18 +2284,87 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision:
         "t_r":           {0: batch},
     }
     
+    export_target = None if low_memory_export else output_path
     onnx_program = torch.onnx.export(
         wrapper,
         (dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r),
-        output_path,
+        export_target,
         opset_version=opset,
         input_names=["input_latents", "enc_hidden", "t", "t_r"],
         output_names=["velocity"],
         dynamic_shapes=dynamic_shapes,
-        export_params=True,
+        export_params=not low_memory_export,
+        keep_initializers_as_inputs=low_memory_export,
         external_data=True,
         dynamo=True,
+        optimize=not low_memory_export,
     )
+
+    if low_memory_export:
+        if not model_dir:
+            raise SystemExit("low-memory export requires model_dir for safetensors streaming")
+        graph_shell_path = output_path + ".graph-shell.onnx"
+        for stale_path in (output_path, output_path + ".data", graph_shell_path, graph_shell_path + ".data"):
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+        print("[export_dit] Saving graph without embedded initializers...")
+        onnx_program.save(
+            graph_shell_path,
+            include_initializers=False,
+            keep_initializers_as_inputs=True,
+            external_data=True,
+        )
+        print(f"[export_dit] Streaming {precision} safetensors into ONNX external data...")
+        try:
+            stream_result = _externalize_initializers_from_safetensors(
+                onnx_program,
+                output_path,
+                Path(model_dir),
+                wrapper,
+                precision=precision,
+                chunk_mb=stream_chunk_mb,
+                graph_shell_path=graph_shell_path,
+            )
+        except BaseException:
+            for stale_path in (output_path, output_path + ".data"):
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
+            raise
+        finally:
+            if os.path.exists(graph_shell_path):
+                os.remove(graph_shell_path)
+        manifest = stream_result["manifest"]
+        precision_report = stream_result["precision_report"]
+        write_export_metadata(
+            Path(output_path).with_suffix(".metadata.json"),
+            ExportMetadata(
+                family="acestep-v15",
+                source_model=source_model,
+                profile="dynamic-4input",
+                precision_policy=precision,
+                tensor_names_fp16=precision_report.get("matched_allowlist", []),
+                tensor_names_fp32=precision_report.get("preserved_fp32", []),
+            ),
+        )
+
+        t1 = time.time()
+        data_path = output_path + ".data"
+        onnx_size = os.path.getsize(output_path)
+        data_size = os.path.getsize(data_path) if os.path.exists(data_path) else 0
+        print(f"[export_dit] Low-memory stream manifest: {manifest['streamed_from_safetensors']} streamed, "
+              f"{manifest['materialized_fallback_parameters']} small fallback")
+        print(f"[export_dit] ONNX trace completed in {t1-t0:.1f}s")
+        print(f"[export_dit] Exported to {output_path}")
+        print(f"[export_dit] ONNX graph file: {onnx_size/1e6:.1f} MB")
+        print(f"[export_dit] ONNX external weight data: {data_size/1e9:.2f} GB ({os.path.basename(data_path)})")
+        print("[export_dit] Keep the .onnx and .onnx.data files together; pass the .onnx path to TensorRT.")
+        for item in manifest.get("external_data_files", []):
+            print(
+                f"[export_dit] External data validated: {item['path']} "
+                f"{item['size_bytes']/1e9:.2f} GB, {item['initializer_count']} initializers"
+            )
+        print(f"[export_dit] Total export time: {time.time()-t0:.1f}s")
+        return output_path
     
     # ── Post-process: rename val_N initializers to original parameter FQNs ──
     # Ported from Demon's rename_val_initializers_to_fqn (export.py:636-879).
@@ -483,8 +2395,6 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision:
     def _bytes_for(p: torch.Tensor):
         """Raw bytes of a torch tensor in its native dtype."""
         p_cpu = p.detach().cpu().contiguous()
-        if p_cpu.dtype == torch.bfloat16:
-            return p_cpu.view(torch.uint16).numpy().tobytes()
         if p_cpu.dtype in (torch.float16, torch.float32):
             return p_cpu.numpy().tobytes()
         return None
@@ -492,7 +2402,6 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision:
     _TORCH_TO_ONNX_DT = {
         torch.float32: TensorProto.FLOAT,
         torch.float16: TensorProto.FLOAT16,
-        torch.bfloat16: TensorProto.BFLOAT16,
     }
     
     # Build torch-side hash index: (onnx_dtype, shape, sha256) → (fqn, transposed)
@@ -551,7 +2460,7 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision:
     val_inits_changed = {}  # old_name → new_name
     transposed_fqns = []
     claimed_torch = set()
-    float_dtypes = (TensorProto.BFLOAT16, TensorProto.FLOAT16, TensorProto.FLOAT)
+    float_dtypes = (TensorProto.FLOAT16, TensorProto.FLOAT)
     renamed = 0
     skipped = 0
     
@@ -627,6 +2536,21 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision:
     with open(manifest_path, 'w') as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
     print(f"[export_dit] Refit manifest saved to {manifest_path}")
+
+    precision_report = apply_precision_policy_to_onnx(output_path, wrapper, precision)
+    write_export_metadata(
+        Path(output_path).with_suffix(".metadata.json"),
+        ExportMetadata(
+            family="acestep-v15",
+            source_model=source_model,
+            profile="dynamic-4input",
+            precision_policy=precision,
+            tensor_names_fp16=precision_report.get("matched_allowlist", []),
+            tensor_names_fp32=precision_report.get("preserved_fp32", []),
+        ),
+    )
+    print(f"[export_dit] Precision policy: {precision} "
+          f"({len(precision_report.get('downcast_to_fp16', []))} tensors downcast)")
     
     t1 = time.time()
     print(f"[export_dit] ONNX trace completed in {t1-t0:.1f}s")
@@ -663,7 +2587,7 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18, precision:
     return output_path
 
 
-def verify_onnx(onnx_path: str, dit_model, config, precision: str = "bf16_mixed"):
+def verify_onnx(onnx_path: str, dit_model, config, precision: str = "q8map-fp16"):
     """Verify the ONNX model produces matching output."""
     try:
         import onnxruntime as ort
@@ -673,10 +2597,10 @@ def verify_onnx(onnx_path: str, dit_model, config, precision: str = "bf16_mixed"
     
     device = next(dit_model.parameters()).device
     
-    if precision == "bf16_mixed":
-        tensor_dtype = torch.bfloat16
-    else:
-        tensor_dtype = torch.float32
+    if precision not in {"q8map-fp16", "w8a16", "fp32"}:
+        raise SystemExit(f"unknown precision policy: {precision}")
+
+    tensor_dtype = torch.float32
     
     wrapper = DiTForwardWrapper(dit_model, precision=precision)
     wrapper.eval()
@@ -710,8 +2634,8 @@ def verify_onnx(onnx_path: str, dit_model, config, precision: str = "bf16_mixed"
     mean_diff = np.mean(np.abs(ref_np - ort_np))
     print(f"[export_dit] Verification: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
     
-    if max_diff < 0.05:  # bf16 has slightly larger tolerance than fp16
-        print("[export_dit] PASS: ONNX output matches PyTorch (within bf16 tolerance)")
+    if max_diff < 0.05:
+        print("[export_dit] PASS: ONNX output matches PyTorch (within q8map-fp16 tolerance)")
     else:
         print("[export_dit] WARNING: Large difference detected — may need investigation")
 
@@ -724,14 +2648,22 @@ def main():
                         help="Output ONNX file path (default: models/onnx/dit_<model_name>.onnx)")
     parser.add_argument("--opset", type=int, default=18,
                         help="ONNX opset version (default: 18)")
-    parser.add_argument("--precision", default="bf16_mixed",
-                        choices=["bf16_mixed", "fp32"],
-                        help="Precision recipe (default: bf16_mixed)")
+    parser.add_argument("--precision", default="q8map-fp16",
+                        choices=["q8map-fp16", "w8a16", "fp32"],
+                        help="Precision recipe (default: q8map-fp16)")
     parser.add_argument("--verify", action="store_true",
                         help="Verify ONNX output matches PyTorch")
-    parser.add_argument("--device", default="cuda",
-                        help="Device for model loading (default: cuda)")
+    parser.add_argument("--device", default="cpu",
+                        help="Device for model loading (default: cpu)")
+    parser.add_argument("--low-memory-export", dest="low_memory_export", action="store_true", default=True,
+                        help="Export ONNX by streaming safetensors into external data (default)")
+    parser.add_argument("--no-low-memory-export", dest="low_memory_export", action="store_false",
+                        help="Use the legacy in-memory export path")
+    parser.add_argument("--stream-chunk-mb", type=int, default=16,
+                        help="Chunk size in MB for low-memory tensor streaming (default: 16)")
     args = parser.parse_args()
+    if args.low_memory_export and args.verify:
+        raise SystemExit("--verify runs PyTorch and ONNX inference and is not compatible with --low-memory-export")
     
     # Default output path
     if args.output is None:
@@ -744,10 +2676,18 @@ def main():
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     
     # Load model
-    dit_model, config = load_dit_model(args.model_dir, device=args.device, precision=args.precision)
+    dit_model, config = load_dit_model(
+        args.model_dir,
+        device=args.device,
+        precision=args.precision,
+        low_memory_export=args.low_memory_export,
+    )
     
     # Export
-    export_onnx(dit_model, config, args.output, opset=args.opset, precision=args.precision)
+    export_onnx(dit_model, config, args.output, opset=args.opset,
+                precision=args.precision, source_model=args.model_dir,
+                model_dir=args.model_dir, low_memory_export=args.low_memory_export,
+                stream_chunk_mb=args.stream_chunk_mb)
     
     # Verify
     if args.verify:

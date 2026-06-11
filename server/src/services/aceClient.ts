@@ -116,8 +116,6 @@ export interface AceRequest {
   plugin_params?: Record<string, string | number | boolean>;
   // Postprocess plugin: name of the Lua postprocess plugin to use for VAE decode
   postprocess_plugin?: string;
-  // VAE backend selection: true = ONNX Runtime (+TensorRT), false/undefined = GGML (default)
-  use_ort_vae?: boolean;
 }
 
 /** Job status from ace-server */

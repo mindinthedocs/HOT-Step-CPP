@@ -12,6 +12,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +34,10 @@ public:
 
     // Scan directories and load all plugins. Call once at startup.
     void init(const std::string & engine_dir, const std::string & project_dir) {
+        if (initialized_) {
+            return;
+        }
+        initialized_ = true;
         fprintf(stderr, "[Plugins] Initializing plugin system...\n");
 
         // Scan engine/plugins/{solvers,schedulers,guidance,postprocess}/
@@ -52,6 +57,69 @@ public:
         fprintf(stderr, "[Plugins] Loaded %d solvers, %d schedulers, %d guidance, %d postprocess\n",
                 (int) solvers_.size(), (int) schedulers_.size(),
                 (int) guidance_.size(), (int) postprocess_.size());
+    }
+
+    void init_from_executable(const char * argv0) {
+        if (initialized_) {
+            return;
+        }
+
+        std::error_code ec;
+        fs::path cwd = fs::current_path(ec);
+        if (ec) {
+            cwd = ".";
+        }
+
+        std::vector<fs::path> candidates;
+        std::set<std::string> seen;
+        auto add_candidate = [&](fs::path p) {
+            if (p.empty()) {
+                return;
+            }
+            p = p.lexically_normal();
+            std::string key = p.string();
+            if (seen.insert(key).second) {
+                candidates.push_back(p);
+            }
+        };
+
+        if (argv0 && argv0[0]) {
+            fs::path exe_path(argv0);
+            if (exe_path.is_relative()) {
+                exe_path = cwd / exe_path;
+            }
+            std::error_code canon_ec;
+            fs::path canon = fs::weakly_canonical(exe_path, canon_ec);
+            if (!canon_ec) {
+                exe_path = canon;
+            }
+            fs::path exe_dir = exe_path.parent_path();
+            add_candidate(exe_dir);
+            add_candidate(exe_dir / "engine");
+            add_candidate(exe_dir.parent_path());
+            add_candidate(exe_dir.parent_path() / "engine");
+            add_candidate(exe_dir.parent_path().parent_path());
+            add_candidate(exe_dir.parent_path().parent_path() / "engine");
+            add_candidate(exe_dir.parent_path().parent_path().parent_path());
+            add_candidate(exe_dir.parent_path().parent_path().parent_path() / "engine");
+        }
+
+        add_candidate(cwd);
+        add_candidate(cwd / "engine");
+        add_candidate(cwd.parent_path());
+        add_candidate(cwd.parent_path() / "engine");
+
+        for (const fs::path & candidate : candidates) {
+            if (has_builtin_plugins(candidate)) {
+                init(candidate.string(), candidate.parent_path().string());
+                return;
+            }
+        }
+
+        fs::path fallback = candidates.empty() ? fs::path(".") : candidates.front();
+        fprintf(stderr, "[Plugins] WARNING: could not locate engine/plugins; using %s\n",
+                fallback.string().c_str());
+        init(fallback.string(), fallback.parent_path().string());
     }
 
     // ── Lookup by name (replacing old static registries) ──
@@ -153,6 +221,13 @@ private:
     std::unordered_map<std::string, LuaPlugin> schedulers_;
     std::unordered_map<std::string, LuaPlugin> guidance_;
     std::unordered_map<std::string, LuaPlugin> postprocess_;
+    bool initialized_ = false;
+
+    static bool has_builtin_plugins(const fs::path & engine_dir) {
+        std::error_code ec;
+        return fs::is_regular_file(engine_dir / "plugins" / "solvers" / "euler.lua", ec) &&
+               fs::is_regular_file(engine_dir / "plugins" / "guidance" / "apg.lua", ec);
+    }
 
     void scan_dir(const std::string & dir_path, PluginType expected_type) {
         if (!fs::exists(dir_path) || !fs::is_directory(dir_path)) return;

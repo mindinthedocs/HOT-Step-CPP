@@ -22,7 +22,7 @@ int ops_encode_src(const AceSynth * ctx,
                    SynthState &     s);
 
 // FSQ roundtrip on cover_latents (cover mode only).
-void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s);
+int ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s);
 
 // Resolve shared DiT params (steps, guidance, shift) and scan audio_codes.
 int ops_resolve_params(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s);

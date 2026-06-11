@@ -53,7 +53,8 @@ class TextEncoderWrapper(nn.Module):
         return outputs.last_hidden_state
 
 
-def load_model(model_dir: str, device: str = "cuda", dtype=torch.float32):
+def load_model(model_dir: str, device: str = "cpu", dtype=torch.float32,
+               low_memory_export: bool = True):
     """Load Qwen3-Embedding model from safetensors."""
     model_dir = Path(model_dir)
     
@@ -77,6 +78,7 @@ def load_model(model_dir: str, device: str = "cuda", dtype=torch.float32):
         config=config,
         torch_dtype=dtype,
         trust_remote_code=True,
+        low_cpu_mem_usage=low_memory_export,
     )
     model = model.to(device)
     model.eval()
@@ -90,7 +92,8 @@ def load_model(model_dir: str, device: str = "cuda", dtype=torch.float32):
     return model, config
 
 
-def export_onnx(model, config, output_path: str, opset: int = 18):
+def export_onnx(model, config, output_path: str, opset: int = 18,
+                low_memory_export: bool = True):
     """Export the text encoder to ONNX."""
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
@@ -128,7 +131,7 @@ def export_onnx(model, config, output_path: str, opset: int = 18):
             "input_ids":     {0: "batch", 1: "seq_len"},
             "hidden_states": {0: "batch", 1: "seq_len"},
         },
-        do_constant_folding=True,
+        do_constant_folding=not low_memory_export,
         export_params=True,
     )
     
@@ -248,8 +251,15 @@ def main():
                         help="ONNX opset version (default: 18)")
     parser.add_argument("--verify", action="store_true",
                         help="Verify ONNX output matches PyTorch")
-    parser.add_argument("--device", default="cuda",
-                        help="Device for model loading (default: cuda)")
+    parser.add_argument("--device", default="cpu",
+                        help="Device for model loading (default: cpu)")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Export the ONNX graph in FP16 (native half weights, "
+                             "the strongly-typed TRT 11 encoder precision for sm_75)")
+    parser.add_argument("--low-memory-export", dest="low_memory_export", action="store_true", default=True,
+                        help="Use low CPU memory loading and skip ONNX constant folding (default)")
+    parser.add_argument("--no-low-memory-export", dest="low_memory_export", action="store_false",
+                        help="Use the legacy eager loader")
     args = parser.parse_args()
     
     # Default output path
@@ -262,10 +272,13 @@ def main():
     output_dir = os.path.dirname(args.output)
     
     # Load model
-    model, config = load_model(args.model_dir, device=args.device)
+    export_dtype = torch.float16 if args.fp16 else torch.float32
+    model, config = load_model(args.model_dir, device=args.device, dtype=export_dtype,
+                               low_memory_export=args.low_memory_export)
     
     # Export ONNX
-    export_onnx(model, config, args.output, opset=args.opset)
+    export_onnx(model, config, args.output, opset=args.opset,
+                low_memory_export=args.low_memory_export)
     
     # Export embedding table for lyric lookup
     embed_path = os.path.join(output_dir, "embed_tokens.bin")

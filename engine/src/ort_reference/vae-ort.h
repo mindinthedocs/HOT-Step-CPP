@@ -19,6 +19,8 @@
 #ifndef VAE_ORT_H
 #define VAE_ORT_H
 
+#include "ort-trt-cache.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,11 +56,14 @@ struct VaeOrt {
 // ── Load / Free ────────────────────────────────────────────────────────
 
 // Initialise a VaeOrt context from an ONNX model file.
-// Attempts TensorRT EP first (builds engine cache alongside the .onnx),
-// falls back to CUDA EP, then CPU.
+// Loads a prebuilt TensorRT EP cache alongside the .onnx, then appends CUDA as
+// an execution fallback for nodes TensorRT does not claim.
 // device_id: CUDA device ordinal (0 for single-GPU systems).
 // Returns true on success.
-static inline bool vae_ort_load(VaeOrt * ctx, const char * onnx_path, int device_id = 0) {
+static inline bool vae_ort_load(VaeOrt * ctx,
+                                const char * onnx_path,
+                                int device_id = 0,
+                                const char * artifact_fingerprint = nullptr) {
     if (!ctx || !onnx_path) return false;
 
     ctx->model_path = onnx_path;
@@ -67,48 +72,35 @@ static inline bool vae_ort_load(VaeOrt * ctx, const char * onnx_path, int device
 
     // ── TensorRT EP (preferred) ────────────────────────────────────
 #if defined(GGML_USE_CUDA)
-    // Build TRT engine cache directory alongside the model file.
-    std::string trt_cache_dir;
-    {
-        std::string p = onnx_path;
-        auto slash = p.find_last_of("/\\");
-        trt_cache_dir = (slash != std::string::npos) ? p.substr(0, slash) : ".";
+    std::string trt_cache_dir = hs_ort_trt_cache_dir(onnx_path, artifact_fingerprint, "vae-dec");
+    if (!hs_ort_trt_cache_ready(trt_cache_dir)) {
+        fprintf(stderr, "[VAE-ORT] FATAL: prebuilt TensorRT cache missing or incomplete: %s\n",
+                trt_cache_dir.c_str());
+        fprintf(stderr, "[VAE-ORT] Build it offline with tools/onnx-export/build-ort-trt-engines.py\n");
+        return false;
     }
 
-    // Try legacy TensorRT EP (V1 struct API — uses onnxruntime_providers_tensorrt.dll
-    // which loads nvinfer_10.dll at runtime from PATH).
+    // Try TensorRT EP V2 (uses onnxruntime_providers_tensorrt.dll
+    // which loads the TensorRT runtime DLLs from PATH).
     // NOTE: The newer NvTensorRTRTXExecutionProvider requires a separate
     // onnxruntime_providers_nv_tensorrt_rtx.dll that we don't ship.
     // The legacy EP works with full TensorRT SDK and supports all NVIDIA GPUs.
     // The C++ wrapper doesn't expose AppendExecutionProvider_TensorRT, so we
     // call through the C API directly.
     {
-        OrtTensorRTProviderOptions trt_opts{};
-        trt_opts.device_id                  = device_id;
-        trt_opts.trt_max_partition_iterations = 1000;
-        trt_opts.trt_min_subgraph_size      = 1;
-        trt_opts.trt_max_workspace_size     = (size_t)2 << 30;  // 2 GiB
-        trt_opts.trt_fp16_enable            = 1;
-        trt_opts.trt_engine_cache_enable    = 1;
-        trt_opts.trt_engine_cache_path      = trt_cache_dir.c_str();
-
-        // NOTE: Demon uses builder_optimization_level=1 for VAE on Blackwell
-        // to avoid Myelin fusion segfaults. The legacy OrtTensorRTProviderOptions
-        // struct doesn't expose this field — would need V2 API. Will add if
-        // we observe VAE segfaults on sm_120+.
-
-        const OrtApi & api = Ort::GetApi();
-        OrtStatus * status = api.SessionOptionsAppendExecutionProvider_TensorRT(
-            ctx->session_opts, &trt_opts);
-        if (status) {
-            std::string msg = api.GetErrorMessage(status);
-            api.ReleaseStatus(status);
-            fprintf(stderr, "[VAE-ORT] TensorRT EP unavailable: %s — trying CUDA EP\n", msg.c_str());
-            ctx->using_trt = false;
-        } else {
+        try {
+            Ort::TensorRTProviderOptions trt_opts;
+            auto opts = hs_ort_trt_provider_options(
+                onnx_path, artifact_fingerprint, "vae-dec", device_id, true, (size_t)2 << 30);
+            trt_opts.Update(opts);
+            ctx->session_opts.AppendExecutionProvider_TensorRT_V2(*trt_opts);
             ctx->using_trt = true;
-            fprintf(stderr, "[VAE-ORT] TensorRT EP appended (device %d, fp16=on, cache=%s)\n",
-                    device_id, trt_cache_dir.c_str());
+            fprintf(stderr, "[VAE-ORT] TensorRT EP appended (device %d, fp16=on, cache=%s, profile_max=%s)\n",
+                    device_id, trt_cache_dir.c_str(), opts["trt_profile_max_shapes"].c_str());
+        } catch (const std::exception & e) {
+            fprintf(stderr, "[VAE-ORT] FATAL: TensorRT EP unavailable for prebuilt bundle: %s\n", e.what());
+            ctx->using_trt = false;
+            return false;
         }
     }
 
@@ -288,15 +280,23 @@ static inline int vae_ort_decode_tiled(VaeOrt *      ctx,
         for (int f = T_latent; f < chunk_size; f++)
             memcpy(padded.data() + (size_t)f * 64, last_frame, 64 * sizeof(float));
 
-        int full_T = vae_ort_decode(ctx, padded.data(), chunk_size, audio_out, T_audio_max);
+        int full_audio_max = chunk_size * 1920;
+        std::vector<float> full_audio((size_t)2 * full_audio_max);
+        int full_T = vae_ort_decode(ctx, padded.data(), chunk_size, full_audio.data(), full_audio_max);
         if (full_T < 0) return full_T;
 
         // Valid audio = T_latent proportion of full output
         int actual_T = (int)roundf((float)T_latent / (float)chunk_size * (float)full_T);
         if (actual_T > full_T) actual_T = full_T;
+        if (actual_T > T_audio_max) {
+            fprintf(stderr, "[VAE-ORT] WARNING: cropped short decode T_audio=%d > buffer max=%d, clamping\n",
+                    actual_T, T_audio_max);
+            actual_T = T_audio_max;
+        }
 
-        // Compact R channel: planar layout [L(full_T), R(full_T)]
-        memmove(audio_out + actual_T, audio_out + full_T, (size_t)actual_T * sizeof(float));
+        // Copy from padded planar layout [L(full_T), R(full_T)] into [L(actual_T), R(actual_T)].
+        memcpy(audio_out, full_audio.data(), (size_t)actual_T * sizeof(float));
+        memcpy(audio_out + actual_T, full_audio.data() + full_T, (size_t)actual_T * sizeof(float));
         return actual_T;
     }
 
@@ -404,7 +404,7 @@ static inline int vae_ort_decode_tiled(VaeOrt *      ctx,
 
 struct VaeOrt {};
 
-static inline bool vae_ort_load(VaeOrt *, const char *, int = 0) {
+static inline bool vae_ort_load(VaeOrt *, const char *, int = 0, const char * = nullptr) {
     fprintf(stderr, "[VAE-ORT] Not compiled (HOT_STEP_SUPERSEP not defined)\n");
     return false;
 }

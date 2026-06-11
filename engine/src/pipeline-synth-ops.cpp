@@ -9,23 +9,227 @@
 #include "hot-step-sampler.h"
 #include "hot-step-sampler-trt.h"
 #include "adapter-trt.h"
+#include "lyric-embed-lut.h"
 #include "philox.h"
 #include "pipeline-synth-impl.h"
 #include "task-types.h"
+#include "trt-artifact-manifest.h"
 #include "vae-enc.h"
 
 #include <charconv>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <system_error>
 #include <vector>
 
 static const int FRAMES_PER_SECOND = 25;
 
+#ifdef HOT_STEP_TRT
+static bool hs_file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static uint64_t hs_fnv1a_file(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return 0;
+    uint64_t h = 14695981039346656037ULL;
+    unsigned char buf[8192];
+    for (;;) {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        for (size_t i = 0; i < n; i++) {
+            h ^= (uint64_t) buf[i];
+            h *= 1099511628211ULL;
+        }
+        if (n < sizeof(buf)) break;
+    }
+    fclose(f);
+    return h;
+}
+
+static std::string hs_hex64(uint64_t v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) v);
+    return std::string(buf);
+}
+
+static std::string hs_hex32(uint32_t v) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%08x", (unsigned int) v);
+    return std::string(buf);
+}
+
+static std::string hs_path_key(const std::string & path) {
+    std::error_code ec;
+    std::filesystem::path abs = std::filesystem::absolute(path, ec);
+    if (ec) {
+        return path;
+    }
+    std::filesystem::path canon = std::filesystem::weakly_canonical(abs, ec);
+    if (!ec) {
+        return canon.lexically_normal().string();
+    }
+    return abs.lexically_normal().string();
+}
+
+static uint32_t hs_float_bits(float v) {
+    uint32_t bits = 0;
+    memcpy(&bits, &v, sizeof(bits));
+    return bits;
+}
+
+static std::string hs_trt_engine_metadata_fingerprint(const std::string & metadata_path) {
+    std::string fp;
+    fp += "alias-path=";
+    fp += hs_path_key(metadata_path);
+    fp += ",alias-hash=";
+    fp += hs_hex64(hs_fnv1a_file(metadata_path));
+
+    yyjson_doc * doc = nullptr;
+    yyjson_doc * primary_doc = nullptr;
+    yyjson_val * root = nullptr;
+    std::string source_path;
+    std::string err;
+    if (trt_artifact_load_effective_engine_metadata(metadata_path,
+                                                    &doc,
+                                                    &primary_doc,
+                                                    &root,
+                                                    &source_path,
+                                                    &err)) {
+        if (!source_path.empty() && source_path != metadata_path) {
+            fp += ",primary-path=";
+            fp += hs_path_key(source_path);
+            fp += ",primary-hash=";
+            fp += hs_hex64(hs_fnv1a_file(source_path));
+        }
+        if (primary_doc) yyjson_doc_free(primary_doc);
+        yyjson_doc_free(doc);
+    } else {
+        fp += ",effective=unreadable";
+    }
+    return fp;
+}
+
+static std::string hs_trt_sidecar_fingerprint(const std::string & onnx_path,
+                                              const std::string & engine_path) {
+    std::string stem = onnx_path.substr(0, onnx_path.size() - 5);
+    std::string fp;
+    struct Sidecar {
+        const char * label;
+        std::string  path;
+    };
+    Sidecar sidecars[] = {
+        { "metadata", stem + ".metadata.json" },
+        { "precision-manifest", stem + ".precision-manifest.json" },
+        { "precision", stem + ".precision.json" },
+        { "refit-manifest", onnx_path + ".refit_manifest.json" },
+        { "engine-metadata", engine_path + ".metadata.json" },
+    };
+    for (const Sidecar & sidecar : sidecars) {
+        fp += sidecar.label;
+        fp += "=";
+        if (strcmp(sidecar.label, "engine-metadata") == 0) {
+            fp += hs_trt_engine_metadata_fingerprint(sidecar.path);
+        } else {
+            fp += hs_hex64(hs_fnv1a_file(sidecar.path));
+        }
+        fp += ";";
+    }
+    return fp;
+}
+
+static std::string hs_trt_adapter_key(const ModelKey & k) {
+    if (k.adapter_path.empty()) {
+        return std::string();
+    }
+    const std::string & path = k.adapter_path;
+    std::string key;
+    key += "path=";
+    key += hs_path_key(path);
+    key += ";scale=";
+    key += hs_hex32(hs_float_bits(k.adapter_scale));
+    key += ";groups=";
+    key += hs_hex32(hs_float_bits(k.adapter_group_scales.self_attn));
+    key += ",";
+    key += hs_hex32(hs_float_bits(k.adapter_group_scales.cross_attn));
+    key += ",";
+    key += hs_hex32(hs_float_bits(k.adapter_group_scales.mlp));
+    key += ",";
+    key += hs_hex32(hs_float_bits(k.adapter_group_scales.cond_embed));
+    key += ",";
+    key += hs_hex32(hs_float_bits(k.adapter_group_scales.time_embed));
+    key += ",";
+    key += hs_hex32(hs_float_bits(k.adapter_group_scales.proj_in));
+    key += ";file=";
+    key += hs_hex64(hs_fnv1a_file(path));
+    key += ";model=";
+    key += hs_hex64(hs_fnv1a_file(path + WS_SEP + "adapter_model.safetensors"));
+    key += ";config=";
+    key += hs_hex64(hs_fnv1a_file(path + WS_SEP + "adapter_config.json"));
+    return key;
+}
+
+static std::string hs_trt_cache_key(const std::string & onnx_path,
+                                    const std::string & engine_path) {
+    std::string key;
+    key += "trt=";
+    key += std::to_string(NV_TENSORRT_MAJOR);
+    key += ".";
+    key += std::to_string(NV_TENSORRT_MINOR);
+    key += ";onnx=";
+    key += hs_path_key(onnx_path);
+    key += ";engine=";
+    key += hs_path_key(engine_path);
+    key += ";engine_hash=";
+    key += hs_hex64(hs_fnv1a_file(engine_path));
+    key += ";sidecars=";
+    key += hs_trt_sidecar_fingerprint(onnx_path, engine_path);
+    return key;
+}
+#endif
+
 // ─── Determinism diagnostic ─────────────────────────────────────────────────
+static bool ops_file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static std::string ops_fsq_metadata_path(const std::string & sidecar) {
+    const char * suffix = ".safetensors";
+    size_t suffix_len = strlen(suffix);
+    if (sidecar.size() >= suffix_len &&
+        sidecar.compare(sidecar.size() - suffix_len, suffix_len, suffix) == 0) {
+        return sidecar.substr(0, sidecar.size() - suffix_len) + ".metadata.json";
+    }
+    return sidecar + ".metadata.json";
+}
+
+static bool ops_fsq_sidecar_available(const AceSynth * ctx) {
+    if (!ctx || !ctx->is_onnx_pipeline) {
+        return true;
+    }
+    std::string sidecar = ctx->fsq_detok_key.path + WS_SEP + "fsq.safetensors";
+    return ops_file_exists(sidecar) && ops_file_exists(ops_fsq_metadata_path(sidecar));
+}
+
+static void ops_log_missing_fsq_sidecar(const AceSynth * ctx, const char * phase) {
+    std::string sidecar = ctx->fsq_detok_key.path + WS_SEP + "fsq.safetensors";
+    std::string metadata = ops_fsq_metadata_path(sidecar);
+    fprintf(stderr,
+            "[%s] FATAL: ONNX DiT artifact requires %s and %s for FSQ tokenizer/detokenizer runtime weights\n",
+            phase, sidecar.c_str(), metadata.c_str());
+}
+
 static void diag_stats_f32(const char * label, const float * data, size_t n) {
     if (!data || n == 0) { return; }
     double sum = 0.0, sum_sq = 0.0;
@@ -114,6 +318,11 @@ int ops_encode_src(const AceSynth * ctx,
         return 0;
     }
     if (src_audio && src_len > 0) {
+        if (ctx->vae_enc_key.path.empty()) {
+            fprintf(stderr,
+                    "[Encode-Src] FATAL: raw source audio requires a VAE encoder GGUF; provide src_latents for ONNX-decoder-only bundles\n");
+            return -1;
+        }
         s.timer.reset();
         int T_audio = src_len;
 
@@ -143,7 +352,7 @@ int ops_encode_src(const AceSynth * ctx,
     return 0;
 }
 
-void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
+int ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
     // FSQ roundtrip for cover: tokenize (25Hz->5Hz) + detokenize (5Hz->25Hz).
     // The lossy 5:1 temporal compression destroys micro-timings, ornaments and
     // transients. The DiT receives degraded latents and diverges from the source,
@@ -152,7 +361,11 @@ void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
     // producing remixes that stay close to the source.
     // Other tasks (lego, extract, repaint, complete) also use clean latents.
     if (!s.have_cover) {
-        return;
+        return 0;
+    }
+    if (!ops_fsq_sidecar_available(ctx)) {
+        ops_log_missing_fsq_sidecar(ctx, "FSQ-Roundtrip");
+        return -1;
     }
     s.timer.reset();
     int              T_5Hz = (s.T_cover + 4) / 5;
@@ -164,7 +377,7 @@ void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
         TokGGML * tok = store_require_fsq_tok(ctx->store, ctx->fsq_tok_key);
         if (!tok) {
             fprintf(stderr, "[FSQ-Roundtrip] FATAL: store_require_fsq_tok failed\n");
-            return;
+            return -1;
         }
         ModelHandle tok_guard(ctx->store, tok);
         if (!ctx->params.use_fa) {
@@ -175,7 +388,7 @@ void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
             tok_ggml_encode(tok, s.cover_latents.data(), s.T_cover, codes.data(), ctx->meta->silence_full.data());
     }
     if (T_5Hz_actual <= 0) {
-        return;
+        return -1;
     }
 
     // Detokenizer scope: acquire, decode 5Hz codes back to 25Hz latents, release.
@@ -186,7 +399,7 @@ void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
         DetokGGML * detok = store_require_fsq_detok(ctx->store, ctx->fsq_detok_key);
         if (!detok) {
             fprintf(stderr, "[FSQ-Roundtrip] FATAL: store_require_fsq_detok failed\n");
-            return;
+            return -1;
         }
         ModelHandle detok_guard(ctx->store, detok);
         if (!ctx->params.use_fa) {
@@ -196,11 +409,12 @@ void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
         ret = detok_ggml_decode(detok, codes.data(), T_5Hz_actual, rt_latents.data());
     }
     if (ret < 0) {
-        return;
+        return -1;
     }
     int copy_T = T_25Hz_rt < s.T_cover ? T_25Hz_rt : s.T_cover;
     memcpy(s.cover_latents.data(), rt_latents.data(), (size_t) copy_T * 64 * sizeof(float));
     fprintf(stderr, "[FSQ-Roundtrip] %d->%d->%d frames, %.1f ms\n", s.T_cover, T_5Hz_actual, copy_T, s.timer.ms());
+    return 0;
 }
 
 int ops_resolve_params(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
@@ -336,6 +550,13 @@ void ops_encode_timbre(const AceSynth * ctx,
         return;
     }
     if (ref_audio && ref_len > 0) {
+        if (ctx->vae_enc_key.path.empty()) {
+            fprintf(stderr,
+                    "[Encode-Timbre] WARNING: raw reference audio requires a VAE encoder GGUF; using silence (provide ref_latents to avoid this)\n");
+            s.S_ref_timbre = 1;
+            s.timbre_feats.assign(ctx->meta->silence_full.data(), ctx->meta->silence_full.data() + 64);
+            return;
+        }
         s.timer.reset();
         VAEEncoder * ref_vae = store_require_vae_enc(ctx->store, ctx->vae_enc_key);
         if (!ref_vae) {
@@ -399,6 +620,208 @@ static void build_prompt_strings(const AceRequest &  rb,
     lyric_out = std::string("# Languages\n") + language_b + "\n\n# Lyric\n" + rb.lyrics + "<|endoftext|>";
 }
 
+// Native TRT bundle encode (partner §5.3). Routes the text encoder through
+// text_enc_trt_forward and the condition encoder through cond_enc_trt_forward,
+// replacing the GGML qwen3/cond forwards at the call sites. The TRT forward
+// outputs match the GGML contracts (text_hidden [B,S,1024], enc_hidden
+// [B,S_total,2048]), so downstream padding/stacking is shared.
+//
+// all-three-or-nothing already held at load (use_trt_bundle implies the bundle's
+// dit/text_enc/cond_enc engines all exist). The lyric embedding table has no TRT
+// engine of its own; the bundle must ship it as a text_enc sidecar. When that
+// sidecar is absent this hard-fails rather than falling back to the GGUF text
+// encoder — the all-three-or-nothing contract forbids a silent GGUF encoder
+// fallback when a TRT bundle is selected.
+//
+// Populates main_fwd/nc_fwd (text_hidden + lyric_embed + S), s.per_enc* (cond
+// output), s.null_cond_vec, and H_text/H_cond, exactly like the GGML branch.
+#ifdef HOT_STEP_TRT
+static int ops_encode_text_trt(const AceSynth *             ctx,
+                               const AceRequest *           reqs,
+                               int                          batch_n,
+                               SynthState &                 s,
+                               BPETokenizer *               bpe,
+                               std::vector<TextEncForward> & main_fwd,
+                               std::vector<TextEncForward> & nc_fwd,
+                               int &                        H_text,
+                               int &                        H_cond) {
+    H_text = 1024;  // Qwen3-Embedding text-encoder hidden size (engine output binding)
+    H_cond = 2048;  // condition-encoder hidden size (engine output binding)
+
+    // Lyric embed source: a bundle-shipped embed table sidecar. The all-three
+    // gate covers dit/text_enc/cond_enc engines; the lyric embed table is a
+    // text_enc sidecar — the embed lookup runs against this sidecar.
+    std::string embed_tokens_path;
+    for (const std::string & sc : ctx->trt_manifest.text_enc.sidecars) {
+        if (sc.find("embed_tokens") != std::string::npos && hs_file_exists(sc)) {
+            embed_tokens_path = sc;
+            break;
+        }
+    }
+    if (embed_tokens_path.empty()) {
+        fprintf(stderr,
+                "[Encode-Text-TRT] FATAL: TRT bundle has no lyric embed_tokens sidecar; "
+                "lyric embedding requires the embed_tokens sidecar in the TRT bundle. "
+                "Refusing to fall back to the GGUF text encoder (all-three-or-nothing).\n");
+        return -1;
+    }
+
+    // Load the lyric embed table once (cached process-wide). Lyric tokens index
+    // its rows to produce lyric_embed [S_lyric, 1024], the cond engine's
+    // lyric_embed input — replacing the old 0.0f stub.
+    const LyricEmbedLut * lyric_lut = lyric_embed_lut_get_cached(embed_tokens_path);
+    if (!lyric_lut) {
+        fprintf(stderr, "[Encode-Text-TRT] FATAL: failed to load lyric embed table %s\n",
+                embed_tokens_path.c_str());
+        return -1;
+    }
+    if (lyric_lut->cols != H_text) {
+        fprintf(stderr,
+                "[Encode-Text-TRT] FATAL: embed table width %d != text hidden %d\n",
+                lyric_lut->cols, H_text);
+        return -1;
+    }
+
+    TextEncTrt * te = store_require_text_enc_trt(ctx->store, ctx->text_enc_trt_key);
+    if (!te) {
+        fprintf(stderr, "[Encode-Text-TRT] FATAL: store_require_text_enc_trt failed\n");
+        return -1;
+    }
+
+    auto run_text = [&](const std::vector<int> & ids, int S, std::vector<float> & out) -> bool {
+        out.resize((size_t) H_text * S);
+        return text_enc_trt_forward(te, ids.data(), 1, S, out.data());
+    };
+
+    int text_rc = 0;
+    for (int b = 0; b < batch_n && text_rc == 0; b++) {
+        std::string text_str, lyric_str;
+        build_prompt_strings(reqs[b], s.instruction_str, s.duration, text_str, lyric_str);
+        auto text_ids  = bpe_encode(bpe, text_str.c_str(), true);
+        auto lyric_ids = bpe_encode(bpe, lyric_str.c_str(), true);
+        main_fwd[b].S_text  = (int) text_ids.size();
+        main_fwd[b].S_lyric = (int) lyric_ids.size();
+        if (!run_text(text_ids, main_fwd[b].S_text, main_fwd[b].text_hidden)) {
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: text_enc_trt_forward failed (batch %d)\n", b);
+            text_rc = -1;
+            break;
+        }
+        // lyric_embed: row-gather the bundle embed_tokens table (CPU vocab lookup).
+        if (!lyric_embed_lut_lookup(*lyric_lut, lyric_ids.data(), main_fwd[b].S_lyric,
+                                    main_fwd[b].lyric_embed)) {
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: lyric embed lookup failed (batch %d)\n", b);
+            text_rc = -1;
+            break;
+        }
+    }
+
+    if (text_rc == 0 && s.need_enc_switch) {
+        for (int b = 0; b < batch_n && text_rc == 0; b++) {
+            std::string text_str, lyric_str;
+            build_prompt_strings(reqs[b], DIT_INSTR_TEXT2MUSIC, s.duration, text_str, lyric_str);
+            auto text_ids  = bpe_encode(bpe, text_str.c_str(), true);
+            auto lyric_ids = bpe_encode(bpe, lyric_str.c_str(), true);
+            nc_fwd[b].S_text  = (int) text_ids.size();
+            nc_fwd[b].S_lyric = (int) lyric_ids.size();
+            if (!run_text(text_ids, nc_fwd[b].S_text, nc_fwd[b].text_hidden)) {
+                text_rc = -1;
+                break;
+            }
+            if (!lyric_embed_lut_lookup(*lyric_lut, lyric_ids.data(), nc_fwd[b].S_lyric,
+                                        nc_fwd[b].lyric_embed)) {
+                fprintf(stderr, "[Encode-Text-TRT] FATAL: lyric embed lookup failed (nc batch %d)\n", b);
+                text_rc = -1;
+                break;
+            }
+        }
+    }
+
+    if (text_rc == 0 && !reqs[0].negative_prompt.empty()) {
+        AceRequest neg_req = reqs[0];
+        neg_req.caption = reqs[0].negative_prompt;
+        neg_req.lyrics  = "";
+        std::string neg_text_str, neg_lyric_str;
+        build_prompt_strings(neg_req, s.instruction_str, s.duration, neg_text_str, neg_lyric_str);
+        auto neg_text_ids = bpe_encode(bpe, neg_text_str.c_str(), true);
+        s.neg_S_text = (int) neg_text_ids.size();
+        if (!run_text(neg_text_ids, s.neg_S_text, s.neg_text_hidden)) {
+            text_rc = -1;
+        }
+    }
+
+    // Free text-enc evictable buffers + context before cond-enc loads (keeps the
+    // resident engine shell; mirrors the GGML branch's one-module-at-a-time peak).
+    store_release_text_enc_trt(ctx->store, te);
+    if (text_rc != 0) {
+        return -1;
+    }
+
+    CondEncTrt * ce = store_require_cond_enc_trt(ctx->store, ctx->cond_enc_trt_key);
+    if (!ce) {
+        fprintf(stderr, "[Encode-Text-TRT] FATAL: store_require_cond_enc_trt failed\n");
+        return -1;
+    }
+
+    s.per_enc.resize(batch_n);
+    s.per_enc_S.resize(batch_n);
+    s.per_enc_nc.resize(batch_n);
+    s.per_enc_S_nc.assign(batch_n, 0);
+
+    // null_condition_emb stays on the EXISTING CFG path (DiTMeta), not an engine
+    // input — same as the GGML branch.
+    s.null_cond_vec.resize(H_cond);
+    if (!ctx->meta->null_cond_cpu.empty()) {
+        memcpy(s.null_cond_vec.data(), ctx->meta->null_cond_cpu.data(), H_cond * sizeof(float));
+    }
+
+    int cond_rc = 0;
+    for (int b = 0; b < batch_n && cond_rc == 0; b++) {
+        // The lyric_embed feeding cond must be NON-ZERO (not the old 0.0f
+        // stub) — i.e. lyrics actually condition the song.
+        {
+            double le_absum = 0.0;
+            for (float v : main_fwd[b].lyric_embed) le_absum += (double) std::fabs(v);
+            fprintf(stderr, "[Encode-Text-TRT Batch%d] lyric_embed S_lyric=%d sum|.|=%.4f (NON-ZERO -> lyrics condition the song)\n",
+                    b, main_fwd[b].S_lyric, le_absum);
+        }
+        if (!cond_enc_trt_forward(ce,
+                                  main_fwd[b].text_hidden.data(), main_fwd[b].S_text,
+                                  main_fwd[b].lyric_embed.data(), main_fwd[b].S_lyric,
+                                  s.timbre_feats.data(), s.S_ref_timbre, 1,
+                                  s.per_enc[b], &s.per_enc_S[b])) {
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: cond_enc_trt_forward failed (batch %d)\n", b);
+            cond_rc = -1;
+            break;
+        }
+        fprintf(stderr, "[Encode-Text-TRT Batch%d] %d+%d tokens -> enc_S=%d\n",
+                b, main_fwd[b].S_text, main_fwd[b].S_lyric, s.per_enc_S[b]);
+    }
+
+    if (cond_rc == 0 && s.need_enc_switch) {
+        for (int b = 0; b < batch_n && cond_rc == 0; b++) {
+            if (!cond_enc_trt_forward(ce,
+                                      nc_fwd[b].text_hidden.data(), nc_fwd[b].S_text,
+                                      nc_fwd[b].lyric_embed.data(), nc_fwd[b].S_lyric,
+                                      s.timbre_feats.data(), s.S_ref_timbre, 1,
+                                      s.per_enc_nc[b], &s.per_enc_S_nc[b])) {
+                cond_rc = -1;
+                break;
+            }
+        }
+    }
+
+    store_release_cond_enc_trt(ctx->store, ce);
+    return cond_rc;
+}
+#else
+static int ops_encode_text_trt(const AceSynth *, const AceRequest *, int, SynthState &,
+                               BPETokenizer *, std::vector<TextEncForward> &,
+                               std::vector<TextEncForward> &, int &, int &) {
+    fprintf(stderr, "[Encode-Text-TRT] FATAL: TRT bundle selected but binary built without HOT_STEP_TRT\n");
+    return -1;
+}
+#endif
+
 int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
     // Per-batch text encoding in two GPU phases to keep EVICT_STRICT at one
     // module resident at a time:
@@ -415,16 +838,8 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
 
     s.need_enc_switch = s.use_source_context && !s.is_repaint && !s.is_lego_region && s.rr.audio_cover_strength < 1.0f;
 
-    // BPE tokenizer: when text_encoder_path points at an .onnx file,
-    // vocab.json + merges.txt live in the same directory, not inside the file.
-    std::string bpe_dir;
+    // BPE tokenizer: GGUF TextEnc keeps tokenizer metadata in the GGUF file.
     const char * bpe_path = ctx->params.text_encoder_path;
-    if (ctx->is_onnx_pipeline) {
-        bpe_dir = ctx->text_enc_ort_key.path;
-        auto slash = bpe_dir.find_last_of("/\\");
-        if (slash != std::string::npos) bpe_dir = bpe_dir.substr(0, slash);
-        bpe_path = bpe_dir.c_str();
-    }
     BPETokenizer * bpe = store_bpe(ctx->store, bpe_path);
     if (!bpe) {
         fprintf(stderr, "[Encode-Text] FATAL: store_bpe failed (path=%s)\n", bpe_path);
@@ -436,231 +851,12 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
     int                         H_text = 0;
     int                         H_cond = 0;
 
-    // ═══════════════════════════════════════════════════════════════════
-    // ORT PATH: text encoder + condition encoder via ONNX Runtime
-    // ═══════════════════════════════════════════════════════════════════
-    if (ctx->is_onnx_pipeline) {
-        fprintf(stderr, "[Encode-Text] Using ONNX pipeline (TextEnc-ORT + CondEnc-ORT)\n");
-
-        // Phase A(ORT): text encoder
-        {
-            TextEncOrt * te = store_require_text_enc_ort(ctx->store, ctx->text_enc_ort_key);
-            if (!te) {
-                fprintf(stderr, "[Encode-Text] FATAL: store_require_text_enc_ort failed\n");
-                return -1;
-            }
-            ModelHandle te_guard(ctx->store, te);
-            H_text = te->hidden_size;
-
-            for (int b = 0; b < batch_n; b++) {
-                std::string text_str;
-                std::string lyric_str;
-                build_prompt_strings(reqs[b], s.instruction_str, s.duration, text_str, lyric_str);
-
-                // Determinism diagnostic
-                {
-                    auto str_hash = [](const std::string & s) -> uint64_t {
-                        uint64_t h = 14695981039346656037ULL;
-                        for (char c : s) { h ^= (uint8_t)c; h *= 1099511628211ULL; }
-                        return h;
-                    };
-                    fprintf(stderr, "[DIAG] enc_input_b%d: instr=\"%s\" caption_hash=%016llx lyrics_hash=%016llx text_len=%zu lyric_len=%zu\n",
-                            b, s.instruction_str.c_str(),
-                            (unsigned long long)str_hash(reqs[b].caption),
-                            (unsigned long long)str_hash(reqs[b].lyrics),
-                            text_str.size(), lyric_str.size());
-                }
-
-                auto text_ids  = bpe_encode(bpe, text_str.c_str(), true);
-                auto lyric_ids = bpe_encode(bpe, lyric_str.c_str(), true);
-                int  S_text    = (int) text_ids.size();
-                int  S_lyric   = (int) lyric_ids.size();
-
-                // LRC capture (batch 0 only)
-                if (b == 0 && reqs[0].get_lrc) {
-                    s.get_lrc         = true;
-                    s.lyric_token_ids = lyric_ids;
-                    s.vocal_language  = reqs[0].vocal_language.empty() ? "en" : reqs[0].vocal_language;
-
-                    const char * lang_b = s.vocal_language.c_str();
-                    std::string  hdr    = std::string("# Languages\n") + lang_b + "\n\n# Lyric\n";
-                    auto         hdr_ids = bpe_encode(bpe, hdr.c_str(), false);
-                    s.lyric_start_idx = (int) hdr_ids.size();
-
-                    s.lyric_end_idx = (int) lyric_ids.size();
-                    for (int ti = 0; ti < (int) lyric_ids.size(); ti++) {
-                        if (lyric_ids[ti] == 151643) { s.lyric_end_idx = ti; break; }
-                    }
-
-                    int pure_n = s.lyric_end_idx - s.lyric_start_idx;
-                    s.lyric_token_texts.resize(pure_n);
-                    if (pure_n > 0) {
-                        std::string prev_full;
-                        for (int ti = s.lyric_start_idx; ti < s.lyric_end_idx; ti++) {
-                            std::vector<int> prefix(lyric_ids.begin() + s.lyric_start_idx,
-                                                    lyric_ids.begin() + ti + 1);
-                            std::string full;
-                            for (int pid : prefix) {
-                                if (pid >= 0 && pid < bpe->n_vocab) {
-                                    const std::string & bpe_str = bpe->id_to_str[pid];
-                                    for (size_t ci = 0; ci < bpe_str.size(); ) {
-                                        int adv;
-                                        int cp = utf8_codepoint(bpe_str.c_str() + ci, &adv);
-                                        bool found = false;
-                                        for (int by = 0; by < 256; by++) {
-                                            int a2;
-                                            int cp2 = utf8_codepoint(bpe->byte2str[by].c_str(), &a2);
-                                            if (cp2 == cp && (int) bpe->byte2str[by].size() == adv) {
-                                                full += (char)(unsigned char) by;
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                        if (!found) full += '?';
-                                        ci += adv;
-                                    }
-                                }
-                            }
-                            int idx = ti - s.lyric_start_idx;
-                            if (full.size() > prev_full.size()) {
-                                s.lyric_token_texts[idx] = full.substr(prev_full.size());
-                            } else {
-                                s.lyric_token_texts[idx] = "";
-                            }
-                            prev_full = full;
-                        }
-                    }
-
-                    fprintf(stderr, "[Encode-Text] LRC: captured %d lyric tokens [%d..%d) of %d total\n",
-                            pure_n, s.lyric_start_idx, s.lyric_end_idx, (int) lyric_ids.size());
-                }
-
-                main_fwd[b].S_text  = S_text;
-                main_fwd[b].S_lyric = S_lyric;
-
-                // ORT text encoder forward
-                std::vector<float> text_hidden_ort;
-                if (text_enc_ort_forward(te, text_ids.data(), S_text, text_hidden_ort) != 0) {
-                    fprintf(stderr, "[Encode-Text] FATAL: text_enc_ort_forward failed\n");
-                    return -1;
-                }
-                main_fwd[b].text_hidden = std::move(text_hidden_ort);
-
-                diag_stats_f32("text_hidden_b0", main_fwd[b].text_hidden.data(),
-                               main_fwd[b].text_hidden.size());
-
-                // ORT embed lookup for lyrics
-                std::vector<float> lyric_embed_ort;
-                if (text_enc_ort_embed_lookup(te, lyric_ids.data(), S_lyric, lyric_embed_ort) != 0) {
-                    fprintf(stderr, "[Encode-Text] FATAL: text_enc_ort_embed_lookup failed\n");
-                    return -1;
-                }
-                main_fwd[b].lyric_embed = std::move(lyric_embed_ort);
-            }
-
-            if (s.need_enc_switch) {
-                for (int b = 0; b < batch_n; b++) {
-                    std::string text_str;
-                    std::string lyric_str;
-                    build_prompt_strings(reqs[b], DIT_INSTR_TEXT2MUSIC, s.duration, text_str, lyric_str);
-
-                    auto text_ids  = bpe_encode(bpe, text_str.c_str(), true);
-                    auto lyric_ids = bpe_encode(bpe, lyric_str.c_str(), true);
-                    int  S_text    = (int) text_ids.size();
-                    int  S_lyric   = (int) lyric_ids.size();
-
-                    nc_fwd[b].S_text  = S_text;
-                    nc_fwd[b].S_lyric = S_lyric;
-                    std::vector<float> tmp_text;
-                    text_enc_ort_forward(te, text_ids.data(), S_text, tmp_text);
-                    nc_fwd[b].text_hidden = std::move(tmp_text);
-                    std::vector<float> tmp_lyric;
-                    text_enc_ort_embed_lookup(te, lyric_ids.data(), S_lyric, tmp_lyric);
-                    nc_fwd[b].lyric_embed = std::move(tmp_lyric);
-                }
-            }
-
-            // Negative prompt encoding
-            if (!reqs[0].negative_prompt.empty()) {
-                std::string neg_text_str, neg_lyric_str;
-                {
-                    AceRequest neg_req = reqs[0];
-                    neg_req.caption    = reqs[0].negative_prompt;
-                    neg_req.lyrics     = "";
-                    build_prompt_strings(neg_req, s.instruction_str, s.duration, neg_text_str, neg_lyric_str);
-                }
-                auto neg_text_ids = bpe_encode(bpe, neg_text_str.c_str(), true);
-                s.neg_S_text = (int) neg_text_ids.size();
-                text_enc_ort_forward(te, neg_text_ids.data(), s.neg_S_text, s.neg_text_hidden);
-                fprintf(stderr, "[Encode-Text] negative_prompt text encoded (ORT): %d tokens\n", s.neg_S_text);
-            }
-
-            debug_dump_2d(&s.dbg, "text_hidden", main_fwd[0].text_hidden.data(), main_fwd[0].S_text, H_text);
-            debug_dump_2d(&s.dbg, "lyric_embed", main_fwd[0].lyric_embed.data(), main_fwd[0].S_lyric, H_text);
+    if (ctx->use_trt_bundle) {
+        if (ops_encode_text_trt(ctx, reqs, batch_n, s, bpe, main_fwd, nc_fwd, H_text, H_cond) != 0) {
+            return -1;
         }
-
-        // Phase B(ORT): condition encoder
-        s.per_enc.resize(batch_n);
-        s.per_enc_S.resize(batch_n);
-        s.per_enc_nc.resize(batch_n);
-        s.per_enc_S_nc.assign(batch_n, 0);
-        {
-            CondEncOrt * ce = store_require_cond_enc_ort(ctx->store, ctx->cond_enc_ort_key);
-            if (!ce) {
-                fprintf(stderr, "[Encode-Text] FATAL: store_require_cond_enc_ort failed\n");
-                return -1;
-            }
-            ModelHandle ce_guard(ctx->store, ce);
-            H_cond = ce->hidden_size;
-
-            // null_condition_emb from the ORT model
-            s.null_cond_vec.resize(H_cond);
-            if (!ce->null_cond_emb.empty()) {
-                memcpy(s.null_cond_vec.data(), ce->null_cond_emb.data(), H_cond * sizeof(float));
-            }
-
-            // Negative prompt encoding through cond encoder
-            if (!s.neg_text_hidden.empty() && s.neg_S_text > 0) {
-                std::vector<float> neg_enc;
-                int                neg_enc_S = 0;
-                cond_enc_ort_forward(ce, s.neg_text_hidden.data(), s.neg_S_text,
-                                     nullptr, 0,
-                                     s.timbre_feats.data(), s.S_ref_timbre, neg_enc, &neg_enc_S);
-                if (neg_enc_S > 0 && !neg_enc.empty()) {
-                    s.null_cond_vec.assign(H_cond, 0.0f);
-                    for (int si = 0; si < neg_enc_S; si++)
-                        for (int h = 0; h < H_cond; h++)
-                            s.null_cond_vec[h] += neg_enc[(size_t)si * H_cond + h];
-                    float inv = 1.0f / (float)neg_enc_S;
-                    for (int h = 0; h < H_cond; h++) s.null_cond_vec[h] *= inv;
-                    fprintf(stderr, "[Encode-Text] negative_prompt encoded (ORT): enc_S=%d\n", neg_enc_S);
-                }
-            }
-
-            for (int b = 0; b < batch_n; b++) {
-                s.timer.reset();
-                cond_enc_ort_forward(ce, main_fwd[b].text_hidden.data(), main_fwd[b].S_text,
-                                     main_fwd[b].lyric_embed.data(), main_fwd[b].S_lyric,
-                                     s.timbre_feats.data(), s.S_ref_timbre,
-                                     s.per_enc[b], &s.per_enc_S[b]);
-                fprintf(stderr, "[Encode-Text(ORT) Batch%d] %d+%d tokens -> enc_S=%d, %.1f ms\n",
-                        b, main_fwd[b].S_text, main_fwd[b].S_lyric, s.per_enc_S[b], s.timer.ms());
-            }
-            debug_dump_2d(&s.dbg, "enc_hidden", s.per_enc[0].data(), s.per_enc_S[0], H_cond);
-
-            if (s.need_enc_switch) {
-                for (int b = 0; b < batch_n; b++) {
-                    cond_enc_ort_forward(ce, nc_fwd[b].text_hidden.data(), nc_fwd[b].S_text,
-                                         nc_fwd[b].lyric_embed.data(), nc_fwd[b].S_lyric,
-                                         s.timbre_feats.data(), s.S_ref_timbre,
-                                         s.per_enc_nc[b], &s.per_enc_S_nc[b]);
-                    fprintf(stderr, "[Encode-Text(ORT) Batch%d] non-cover: %d+%d tokens -> enc_S=%d\n",
-                            b, nc_fwd[b].S_text, nc_fwd[b].S_lyric, s.per_enc_S_nc[b]);
-                }
-            }
-        }
-
     } else {
+
     // ═══════════════════════════════════════════════════════════════════
     // GGML PATH: existing text encoder + condition encoder via GGML
     // ═══════════════════════════════════════════════════════════════════
@@ -828,6 +1024,7 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
     }
 
     // Phase B: condition encoder.
+    {
     s.per_enc.resize(batch_n);
     s.per_enc_S.resize(batch_n);
     s.per_enc_nc.resize(batch_n);
@@ -889,7 +1086,8 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
             }
         }
     }
-    } // end GGML else-branch
+    }
+    }  // end GGML/TRT encode branch
 
     // find max s.enc_S across both encodings (cover + text2music),
     // pad shorter encodings with null_cond, stack into [H, s.max_enc_S, N]
@@ -1006,6 +1204,10 @@ int ops_build_context(const AceSynth * ctx, const AceRequest * reqs, int batch_n
         bool any_codes = s.have_codes;
 
         if (any_codes) {
+            if (!ops_fsq_sidecar_available(ctx)) {
+                ops_log_missing_fsq_sidecar(ctx, "Build-Context");
+                return -1;
+            }
             DetokGGML * detok = store_require_fsq_detok(ctx->store, ctx->fsq_detok_key);
             if (!detok) {
                 fprintf(stderr, "[Build-Context] FATAL: store_require_fsq_detok failed\n");
@@ -1198,98 +1400,136 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
 
         fprintf(stderr, "[DiT-Generate] Using TRT path: %s\n", ctx->dit_key.path.c_str());
 
-        // Static TRT context — built once, reused across requests
-        static DitTrt s_trt;
-        static bool   s_trt_ready = false;
-        static std::string s_trt_onnx_path;
-
-        if (!s_trt_ready || s_trt_onnx_path != ctx->dit_key.path) {
-            // Need to build or load the TRT engine
-            if (s_trt_ready) {
-                dit_trt_free(&s_trt);
-                // dit_trt_free already nulls pointers and clears base_weights
-                s_trt.current_adapter.clear();
-                s_trt_ready = false;
-            }
-
-            // Resolve actual ONNX file: dit_key.path may be a directory or .onnx file
-            std::string onnx_path;
-            {
-                const std::string & p = ctx->dit_key.path;
-                size_t plen = p.size();
-                if (plen >= 5 && p.compare(plen - 5, 5, ".onnx") == 0) {
-                    onnx_path = p;  // already a .onnx file path
-                } else {
-                    // Directory: find the dit*.onnx file inside
-#ifdef _WIN32
-                    std::string pattern = p + "\\*.onnx";
-                    WIN32_FIND_DATAA fd;
-                    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-                    if (h != INVALID_HANDLE_VALUE) {
-                        do {
-                            std::string fname(fd.cFileName);
-                            std::string lower = fname;
-                            for (auto & c : lower) c = (char)tolower((unsigned char)c);
-                            if (lower.find("dit") != std::string::npos) {
-                                onnx_path = p + "\\" + fname;
-                                break;
-                            }
-                        } while (FindNextFileA(h, &fd));
-                        FindClose(h);
-                    }
-#else
-                    DIR * d = opendir(p.c_str());
-                    if (d) {
-                        struct dirent * ent;
-                        while ((ent = readdir(d)) != nullptr) {
-                            std::string fname(ent->d_name);
-                            std::string lower = fname;
-                            for (auto & c : lower) c = (char)tolower((unsigned char)c);
-                            if (lower.find("dit") != std::string::npos &&
-                                lower.size() >= 5 && lower.compare(lower.size() - 5, 5, ".onnx") == 0) {
-                                onnx_path = p + "/" + fname;
-                                break;
-                            }
+        // dit_key.path may be a .onnx FILE path or a bundle DIRECTORY. Resolve
+        // the concrete dit*.onnx file before deriving the engine path so both
+        // routing modes reach the same store-managed TRT dispatch below.
+        std::string onnx_path;
+        {
+            const std::string & p = ctx->dit_key.path;
+            if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".onnx") == 0) {
+                onnx_path = p;  // already a concrete .onnx file path
+            } else {
+                std::error_code ec;
+                if (std::filesystem::is_directory(p, ec)) {
+                    for (const auto & entry : std::filesystem::directory_iterator(p, ec)) {
+                        if (!entry.is_regular_file(ec)) continue;
+                        std::string fname = entry.path().filename().string();
+                        std::string lower = fname;
+                        for (auto & c : lower) c = (char)tolower((unsigned char)c);
+                        if (lower.find("dit") != std::string::npos &&
+                            lower.size() >= 5 &&
+                            lower.compare(lower.size() - 5, 5, ".onnx") == 0) {
+                            onnx_path = entry.path().string();
+                            break;
                         }
-                        closedir(d);
-                    }
-#endif
-                    if (onnx_path.empty()) {
-                        fprintf(stderr, "[DiT-Generate] FATAL: no dit*.onnx found in %s\n", p.c_str());
-                        return -1;
                     }
                 }
+                if (onnx_path.empty()) {
+                    fprintf(stderr, "[DiT-Generate] FATAL: no dit*.onnx found in %s\n", p.c_str());
+                    return -1;
+                }
+                fprintf(stderr, "[DiT-Generate] Resolved DiT bundle dir to ONNX: %s\n", onnx_path.c_str());
+            }
+        }
+
+        std::string engine_path = onnx_path.substr(0, onnx_path.size() - 5) + ".engine";
+        // A batched-CFG step packs cond+uncond into one 2*batch_n forward. When
+        // the prebuilt engine's profile only covers batch=batch_n (e.g. a bundle
+        // built max-batch=1 for an 8 GB card), fall back to CFG 2-pass (two
+        // batch_n forwards per step) — the dit-sampler supports this and it also
+        // lowers activation VRAM. This local override does not mutate ctx->params.
+        bool dit_use_batch_cfg     = ctx->params.use_batch_cfg;
+        int required_profile_batch = (dit_use_batch_cfg && s.guidance_scale > 1.0f) ? 2 * batch_n : batch_n;
+
+        TrtPrecisionManifestCheck precision_manifest;
+        std::string precision_err;
+        if (!trt_artifact_validate_precision_manifest(onnx_path, &precision_manifest, &precision_err)) {
+            fprintf(stderr, "[DiT-Generate] FATAL: invalid DiT precision manifest: %s\n", precision_err.c_str());
+            return -1;
+        }
+
+        if (!hs_file_exists(engine_path)) {
+            fprintf(stderr,
+                    "[DiT-Generate] FATAL: prebuilt TRT engine is missing: %s\n"
+                    "[DiT-Generate] Build it offline with tools/onnx-export/build-trt-engine.py and place it in the DiT bundle.\n",
+                    engine_path.c_str());
+            return -1;
+        }
+
+        {
+            TrtEngineMetadataCheck engine_check;
+            std::string engine_err;
+            if (!trt_artifact_validate_engine_metadata(engine_path + ".metadata.json",
+                                                       precision_manifest.policy,
+                                                       NV_TENSORRT_MAJOR,
+                                                       NV_TENSORRT_MINOR,
+                                                       &engine_check,
+                                                       &engine_err)) {
+                fprintf(stderr, "[DiT-Generate] FATAL: prebuilt engine metadata incompatible: %s\n",
+                        engine_err.c_str());
+                return -1;
             }
 
-            // Engine path: same directory, same name but .engine extension
-            std::string engine_path = onnx_path.substr(0, onnx_path.size() - 5) + ".engine";
-
-            // Check if engine exists
-            FILE * ef = fopen(engine_path.c_str(), "rb");
-            if (ef) {
-                fclose(ef);
-                fprintf(stderr, "[DiT-Generate] Loading cached TRT engine: %s\n", engine_path.c_str());
-            } else {
-                // Build engine from ONNX (slow, first run only)
-                fprintf(stderr, "[DiT-Generate] Building TRT engine from ONNX...\n");
-                if (!dit_trt_build(onnx_path.c_str(), engine_path.c_str())) {
-                    fprintf(stderr, "[DiT-Generate] FATAL: TRT engine build failed\n");
+            if (!trt_artifact_engine_profile_covers(engine_check,
+                                                    required_profile_batch,
+                                                    s.T,
+                                                    s.enc_S,
+                                                    &engine_err)) {
+                // If batched CFG is what overflowed the profile, retry with CFG
+                // 2-pass (batch_n forwards) before failing.
+                bool retried = false;
+                if (dit_use_batch_cfg && required_profile_batch > batch_n) {
+                    std::string retry_err;
+                    if (trt_artifact_engine_profile_covers(engine_check, batch_n, s.T, s.enc_S, &retry_err)) {
+                        fprintf(stderr,
+                                "[DiT-Generate] engine profile too small for batched CFG (%s); "
+                                "falling back to CFG 2-pass at batch=%d\n",
+                                engine_err.c_str(), batch_n);
+                        dit_use_batch_cfg     = false;
+                        required_profile_batch = batch_n;
+                        retried               = true;
+                    }
+                }
+                if (!retried) {
+                    fprintf(stderr, "[DiT-Generate] FATAL: prebuilt engine profile incompatible: %s\n",
+                            engine_err.c_str());
                     return -1;
                 }
             }
+            fprintf(stderr,
+                    "[DiT-TRT] Prebuilt engine metadata OK: TRT %s, policy=%s, profile=%s, max=batch:%d T:%d enc_S:%d\n",
+                    engine_check.tensorrt_version.c_str(),
+                    engine_check.policy.c_str(),
+                    engine_check.profile.c_str(),
+                    engine_check.profile_max_batch,
+                    engine_check.profile_max_T,
+                    engine_check.profile_max_enc_S);
 
-            // Load engine + refit with base weights
-            if (!dit_trt_load(&s_trt, engine_path.c_str(), onnx_path.c_str())) {
-                fprintf(stderr, "[DiT-Generate] FATAL: TRT engine load failed\n");
-                return -1;
-            }
-            s_trt_onnx_path = onnx_path;
-            s_trt_ready = true;
+        }
+
+        std::string want_cache_key = hs_trt_cache_key(onnx_path, engine_path);
+
+        // Acquire the deserialized engine from the model store.
+        // The store keys MODEL_DIT_TRT on (engine path + artifact fingerprint):
+        // a changed engine/sidecar fingerprint misses the cache and reloads;
+        // a matching key reuses the cached engine. Adapter state is refit in
+        // place on the returned engine below — adapters are not part of the key.
+        ModelKey trt_key;
+        trt_key.kind                   = MODEL_DIT_TRT;
+        trt_key.path                   = engine_path;
+        trt_key.artifact_fingerprint   = want_cache_key;
+        trt_key.engine_onnx_path       = onnx_path;
+
+
+        DitTrt * trt = store_require_dit_trt(ctx->store, trt_key);
+        if (!trt) {
+            fprintf(stderr, "[DiT-Generate] FATAL: store_require_dit_trt failed\n");
+            return -1;
         }
 
         // LoRA adapter refitting: apply/revert/switch as needed
         // Non-bf16 engines (fp32 from FP8, etc.) need different merge math.
-        if (s_trt.io_dtype != DitTrt::IO_BF16) {
+        if (trt->io_dtype != DitTrt::IO_BF16) {
             if (!ctx->dit_key.adapter_path.empty()) {
                 fprintf(stderr, "[Adapter-TRT] WARNING: LoRA adapters not yet supported with this engine I/O dtype, skipping\n");
                 fflush(stderr);
@@ -1297,40 +1537,47 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
         } else {
             auto t_adapter_wall = std::chrono::steady_clock::now();
             const std::string& want_adapter = ctx->dit_key.adapter_path;
-            const std::string& have_adapter = s_trt.current_adapter;
+            const std::string& have_adapter = trt->current_adapter;
+            std::string want_adapter_key = hs_trt_adapter_key(ctx->dit_key);
+            const std::string& have_adapter_key = trt->current_adapter_key;
 
-            if (want_adapter.empty() && !have_adapter.empty()) {
+            if (want_adapter.empty() && (!have_adapter.empty() || !have_adapter_key.empty())) {
                 // Revert to base model
-                fprintf(stderr, "[Adapter-TRT] Reverting adapter '%s' → base\n",
+                fprintf(stderr, "[Adapter-TRT] Reverting adapter '%s' -> base\n",
                         have_adapter.c_str());
                 fflush(stderr);
-                int64_t ms = adapter_trt_revert(&s_trt);
+                int64_t ms = adapter_trt_revert(trt);
                 if (ms >= 0) {
                     fprintf(stderr, "[Adapter-TRT] Reverted in %lld ms\n", (long long)ms);
                     fflush(stderr);
+                } else {
+                    trt->current_adapter_key.clear();
                 }
-            } else if (!want_adapter.empty() && want_adapter != have_adapter) {
-                // Apply new adapter (or switch from one to another)
-                if (!have_adapter.empty()) {
-                    fprintf(stderr, "[Adapter-TRT] Switching adapter '%s' → '%s'\n",
+            } else if (!want_adapter.empty() && want_adapter_key != have_adapter_key) {
+                // Apply new adapter, or refit the same adapter when scale,
+                // group scales, or adapter sidecar content changed.
+                if (!have_adapter.empty() || !have_adapter_key.empty()) {
+                    fprintf(stderr, "[Adapter-TRT] Switching adapter '%s' -> '%s'\n",
                             have_adapter.c_str(), want_adapter.c_str());
                     fflush(stderr);
                     // Revert to base first, then apply new
-                    adapter_trt_revert(&s_trt);
+                    adapter_trt_revert(trt);
                 }
                 fprintf(stderr, "[Adapter-TRT] Applying adapter: %s (scale=%.2f)\n",
                         want_adapter.c_str(), ctx->dit_key.adapter_scale);
                 fflush(stderr);
-                int64_t ms = adapter_trt_apply(&s_trt, want_adapter.c_str(),
+                int64_t ms = adapter_trt_apply(trt, want_adapter.c_str(),
                                                ctx->dit_key.adapter_scale);
                 if (ms < 0) {
                     fprintf(stderr, "[Adapter-TRT] WARNING: adapter apply failed, continuing with base\n");
+                    trt->current_adapter_key.clear();
                 } else {
+                    trt->current_adapter_key = want_adapter_key;
                     fprintf(stderr, "[Adapter-TRT] Applied in %lld ms\n", (long long)ms);
                 }
                 fflush(stderr);
             }
-            // else: want == have, no change needed
+            // else: adapter signature matches, no refit needed.
 
             auto t_adapter_end = std::chrono::steady_clock::now();
             auto adapter_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1343,28 +1590,26 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
 
         s.timer.reset();
         int dit_rc = dit_trt_generate(
-            &s_trt, s.noise.data(), s.context.data(), s.enc_hidden.data(), s.enc_S, s.T, batch_n, s.num_steps,
+            trt, s.noise.data(), s.context.data(), s.enc_hidden.data(), s.enc_S, s.T, batch_n, s.num_steps,
             s.schedule.data(), s.output.data(), s.guidance_scale, &s.dbg,
             s.context_silence.empty() ? nullptr : s.context_silence.data(), s.cover_steps, cancel, cancel_data,
             s.per_S.data(), s.per_enc_S.data(), s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
             s.per_enc_S_nc_final.empty() ? nullptr : s.per_enc_S_nc_final.data(), s.use_sde, s.seeds.data(),
-            ctx->params.use_batch_cfg,
+            dit_use_batch_cfg,
             s.null_cond_vec.empty() ? nullptr : s.null_cond_vec.data());
         if (dit_rc != 0) {
+            // Release frees the per-job buffers + context and decrements the
+            // refcount; under EVICT_STRICT the engine is fully unloaded.
+            store_release_dit_trt(ctx->store, trt);
             return -1;
         }
         fprintf(stderr, "[DiT-Generate] TRT Total: %.1f ms (%.1f ms/sample)\n", s.timer.ms(), s.timer.ms() / batch_n);
         fflush(stderr);
 
-        // Release TRT engine from VRAM if eviction policy says so.
-        // EVICT_STRICT (default) = unload after use, like GGML's store_release.
-        // EVICT_NEVER ("Keep DiT & VAE loaded") = keep engine in VRAM.
-        if (store_get_policy(ctx->store) == EVICT_STRICT) {
-            dit_trt_free(&s_trt);
-            s_trt_ready = false;
-            s_trt_onnx_path.clear();
-            fprintf(stderr, "[DiT-TRT] Engine unloaded from VRAM\n");
-        }
+        // Release the handle: frees transient/job buffers + execution context
+        // and decrements the refcount. Under EVICT_STRICT, the engine is fully
+        // unloaded and must be reloaded from disk on the next request.
+        store_release_dit_trt(ctx->store, trt);
 
         // (fall through to latent post-processing below)
         goto post_dit;
@@ -1469,33 +1714,20 @@ int ops_vae_decode(const AceSynth * ctx,
                    SynthState &     s,
                    bool (*cancel)(void *),
                    void * cancel_data) {
-    // ── Decide: ORT path or GGML path ──────────────────────────────
-    bool use_ort = s.rr.use_ort_vae && !ctx->onnx_vae_path.empty();
-
-    // Acquire the appropriate decoder module.
-    // We try ORT first; on failure, fall back to GGML.
-    VAEGGML * vae_ggml = nullptr;
-    VaeOrt  * vae_ort  = nullptr;
-
-    if (use_ort) {
-        vae_ort = store_require_vae_dec_ort(ctx->store, ctx->vae_dec_ort_key);
-        if (!vae_ort) {
-            fprintf(stderr, "[VAE-Decode] WARNING: ORT VAE load failed, falling back to GGML\n");
-            use_ort = false;
-        } else {
-            fprintf(stderr, "[VAE-Decode] Using ORT VAE decoder\n");
-        }
+    // VAE decode via GGML.
+    bool have_ggml_vae = !ctx->vae_dec_key.path.empty();
+    if (!have_ggml_vae) {
+        fprintf(stderr, "[VAE-Decode] FATAL: no VAE decoder available\n");
+        return -1;
     }
-    if (!use_ort) {
-        vae_ggml = store_require_vae_dec(ctx->store, ctx->vae_dec_key);
-        if (!vae_ggml) {
-            fprintf(stderr, "[VAE-Decode] FATAL: store_require_vae_dec failed\n");
-            return -1;
-        }
+    VAEGGML * vae_ggml = store_require_vae_dec(ctx->store, ctx->vae_dec_key);
+    if (!vae_ggml) {
+        fprintf(stderr, "[VAE-Decode] FATAL: store_require_vae_dec failed\n");
+        return -1;
     }
 
-    // RAII guard: whichever module we loaded, release it on scope exit
-    ModelHandle vae_guard(ctx->store, use_ort ? (void *)vae_ort : (void *)vae_ggml);
+    // RAII guard: release the module on scope exit
+    ModelHandle vae_guard(ctx->store, (void *)vae_ggml);
     // Latent splice for repaint/lego: keep s.output inside [t0, t1), copy
     // s.cover_latents outside. Hard cut at frame boundary, the VAE tiled
     // decoder smooths the seam in the waveform.
@@ -1522,14 +1754,8 @@ int ops_vae_decode(const AceSynth * ctx,
         float * dit_out = s.output.data() + b * s.Oc * s.T;
 
         s.timer.reset();
-        int T_audio;
-        if (use_ort) {
-            T_audio = vae_ort_decode_tiled(vae_ort, dit_out, T_latent, audio.data(), T_audio_max,
-                                            ctx->params.vae_chunk, ctx->params.vae_overlap);
-        } else {
-            T_audio = vae_ggml_decode_tiled(vae_ggml, dit_out, T_latent, audio.data(), T_audio_max,
+        int T_audio = vae_ggml_decode_tiled(vae_ggml, dit_out, T_latent, audio.data(), T_audio_max,
                                             ctx->params.vae_chunk, ctx->params.vae_overlap, cancel, cancel_data);
-        }
         if (T_audio < 0) {
             if (cancel && cancel(cancel_data)) {
                 fprintf(stderr, "[VAE-Decode Batch%d] Cancelled\n", b);
@@ -1541,8 +1767,7 @@ int ops_vae_decode(const AceSynth * ctx,
             out[b].sample_rate = 48000;
             continue;
         }
-        fprintf(stderr, "[VAE-Decode Batch%d] Decode: %.1f ms (%s)\n", b, s.timer.ms(),
-                use_ort ? "ORT" : "GGML");
+        fprintf(stderr, "[VAE-Decode Batch%d] Decode: %.1f ms (GGML)\n", b, s.timer.ms());
 
         if (b == 0) {
             debug_dump_2d(&s.dbg, "vae_audio", audio.data(), 2, T_audio);
@@ -1776,33 +2001,19 @@ int ops_pp_vae_reencode(const AceSynth * ctx, int batch_n, AceAudio * out, Synth
     }
 
     // Phase 1: Encode all batch items through PP-VAE encoder → latents
-    // Prefers ORT/TRT encoder when available, falls back to GGML.
     // Encoder converts planar stereo PCM → interleaved → VAE latents [T_latent, 64]
     std::vector<std::vector<float>> latents(batch_n);
     std::vector<int>                T_latent(batch_n, 0);
 
     {
-        bool use_ort_enc = !ctx->pp_vae_onnx_enc_path.empty();
-        VaeEncOrt  * enc_ort  = nullptr;
-        VAEEncoder * enc_ggml = nullptr;
-
-        if (use_ort_enc) {
-            enc_ort = store_require_vae_enc_ort(ctx->store, ctx->pp_vae_enc_ort_key);
-            if (!enc_ort) {
-                fprintf(stderr, "[PP-VAE] ORT encoder unavailable, falling back to GGML\n");
-                use_ort_enc = false;
-            }
+        VAEEncoder * enc_ggml = store_require_vae_enc(ctx->store, ctx->pp_vae_enc_key);
+        if (!enc_ggml) {
+            fprintf(stderr, "[PP-VAE] WARNING: encoder unavailable, skipping\n");
+            return 0;  // non-fatal: just skip the re-encode
         }
-        if (!use_ort_enc) {
-            enc_ggml = store_require_vae_enc(ctx->store, ctx->pp_vae_enc_key);
-            if (!enc_ggml) {
-                fprintf(stderr, "[PP-VAE] WARNING: encoder unavailable, skipping\n");
-                return 0;  // non-fatal: just skip the re-encode
-            }
-        }
-        ModelHandle enc_guard(ctx->store, use_ort_enc ? (void *)enc_ort : (void *)enc_ggml);
+        ModelHandle enc_guard(ctx->store, (void *)enc_ggml);
 
-        fprintf(stderr, "[PP-VAE] Encoding via %s\n", use_ort_enc ? "ORT/TRT" : "GGML");
+        fprintf(stderr, "[PP-VAE] Encoding via GGML\n");
 
         for (int b = 0; b < batch_n; b++) {
             if (!out[b].samples || out[b].n_samples <= 0) {
@@ -1823,15 +2034,9 @@ int ops_pp_vae_reencode(const AceSynth * ctx, int batch_n, AceAudio * out, Synth
                 interleaved[i * 2 + 1] = R[i];
             }
 
-            if (use_ort_enc) {
-                T_latent[b] = vae_enc_ort_encode_tiled(enc_ort, interleaved.data(), T_audio,
-                                                        latents[b].data(), max_T,
-                                                        ctx->params.vae_chunk, ctx->params.vae_overlap);
-            } else {
-                T_latent[b] = vae_enc_encode_tiled(enc_ggml, interleaved.data(), T_audio,
-                                                    latents[b].data(), max_T,
-                                                    ctx->params.vae_chunk, ctx->params.vae_overlap);
-            }
+            T_latent[b] = vae_enc_encode_tiled(enc_ggml, interleaved.data(), T_audio,
+                                                latents[b].data(), max_T,
+                                                ctx->params.vae_chunk, ctx->params.vae_overlap);
 
             if (T_latent[b] <= 0) {
                 fprintf(stderr, "[PP-VAE Batch%d] WARNING: encode failed\n", b);
@@ -1858,30 +2063,16 @@ int ops_pp_vae_reencode(const AceSynth * ctx, int batch_n, AceAudio * out, Synth
     fprintf(stderr, "[PP-VAE] Encode done: %.1f ms\n", s.timer.ms());
 
     // Phase 2: Decode all latents through PP-VAE decoder → PCM
-    // Prefers ORT/TRT decoder when available, falls back to GGML.
     {
         s.timer.reset();
-        bool use_ort_dec = !ctx->pp_vae_onnx_dec_path.empty();
-        VaeOrt  * dec_ort  = nullptr;
-        VAEGGML * dec_ggml = nullptr;
-
-        if (use_ort_dec) {
-            dec_ort = store_require_vae_dec_ort(ctx->store, ctx->pp_vae_dec_ort_key);
-            if (!dec_ort) {
-                fprintf(stderr, "[PP-VAE] ORT decoder unavailable, falling back to GGML\n");
-                use_ort_dec = false;
-            }
+        VAEGGML * dec_ggml = store_require_vae_dec(ctx->store, ctx->pp_vae_dec_key);
+        if (!dec_ggml) {
+            fprintf(stderr, "[PP-VAE] WARNING: decoder unavailable, skipping\n");
+            return 0;
         }
-        if (!use_ort_dec) {
-            dec_ggml = store_require_vae_dec(ctx->store, ctx->pp_vae_dec_key);
-            if (!dec_ggml) {
-                fprintf(stderr, "[PP-VAE] WARNING: decoder unavailable, skipping\n");
-                return 0;
-            }
-        }
-        ModelHandle dec_guard(ctx->store, use_ort_dec ? (void *)dec_ort : (void *)dec_ggml);
+        ModelHandle dec_guard(ctx->store, (void *)dec_ggml);
 
-        fprintf(stderr, "[PP-VAE] Decoding via %s\n", use_ort_dec ? "ORT/TRT" : "GGML");
+        fprintf(stderr, "[PP-VAE] Decoding via GGML\n");
 
         for (int b = 0; b < batch_n; b++) {
             if (T_latent[b] <= 0) {
@@ -1891,16 +2082,9 @@ int ops_pp_vae_reencode(const AceSynth * ctx, int batch_n, AceAudio * out, Synth
             int                T_audio_max = T_latent[b] * 1920;
             std::vector<float> audio(2 * T_audio_max);
 
-            int T_audio;
-            if (use_ort_dec) {
-                T_audio = vae_ort_decode_tiled(dec_ort, latents[b].data(), T_latent[b],
-                                                audio.data(), T_audio_max,
-                                                ctx->params.vae_chunk, ctx->params.vae_overlap);
-            } else {
-                T_audio = vae_ggml_decode_tiled(dec_ggml, latents[b].data(), T_latent[b],
+            int T_audio = vae_ggml_decode_tiled(dec_ggml, latents[b].data(), T_latent[b],
                                                  audio.data(), T_audio_max,
                                                  ctx->params.vae_chunk, ctx->params.vae_overlap, NULL, NULL);
-            }
 
             if (T_audio <= 0) {
                 fprintf(stderr, "[PP-VAE Batch%d] WARNING: decode failed\n", b);
@@ -1962,4 +2146,3 @@ int ops_pp_vae_reencode(const AceSynth * ctx, int batch_n, AceAudio * out, Synth
 
     return 0;
 }
-

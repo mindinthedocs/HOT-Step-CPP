@@ -12,6 +12,8 @@
 #ifndef TEXT_ENC_ORT_H
 #define TEXT_ENC_ORT_H
 
+#include "ort-trt-cache.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,7 +55,8 @@ struct TextEncOrt {
 
 static inline bool text_enc_ort_load(TextEncOrt * ctx, const char * onnx_path,
                                      const char * embed_bin_path = nullptr,
-                                     int device_id = 0) {
+                                     int device_id = 0,
+                                     const char * artifact_fingerprint = nullptr) {
     if (!ctx || !onnx_path) return false;
 
     ctx->model_path = onnx_path;
@@ -62,35 +65,28 @@ static inline bool text_enc_ort_load(TextEncOrt * ctx, const char * onnx_path,
 
     // ── TensorRT EP ────────────────────────────────────────────────
 #if defined(GGML_USE_CUDA)
-    std::string trt_cache_dir;
-    {
-        std::string p = onnx_path;
-        auto slash = p.find_last_of("/\\");
-        trt_cache_dir = (slash != std::string::npos) ? p.substr(0, slash) : ".";
+    std::string trt_cache_dir = hs_ort_trt_cache_dir(onnx_path, artifact_fingerprint, "text-enc");
+    if (!hs_ort_trt_cache_ready(trt_cache_dir)) {
+        fprintf(stderr, "[TextEnc-ORT] FATAL: prebuilt TensorRT cache missing or incomplete: %s\n",
+                trt_cache_dir.c_str());
+        fprintf(stderr, "[TextEnc-ORT] Build it offline with tools/onnx-export/build-ort-trt-engines.py\n");
+        return false;
     }
 
     {
-        OrtTensorRTProviderOptions trt_opts{};
-        trt_opts.device_id                   = device_id;
-        trt_opts.trt_max_partition_iterations = 1000;
-        trt_opts.trt_min_subgraph_size       = 1;
-        trt_opts.trt_max_workspace_size      = (size_t)2 << 30;
-        trt_opts.trt_fp16_enable             = 0;  // FP32: layernorm overflows in FP16
-        trt_opts.trt_engine_cache_enable     = 1;
-        trt_opts.trt_engine_cache_path       = trt_cache_dir.c_str();
-
-        const OrtApi & api = Ort::GetApi();
-        OrtStatus * status = api.SessionOptionsAppendExecutionProvider_TensorRT(
-            ctx->session_opts, &trt_opts);
-        if (status) {
-            std::string msg = api.GetErrorMessage(status);
-            api.ReleaseStatus(status);
-            fprintf(stderr, "[TextEnc-ORT] TRT EP unavailable: %s — trying CUDA EP\n", msg.c_str());
-            ctx->using_trt = false;
-        } else {
+        try {
+            Ort::TensorRTProviderOptions trt_opts;
+            auto opts = hs_ort_trt_provider_options(
+                onnx_path, artifact_fingerprint, "text-enc", device_id, false, (size_t)2 << 30);
+            trt_opts.Update(opts);
+            ctx->session_opts.AppendExecutionProvider_TensorRT_V2(*trt_opts);
             ctx->using_trt = true;
-            fprintf(stderr, "[TextEnc-ORT] TRT EP appended (device %d, cache=%s)\n",
-                    device_id, trt_cache_dir.c_str());
+            fprintf(stderr, "[TextEnc-ORT] TRT EP appended (device %d, cache=%s, profile_max=%s)\n",
+                    device_id, trt_cache_dir.c_str(), opts["trt_profile_max_shapes"].c_str());
+        } catch (const std::exception & e) {
+            fprintf(stderr, "[TextEnc-ORT] FATAL: TensorRT EP unavailable for prebuilt bundle: %s\n", e.what());
+            ctx->using_trt = false;
+            return false;
         }
     }
 
@@ -255,7 +251,8 @@ struct TextEncOrt {
     int hidden_size = 1024;
 };
 
-static inline bool text_enc_ort_load(TextEncOrt *, const char *, const char * = nullptr, int = 0) {
+static inline bool text_enc_ort_load(TextEncOrt *, const char *, const char * = nullptr, int = 0,
+                                     const char * = nullptr) {
     fprintf(stderr, "[TextEnc-ORT] Not compiled (HOT_STEP_SUPERSEP not defined)\n");
     return false;
 }

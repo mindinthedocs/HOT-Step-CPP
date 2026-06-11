@@ -14,6 +14,7 @@
 #include "pipeline-synth.h"
 #include "request.h"
 #include "timer.h"
+#include "trt-bundle-manifest.h"
 
 #include <string>
 #include <vector>
@@ -47,20 +48,20 @@ struct AceSynth {
     // PP-VAE: optional post-processing VAE (auto-detected from models dir)
     ModelKey pp_vae_enc_key;      // PP-VAE encoder (GGML), from pp_vae_path
     ModelKey pp_vae_dec_key;      // PP-VAE decoder (GGML), from pp_vae_path
-    ModelKey pp_vae_enc_ort_key;  // PP-VAE encoder (ORT), from pp_vae_onnx_enc_path
-    ModelKey pp_vae_dec_ort_key;  // PP-VAE decoder (ORT), from pp_vae_onnx_dec_path
     bool     have_pp_vae;         // true if PP-VAE GGUF was found
-    std::string pp_vae_onnx_enc_path;  // path to scragvae_encoder.onnx (empty = not available)
-    std::string pp_vae_onnx_dec_path;  // path to scragvae_decoder.onnx (empty = not available)
 
-    // ORT VAE: optional ONNX Runtime VAE decoder (TensorRT/CUDA EP)
-    ModelKey    vae_dec_ort_key;   // VAE-Dec-ORT, from onnx_vae_path
-    std::string onnx_vae_path;    // path to vae_decoder.onnx (empty = not available)
+    bool        is_onnx_pipeline;   // true when FSQ/runtime side data is from the ONNX artifact dir
 
-    // ORT text/cond encoder: used when DiT is ONNX (.onnx path)
-    ModelKey    text_enc_ort_key;   // TextEnc-ORT, from text_encoder.onnx
-    ModelKey    cond_enc_ort_key;   // CondEnc-ORT, from cond_encoder.onnx
-    bool        is_onnx_pipeline;  // true when DiT is ONNX → all sub-models use ORT
+    // Native TRT bundle routing. Set when the selected ONNX DiT directory carries
+    // a manifest.json (the sole TRT-bundle detector). When true the encoders route
+    // through the TRT engines named in the manifest instead of GGML qwen3/cond.
+    // The all-three-or-nothing gate runs at load: an incomplete manifest hard-fails
+    // ace_synth_load, so use_trt_bundle==true implies dit/text_enc/cond_enc engines
+    // are all present. The DiT TRT path keys off dit_key.path (ONNX dir) as before.
+    bool             use_trt_bundle = false;
+    TrtBundleManifest trt_manifest;       // resolved component paths (valid iff use_trt_bundle)
+    ModelKey         text_enc_trt_key;    // MODEL_TEXT_ENC_TRT, path = manifest text_enc engine
+    ModelKey         cond_enc_trt_key;    // MODEL_COND_ENC_TRT, path = manifest cond_enc engine
 };
 
 // Transient state for a single job, shared by reference across the primitive

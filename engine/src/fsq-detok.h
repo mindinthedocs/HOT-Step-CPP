@@ -5,7 +5,8 @@
 //   -> detokenizer (per token): embed + special_tokens broadcast + 2L encoder + proj_out
 //   -> [T_25Hz, 64] context_latents (T_25Hz = T_5Hz * 5)
 //
-// Weights live in the DiT GGUF (prefix "tokenizer." and "detokenizer.")
+// Weights live in the DiT GGUF, a source safetensors directory, or a runtime
+// fsq.safetensors sidecar (prefix "tokenizer." and "detokenizer.").
 // Detokenizer reuses Qwen3 encoder infrastructure from qwen3.h
 
 #pragma once
@@ -66,7 +67,8 @@ struct DetokGGML {
     WeightCtx            wctx;
 };
 
-// Load from DiT GGUF or safetensors directory
+// Load from DiT GGUF, source safetensors directory, or runtime fsq.safetensors
+// sidecar.
 static bool detok_ggml_load(DetokGGML * m, const char * gguf_path) {
     m->cfg = detok_config();
 
@@ -83,8 +85,8 @@ static bool detok_ggml_load(DetokGGML * m, const char * gguf_path) {
     WeightSource ws;
 
     if (is_st) {
-        if (!st_multi_open(&sm, gguf_path)) {
-            fprintf(stderr, "[Load] FATAL: cannot open safetensors in %s\n", gguf_path);
+        if (!st_multi_open_preferred(&sm, gguf_path, "fsq.safetensors")) {
+            fprintf(stderr, "[Load] FATAL: cannot open fsq.safetensors or source safetensors in %s\n", gguf_path);
             return false;
         }
         ws.is_st = true;

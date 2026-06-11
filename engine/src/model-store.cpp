@@ -19,6 +19,7 @@
 #include "weight-source.h"
 
 #include <cassert>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -57,6 +58,13 @@ struct ModelKeyHash {
             hash_f(k.adapter_group_scales.cross_attn);
             hash_f(k.adapter_group_scales.mlp);
             hash_f(k.adapter_group_scales.cond_embed);
+            hash_f(k.adapter_group_scales.time_embed);
+            hash_f(k.adapter_group_scales.proj_in);
+        } else if (k.kind == MODEL_DIT_TRT) {
+            // Fold the engine/sidecar fingerprint into the key so an in-place
+            // engine or sidecar change reloads. Adapter fields are deliberately
+            // excluded: adapters refit in place on the resident engine.
+            h ^= std::hash<std::string>{}(k.artifact_fingerprint) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
         }
         return h;
     }
@@ -76,7 +84,12 @@ struct ModelKeyEq {
                 && a.adapter_group_scales.self_attn  == b.adapter_group_scales.self_attn
                 && a.adapter_group_scales.cross_attn == b.adapter_group_scales.cross_attn
                 && a.adapter_group_scales.mlp        == b.adapter_group_scales.mlp
-                && a.adapter_group_scales.cond_embed == b.adapter_group_scales.cond_embed;
+                && a.adapter_group_scales.cond_embed == b.adapter_group_scales.cond_embed
+                && a.adapter_group_scales.time_embed == b.adapter_group_scales.time_embed
+                && a.adapter_group_scales.proj_in    == b.adapter_group_scales.proj_in;
+        }
+        if (a.kind == MODEL_DIT_TRT) {
+            return a.artifact_fingerprint == b.artifact_fingerprint;
         }
         return true;
     }
@@ -104,6 +117,161 @@ struct CpuEntry {
     void * ptr;
     void (*deleter)(void *);
 };
+
+static bool read_f32_vector_sidecar(const std::string & path, std::vector<float> & out) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    uint32_t dim = 0;
+    if (fread(&dim, sizeof(dim), 1, f) != 1 || dim == 0 || dim > 65536) {
+        fclose(f);
+        return false;
+    }
+    out.resize(dim);
+    size_t n = fread(out.data(), sizeof(float), dim, f);
+    fclose(f);
+    if (n != dim) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+static uint64_t store_fnv1a_file(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return 0;
+    }
+    uint64_t h = 1469598103934665603ULL;
+    unsigned char buf[8192];
+    for (;;) {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        for (size_t i = 0; i < n; i++) {
+            h ^= (uint64_t) buf[i];
+            h *= 1099511628211ULL;
+        }
+        if (n < sizeof(buf)) {
+            break;
+        }
+    }
+    fclose(f);
+    return h;
+}
+
+static std::string store_hex64(uint64_t v) {
+    static const char * hex = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i) {
+        out[i] = hex[v & 0xf];
+        v >>= 4;
+    }
+    return out;
+}
+
+static bool store_file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static std::string store_dirname(const std::string & path) {
+    std::string p = path;
+    while (!p.empty() && (p.back() == '/' || p.back() == '\\')) {
+        p.pop_back();
+    }
+    auto slash = p.find_last_of("/\\");
+    return (slash != std::string::npos) ? p.substr(0, slash) : ".";
+}
+
+// Derive the TRT bundle directory that owns a component path. A bundle lives at
+// <...>/trt-bundles/<name>/, and every component key (dit.engine,
+// text_encoder.engine, cond_encoder.engine, manifest.json) shares that prefix.
+// Returns <...>/trt-bundles/<name> with native separators, or "" when path is
+// not under any trt-bundles/ directory (a GGML/GGUF module the prune ignores).
+// Matching is separator-agnostic so mixed '/' and '\\' paths resolve the same.
+static std::string store_bundle_dir(const std::string & path) {
+    static const char * marker = "trt-bundles";
+    const size_t        mlen   = 11;  // strlen("trt-bundles")
+    for (size_t i = 0; (i = path.find(marker, i)) != std::string::npos; i += mlen) {
+        // marker must be a path segment: preceded by a separator (or start) and
+        // followed by a separator that begins the <name> segment.
+        bool left_ok = (i == 0) || path[i - 1] == '/' || path[i - 1] == '\\';
+        size_t after = i + mlen;
+        if (!left_ok || after >= path.size()) {
+            continue;
+        }
+        if (path[after] != '/' && path[after] != '\\') {
+            continue;  // e.g. "trt-bundles-old", not the marker segment
+        }
+        // Skip the separator(s) after the marker, then take the <name> segment.
+        size_t name_start = after;
+        while (name_start < path.size() && (path[name_start] == '/' || path[name_start] == '\\')) {
+            name_start++;
+        }
+        if (name_start >= path.size()) {
+            return "";  // trailing "trt-bundles/" with no bundle name
+        }
+        size_t name_end = name_start;
+        while (name_end < path.size() && path[name_end] != '/' && path[name_end] != '\\') {
+            name_end++;
+        }
+        // Bundle dir = everything up to and including <name>.
+        return path.substr(0, name_end);
+    }
+    return "";
+}
+
+// Two bundle dirs name the same bundle if their derived dirs match after
+// trailing-separator strip and separator normalization. keep_bundle_dir may be
+// passed as the bundle directory itself or as any component path under it, so
+// normalize both sides through store_bundle_dir first (a component path) then
+// fall back to a direct dir compare.
+static std::string store_normalize_bundle_dir(const std::string & dir_or_path) {
+    std::string b = store_bundle_dir(dir_or_path);
+    if (b.empty()) {
+        // Caller passed the bundle dir itself (…/trt-bundles/<name>) with no
+        // component suffix; store_bundle_dir needs a separator after <name>, so
+        // re-derive by appending a synthetic component.
+        std::string probe = dir_or_path;
+        while (!probe.empty() && (probe.back() == '/' || probe.back() == '\\')) {
+            probe.pop_back();
+        }
+        b = store_bundle_dir(probe + "/_");
+    }
+    while (!b.empty() && (b.back() == '/' || b.back() == '\\')) {
+        b.pop_back();
+    }
+    for (auto & c : b) {
+        if (c == '\\') c = '/';
+    }
+    return b;
+}
+
+static std::string store_bpe_cache_key(const char * lm_path) {
+    std::string key = lm_path ? lm_path : "";
+    if (!lm_path) {
+        return key;
+    }
+    size_t len = strlen(lm_path);
+    bool is_gguf = (len >= 5 && strcmp(lm_path + len - 5, ".gguf") == 0);
+    if (is_gguf) {
+        return key;
+    }
+    std::string direct_vocab = key + WS_SEP + "vocab.json";
+    std::string direct_merges = key + WS_SEP + "merges.txt";
+    std::string sidecar_dir = key;
+    if (!store_file_exists(direct_vocab) || !store_file_exists(direct_merges)) {
+        sidecar_dir = store_dirname(key);
+    }
+    std::string vocab = sidecar_dir + WS_SEP + "vocab.json";
+    std::string merges = sidecar_dir + WS_SEP + "merges.txt";
+    return key + "|vocab=" + store_hex64(store_fnv1a_file(vocab))
+        + "|merges=" + store_hex64(store_fnv1a_file(merges));
+}
 
 }  // namespace
 
@@ -134,6 +302,7 @@ static void evict_all_except(ModelStore * s, const ModelKey & keep) {
             ++it;
             continue;
         }
+        // Under EVICT_STRICT, evict everything that is not the module we want.
         GpuEntry & e = it->second;
         if (e.refcount > 0) {
             fprintf(stderr, "[Store] FATAL: evicting %s (refcount=%d) to make room in STRICT mode\n", e.label,
@@ -173,6 +342,7 @@ template <typename T> static T * cache_hit(ModelStore * s, const ModelKey & k) {
         return nullptr;
     }
     it->second.refcount++;
+    fprintf(stderr, "[Store] Hit %s (refcount=%d)\n", it->second.label, it->second.refcount);
     return static_cast<T *>(it->second.ptr);
 }
 
@@ -270,6 +440,23 @@ static void del_fsq_detok(void * p) {
     detok_ggml_free(static_cast<DetokGGML *>(p));
     delete static_cast<DetokGGML *>(p);
 }
+
+#ifdef HOT_STEP_TRT
+static void del_text_enc_trt(void * p) {
+    text_enc_trt_free(static_cast<TextEncTrt *>(p));
+    delete static_cast<TextEncTrt *>(p);
+}
+
+static void del_cond_enc_trt(void * p) {
+    cond_enc_trt_free(static_cast<CondEncTrt *>(p));
+    delete static_cast<CondEncTrt *>(p);
+}
+
+static void del_dit_trt(void * p) {
+    dit_trt_free(static_cast<DitTrt *>(p));
+    delete static_cast<DitTrt *>(p);
+}
+#endif
 
 // Weight buffer size helpers: different modules use different field names
 // for their backend buffer. VAE and VAE-Enc expose m->buf directly, every
@@ -476,136 +663,6 @@ VAEGGML * store_require_vae_dec(ModelStore * s, const ModelKey & k) {
     return m;
 }
 
-static void del_vae_dec_ort(void * p) {
-    vae_ort_free(static_cast<VaeOrt *>(p));
-    delete static_cast<VaeOrt *>(p);
-}
-
-VaeOrt * store_require_vae_dec_ort(ModelStore * s, const ModelKey & k) {
-    std::lock_guard<std::mutex> lock(s->mtx);
-    if (auto * hit = cache_hit<VaeOrt>(s, k)) {
-        return hit;
-    }
-    if (s->policy == EVICT_STRICT) {
-        evict_all_except(s, k);
-    }
-    Timer    t;
-    VaeOrt * m = new VaeOrt();
-    if (!vae_ort_load(m, k.path.c_str())) {
-        delete m;
-        return nullptr;
-    }
-    // ORT manages its own VRAM — report 0 bytes to the store budget.
-    install_entry(s, k, m, 0, "VAE-Dec-ORT", del_vae_dec_ort);
-    fprintf(stderr, "[Store] Load VAE-Dec-ORT: %.0f ms\n", t.ms());
-    return m;
-}
-
-static void del_vae_enc_ort(void * p) {
-    vae_ort_free(static_cast<VaeEncOrt *>(p));
-    delete static_cast<VaeEncOrt *>(p);
-}
-
-VaeEncOrt * store_require_vae_enc_ort(ModelStore * s, const ModelKey & k) {
-    std::lock_guard<std::mutex> lock(s->mtx);
-    if (auto * hit = cache_hit<VaeEncOrt>(s, k)) {
-        return hit;
-    }
-    if (s->policy == EVICT_STRICT) {
-        evict_all_except(s, k);
-    }
-    Timer       t;
-    VaeEncOrt * m = new VaeEncOrt();
-    if (!vae_ort_load(m, k.path.c_str())) {
-        delete m;
-        return nullptr;
-    }
-    // ORT manages its own VRAM — report 0 bytes to the store budget.
-    install_entry(s, k, m, 0, "VAE-Enc-ORT", del_vae_enc_ort);
-    fprintf(stderr, "[Store] Load VAE-Enc-ORT: %.0f ms\n", t.ms());
-    return m;
-}
-
-static void del_text_enc_ort(void * p) {
-    text_enc_ort_free(static_cast<TextEncOrt *>(p));
-    delete static_cast<TextEncOrt *>(p);
-}
-
-TextEncOrt * store_require_text_enc_ort(ModelStore * s, const ModelKey & k) {
-    std::lock_guard<std::mutex> lock(s->mtx);
-    if (auto * hit = cache_hit<TextEncOrt>(s, k)) {
-        return hit;
-    }
-    if (s->policy == EVICT_STRICT) {
-        evict_all_except(s, k);
-    }
-    Timer        t;
-    TextEncOrt * m = new TextEncOrt();
-
-    // Derive embed_tokens.bin and null_condition_emb.bin paths from ONNX directory
-    std::string dir;
-    {
-        std::string p = k.path;
-        auto slash = p.find_last_of("/\\");
-        dir = (slash != std::string::npos) ? p.substr(0, slash) : ".";
-    }
-    std::string embed_path = dir + WS_SEP + "embed_tokens.bin";
-    std::string null_cond_path = dir + WS_SEP + "null_condition_emb.bin";
-
-    const char * embed_cstr = nullptr;
-    {
-        FILE * f = fopen(embed_path.c_str(), "rb");
-        if (f) { fclose(f); embed_cstr = embed_path.c_str(); }
-    }
-
-    if (!text_enc_ort_load(m, k.path.c_str(), embed_cstr)) {
-        delete m;
-        return nullptr;
-    }
-    install_entry(s, k, m, 0, "TextEnc-ORT", del_text_enc_ort);
-    fprintf(stderr, "[Store] Load TextEnc-ORT: %.0f ms\n", t.ms());
-    return m;
-}
-
-static void del_cond_enc_ort(void * p) {
-    cond_enc_ort_free(static_cast<CondEncOrt *>(p));
-    delete static_cast<CondEncOrt *>(p);
-}
-
-CondEncOrt * store_require_cond_enc_ort(ModelStore * s, const ModelKey & k) {
-    std::lock_guard<std::mutex> lock(s->mtx);
-    if (auto * hit = cache_hit<CondEncOrt>(s, k)) {
-        return hit;
-    }
-    if (s->policy == EVICT_STRICT) {
-        evict_all_except(s, k);
-    }
-    Timer        t;
-    CondEncOrt * m = new CondEncOrt();
-
-    // null_condition_emb.bin in same directory as the ONNX
-    std::string dir;
-    {
-        std::string p = k.path;
-        auto slash = p.find_last_of("/\\");
-        dir = (slash != std::string::npos) ? p.substr(0, slash) : ".";
-    }
-    std::string null_cond_path = dir + WS_SEP + "null_condition_emb.bin";
-    const char * null_cstr = nullptr;
-    {
-        FILE * f = fopen(null_cond_path.c_str(), "rb");
-        if (f) { fclose(f); null_cstr = null_cond_path.c_str(); }
-    }
-
-    if (!cond_enc_ort_load(m, k.path.c_str(), null_cstr)) {
-        delete m;
-        return nullptr;
-    }
-    install_entry(s, k, m, 0, "CondEnc-ORT", del_cond_enc_ort);
-    fprintf(stderr, "[Store] Load CondEnc-ORT: %.0f ms\n", t.ms());
-    return m;
-}
-
 TokGGML * store_require_fsq_tok(ModelStore * s, const ModelKey & k) {
     std::lock_guard<std::mutex> lock(s->mtx);
     if (auto * hit = cache_hit<TokGGML>(s, k)) {
@@ -644,6 +701,100 @@ DetokGGML * store_require_fsq_detok(ModelStore * s, const ModelKey & k) {
     return m;
 }
 
+#ifdef HOT_STEP_TRT
+TextEncTrt * store_require_text_enc_trt(ModelStore * s, const ModelKey & k) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (auto * hit = cache_hit<TextEncTrt>(s, k)) {
+        return hit;
+    }
+    if (s->policy == EVICT_STRICT) {
+        evict_all_except(s, k);
+    }
+    Timer        t;
+    TextEncTrt * m = new TextEncTrt();
+    if (!text_enc_trt_load(m, k.path.c_str())) {
+        delete m;
+        return nullptr;
+    }
+    // bytes == 0: TRT owns the engine VRAM; the store budget does not track it.
+    install_entry(s, k, m, 0, "TextEnc-TRT", del_text_enc_trt);
+    fprintf(stderr, "[Store] Load TextEnc-TRT: %.0f ms\n", t.ms());
+    return m;
+}
+
+void store_release_text_enc_trt(ModelStore * s, TextEncTrt * handle) {
+    if (!s || !handle) {
+        return;
+    }
+    // Free the per-job device I/O buffers + execution context, then run
+    // the generic refcount decrement.
+    text_enc_trt_release_evictable(handle);
+    store_release(s, handle);
+}
+
+CondEncTrt * store_require_cond_enc_trt(ModelStore * s, const ModelKey & k) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (auto * hit = cache_hit<CondEncTrt>(s, k)) {
+        return hit;
+    }
+    if (s->policy == EVICT_STRICT) {
+        evict_all_except(s, k);
+    }
+    Timer        t;
+    CondEncTrt * m = new CondEncTrt();
+    if (!cond_enc_trt_load(m, k.path.c_str())) {
+        delete m;
+        return nullptr;
+    }
+    // bytes == 0: TRT owns the engine VRAM; the store budget does not track it.
+    install_entry(s, k, m, 0, "CondEnc-TRT", del_cond_enc_trt);
+    fprintf(stderr, "[Store] Load CondEnc-TRT: %.0f ms\n", t.ms());
+    return m;
+}
+
+void store_release_cond_enc_trt(ModelStore * s, CondEncTrt * handle) {
+    if (!s || !handle) {
+        return;
+    }
+    // Free the per-job device I/O buffers + execution context, then run
+    // the generic refcount decrement.
+    cond_enc_trt_release_evictable(handle);
+    store_release(s, handle);
+}
+
+DitTrt * store_require_dit_trt(ModelStore * s, const ModelKey & k) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    if (auto * hit = cache_hit<DitTrt>(s, k)) {
+        return hit;
+    }
+    if (s->policy == EVICT_STRICT) {
+        evict_all_except(s, k);
+    }
+    Timer    t;
+    DitTrt * m = new DitTrt();
+    // Deserialize the engine (weights embedded) and cache base weights
+    // from the ONNX refitter for adapter support.
+    if (!dit_trt_load(m, k.path.c_str(), k.engine_onnx_path.c_str())) {
+        delete m;
+        return nullptr;
+    }
+    // bytes == 0: TRT owns the engine VRAM; the store budget does not track it.
+    install_entry(s, k, m, 0, "DiT-TRT", del_dit_trt);
+    fprintf(stderr, "[Store] Load DiT-TRT: %.0f ms\n", t.ms());
+    return m;
+}
+
+void store_release_dit_trt(ModelStore * s, DitTrt * handle) {
+    if (!s || !handle) {
+        return;
+    }
+    // Free the per-job device I/O buffers + execution context,
+    // then run the generic refcount decrement.
+    dit_trt_release_evictable(handle);
+    store_release(s, handle);
+}
+#endif
+
 void store_release(ModelStore * s, void * handle) {
     if (!s || !handle) {
         return;
@@ -664,15 +815,8 @@ void store_release(ModelStore * s, void * handle) {
     assert(e.refcount > 0);
     e.refcount--;
     if (e.refcount == 0 && s->policy == EVICT_STRICT) {
-        // ORT sessions report 0 bytes because they manage their own VRAM.
-        // Evicting them saves nothing in the store budget but recreating
-        // them is extremely expensive (TRT engine compilation can take
-        // 30-120s per unique input shape). Keep them alive until a real
-        // model needs the GPU and triggers evict_all_except().
-        if (e.bytes == 0) {
-            // Keep alive — will be evicted by evict_all_except() when needed.
-            return;
-        }
+        // Under EVICT_STRICT, every module is fully unloaded after use.
+        // On the next request, the engine is reloaded from disk.
         fprintf(stderr, "[Store] Unload %s (%.1f MB)\n", e.label, (float) e.bytes / (1024.0f * 1024.0f));
         e.deleter(e.ptr);
         s->handle_to_key.erase(hit);
@@ -680,11 +824,40 @@ void store_release(ModelStore * s, void * handle) {
     }
 }
 
+void store_prune_bundle_except(ModelStore * s, const std::string & keep_bundle_dir) {
+    if (!s) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s->mtx);
+    const std::string           keep = store_normalize_bundle_dir(keep_bundle_dir);
+    for (auto it = s->gpu.begin(); it != s->gpu.end();) {
+        std::string entry_bundle = store_normalize_bundle_dir(it->first.path);
+        if (entry_bundle.empty() || entry_bundle == keep) {
+            // Not a bundle module, or part of the bundle we are keeping.
+            ++it;
+            continue;
+        }
+        GpuEntry & e = it->second;
+        if (e.refcount > 0) {
+            fprintf(stderr,
+                    "[Store] FATAL: prune cannot evict %s (refcount=%d) from bundle %s while "
+                    "switching to %s; a different-bundle module is still in use\n",
+                    e.label, e.refcount, entry_bundle.c_str(), keep.c_str());
+            abort();
+        }
+        fprintf(stderr, "[Store] Bundle-prune evict %s (%.1f MB) from %s\n", e.label,
+                (float) e.bytes / (1024.0f * 1024.0f), entry_bundle.c_str());
+        s->handle_to_key.erase(e.ptr);
+        e.deleter(e.ptr);
+        it = s->gpu.erase(it);
+    }
+}
+
 // Each accessor has the same shape: lookup, load on miss, return cached
 // pointer. Deleter is a lightweight lambda since these types are simple.
 BPETokenizer * store_bpe(ModelStore * s, const char * lm_path) {
     std::lock_guard<std::mutex> lock(s->mtx);
-    std::string                 key = lm_path ? lm_path : "";
+    std::string                 key = store_bpe_cache_key(lm_path);
     auto                        it  = s->bpe_by_path.find(key);
     if (it != s->bpe_by_path.end()) {
         return static_cast<BPETokenizer *>(it->second.ptr);
@@ -938,9 +1111,14 @@ const DiTMeta * store_dit_meta(ModelStore * s, const char * dit_path) {
                 st_multi_close(&sm);
             }
         } else {
-            // ONNX path: null_condition_emb is baked into the ONNX graph
-            // Leave null_cond_cpu empty — the TRT sampler handles CFG internally
-            fprintf(stderr, "[Store] ONNX DiT: null_condition_emb handled by TRT graph\n");
+            std::string null_path = sidecar_dir + WS_SEP + "null_condition_emb.bin";
+            if (!read_f32_vector_sidecar(null_path, meta->null_cond_cpu)) {
+                fprintf(stderr, "[Store] FATAL: ONNX DiT requires %s for CFG padding\n", null_path.c_str());
+                delete meta;
+                return nullptr;
+            }
+            fprintf(stderr, "[Store] ONNX DiT: null_condition_emb [%zu] from %s\n",
+                    meta->null_cond_cpu.size(), null_path.c_str());
         }
     }
 
@@ -972,3 +1150,89 @@ int store_gpu_module_count(const ModelStore * s) {
     std::lock_guard<std::mutex> lock(s->mtx);
     return (int) s->gpu.size();
 }
+
+#ifdef HOT_STEP_MODEL_STORE_TEST
+namespace {
+// Synthetic module backing a test cache entry: a heap object whose deleter
+// bumps an externally-owned counter, so the test can prove eviction freed
+// exactly the expected entries.
+struct SyntheticModule {
+    int * deleter_calls;
+};
+static void del_synthetic(void * p) {
+    auto * m = static_cast<SyntheticModule *>(p);
+    if (m->deleter_calls) {
+        (*m->deleter_calls)++;
+    }
+    delete m;
+}
+}  // namespace
+
+void store_test_install_synthetic(ModelStore *        s,
+                                  ModelKind           kind,
+                                  const std::string & path,
+                                  size_t              bytes,
+                                  int                 refcount,
+                                  int *               deleter_calls) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    ModelKey k;
+    k.kind = kind;
+    k.path = path;
+    auto * m       = new SyntheticModule();
+    m->deleter_calls = deleter_calls;
+    GpuEntry e;
+    e.ptr      = m;
+    e.bytes    = bytes;
+    e.refcount = refcount;
+    e.deleter  = del_synthetic;
+    e.label    = "Synthetic";
+    s->gpu.emplace(k, e);
+    s->handle_to_key.emplace(m, k);
+}
+
+bool store_test_has_entry(const ModelStore * s, ModelKind kind, const std::string & path) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    ModelKey k;
+    k.kind = kind;
+    k.path = path;
+    return s->gpu.find(k) != s->gpu.end();
+}
+
+void * store_test_install_synthetic_h(ModelStore *        s,
+                                      ModelKind           kind,
+                                      const std::string & path,
+                                      const std::string & artifact_fingerprint,
+                                      size_t              bytes,
+                                      int                 refcount,
+                                      int *               deleter_calls) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    ModelKey k;
+    k.kind                 = kind;
+    k.path                 = path;
+    k.artifact_fingerprint = artifact_fingerprint;
+    auto * m         = new SyntheticModule();
+    m->deleter_calls = deleter_calls;
+    GpuEntry e;
+    e.ptr      = m;
+    e.bytes    = bytes;
+    e.refcount = refcount;
+    e.deleter  = del_synthetic;
+    e.label    = "Synthetic";
+    s->gpu.emplace(k, e);
+    s->handle_to_key.emplace(m, k);
+    return m;
+}
+
+int store_test_refcount(const ModelStore * s,
+                        ModelKind           kind,
+                        const std::string & path,
+                        const std::string & artifact_fingerprint) {
+    std::lock_guard<std::mutex> lock(s->mtx);
+    ModelKey k;
+    k.kind                 = kind;
+    k.path                 = path;
+    k.artifact_fingerprint = artifact_fingerprint;
+    auto it = s->gpu.find(k);
+    return it == s->gpu.end() ? -1 : it->second.refcount;
+}
+#endif

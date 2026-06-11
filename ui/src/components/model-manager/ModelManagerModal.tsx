@@ -12,6 +12,7 @@ import { useDownloadStream } from './useDownloadStream';
 import { StarterPackCard } from './StarterPackCard';
 import { ModelCatalogueTab } from './ModelCatalogueTab';
 import { DownloadProgressBar } from './DownloadProgressBar';
+import { TrtBackendSection } from './TrtBackendSection';
 import { modelManagerApi } from '../../services/api';
 
 interface Props {
@@ -154,6 +155,9 @@ export const ModelManagerModal: React.FC<Props> = ({ onClose }) => {
                   </div>
                 </div>
               )}
+
+              {/* ── TensorRT Backend ─────────────────────── */}
+              <TrtBackendSection onBundlesChanged={silentRefresh} />
 
               {/* ── Starter Packs ────────────────────────── */}
               <div>

@@ -1,10 +1,12 @@
 // ace-synth.cpp: ACE-Step synthesis CLI
 // Thin wrapper: parses args, scans the model registry, calls pipeline-synth,
 // writes output files. Model selection (synth_model, adapter, output_format)
-// comes from the request JSON. The registry resolves names to GGUF paths
-// under --models <dir> and --adapters <dir>.
+// comes from the request JSON. The registry resolves names to GGUF,
+// SafeTensors, or ONNX runtime-bundle artifacts under --models <dir> and
+// adapter artifacts under --adapters <dir>.
 
 #include "audio-io.h"
+#include "lua-plugin-registry.h"
 #include "model-registry.h"
 #include "model-store.h"
 #include "pipeline-synth.h"
@@ -27,7 +29,7 @@ static void usage(const char * prog) {
     fprintf(stderr,
             "Usage: %s --models <dir> --request <json...> [options]\n\n"
             "Required:\n"
-            "  --models <dir>          Directory of GGUF model files\n"
+            "  --models <dir>          Directory of GGUF, SafeTensors, or ONNX runtime-bundle artifacts\n"
             "  --request <json...>     One or more request JSONs (from ace-lm --request)\n\n"
             "Optional:\n"
             "  --adapters <dir>        Directory of adapter files (enables JSON adapter field)\n"
@@ -35,19 +37,67 @@ static void usage(const char * prog) {
             "  --ref-audio <file>      Timbre reference audio (WAV or MP3)\n\n"
             "Model selection comes from the request JSON: synth_model picks the DiT,\n"
             "adapter picks an adapter from --adapters, output_format picks the output\n"
-            "extension. When synth_model is empty the first DiT in the registry is used;\n"
-            "text-encoder and VAE are always the first in their registry bucket.\n\n"
+            "extension. When synth_model is empty the first DiT in the registry is used.\n"
+            "ONNX DiT bundles can carry sibling text/condition/VAE artifacts;\n"
+            "GGUF/SafeTensors DiT entries use the first GGUF/SafeTensors text-encoder and VAE entries.\n\n"
             "Audio encoding:\n"
             "  --mp3-bitrate <kbps>    MP3 bitrate (default: 128)\n\n"
             "Memory control:\n"
             "  --vae-chunk <N>         Latent frames per tile (default: %d)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: %d)\n\n"
             "Debug:\n"
+            "  --gguf-text-encoder    Use registry GGUF Text-Enc even when synth_model is ONNX/TRT\n"
+            "  --gguf-dit-aux         Use registry GGUF DiT for CondEnc/FSQ side data with ONNX/TRT DiT forward\n"
             "  --no-fa                 Disable flash attention\n"
             "  --no-batch-cfg          Split DiT CFG into two separate forwards\n"
             "  --clamp-fp16            Clamp hidden states to FP16 range\n"
             "  --dump <dir>            Dump intermediate tensors\n",
             prog, d.vae_chunk, d.vae_overlap);
+}
+
+static const ModelEntry * first_non_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (!str_ends_with(entry.path, ".onnx")) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static const ModelEntry * first_onnx(const std::vector<ModelEntry> & bucket) {
+    for (const auto & entry : bucket) {
+        if (str_ends_with(entry.path, ".onnx")) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+static bool cli_file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static std::string cli_dirname(const std::string & path) {
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    if (pos == 0) {
+        return path.substr(0, 1);
+    }
+    return path.substr(0, pos);
+}
+
+static bool onnx_dit_has_sibling_vae(const ModelEntry * entry) {
+    if (!entry || !str_ends_with(entry->path, ".onnx")) {
+        return false;
+    }
+    return cli_file_exists(cli_dirname(entry->path) + REGISTRY_SEP + "vae_decoder.onnx");
 }
 
 int main(int argc, char ** argv) {
@@ -70,6 +120,8 @@ int main(int argc, char ** argv) {
     bool                      use_fa         = true;
     bool                      use_batch_cfg  = true;
     bool                      clamp_fp16     = false;
+    bool                      gguf_text_enc  = false;
+    bool                      gguf_dit_aux   = false;
     int                       vae_chunk      = params.vae_chunk;
     int                       vae_overlap    = params.vae_overlap;
     int                       mp3_kbps       = 128;
@@ -90,6 +142,10 @@ int main(int argc, char ** argv) {
             ref_audio_path = argv[++i];
         } else if (!strcmp(argv[i], "--dump") && i + 1 < argc) {
             dump_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--gguf-text-encoder")) {
+            gguf_text_enc = true;
+        } else if (!strcmp(argv[i], "--gguf-dit-aux")) {
+            gguf_dit_aux = true;
         } else if (!strcmp(argv[i], "--no-fa")) {
             use_fa = false;
         } else if (!strcmp(argv[i], "--no-batch-cfg")) {
@@ -122,6 +178,8 @@ int main(int argc, char ** argv) {
         usage(argv[0]);
         return 1;
     }
+
+    PluginRegistry::instance().init_from_executable(argv[0]);
 
     // Parse all requests first: the first request drives model selection.
     int                      batch_n = (int) request_paths.size();
@@ -157,8 +215,8 @@ int main(int argc, char ** argv) {
     if (adapters_dir) {
         registry_scan_adapters(&registry, adapters_dir);
     }
-    if (registry.dit.empty() || registry.text_enc.empty() || registry.vae.empty()) {
-        fprintf(stderr, "[Ace-Synth] FATAL: registry needs DiT, text-encoder and VAE models\n");
+    if (registry.dit.empty()) {
+        fprintf(stderr, "[Ace-Synth] FATAL: registry needs a DiT model\n");
         return 1;
     }
     const ModelEntry * dit_entry =
@@ -166,6 +224,39 @@ int main(int argc, char ** argv) {
     if (!dit_entry) {
         fprintf(stderr, "[Ace-Synth] FATAL: synth_model '%s' not found in registry\n", reqs[0].synth_model.c_str());
         return 1;
+    }
+    const bool dit_is_onnx = str_ends_with(dit_entry->path, ".onnx");
+    const ModelEntry * text_entry = (dit_is_onnx && !gguf_text_enc) ? first_onnx(registry.text_enc) : first_non_onnx(registry.text_enc);
+    const ModelEntry * aux_dit_entry = (dit_is_onnx && gguf_dit_aux) ? first_non_onnx(registry.dit) : nullptr;
+    if (dit_is_onnx && gguf_dit_aux && !aux_dit_entry) {
+        fprintf(stderr, "[Ace-Synth] FATAL: --gguf-dit-aux requested but no GGUF/SafeTensors DiT was found\n");
+        return 1;
+    }
+    if (dit_is_onnx && !gguf_text_enc && !text_entry) {
+        fprintf(stderr, "[Ace-Synth] FATAL: selected ONNX DiT requires an ONNX text-encoder bundle\n");
+        return 1;
+    }
+    const ModelEntry * vae_entry  = nullptr;
+    if (!reqs[0].vae.empty()) {
+        vae_entry = registry_find(registry.vae, reqs[0].vae.c_str());
+        if (!vae_entry) {
+            fprintf(stderr, "[Ace-Synth] FATAL: vae '%s' not found in registry\n", reqs[0].vae.c_str());
+            return 1;
+        }
+    } else if (!dit_is_onnx) {
+        vae_entry = first_non_onnx(registry.vae);
+    } else if (!onnx_dit_has_sibling_vae(dit_entry) && !registry.vae.empty()) {
+        vae_entry = &registry.vae[0];
+    }
+    if (!dit_is_onnx || gguf_text_enc || gguf_dit_aux) {
+        if (!text_entry || !vae_entry) {
+            fprintf(stderr, "[Ace-Synth] FATAL: selected route requires GGUF/SafeTensors text-encoder and VAE models\n");
+            return 1;
+        }
+        if (str_ends_with(text_entry->path, ".onnx")) {
+            fprintf(stderr, "[Ace-Synth] FATAL: selected route requires a GGUF/SafeTensors text encoder\n");
+            return 1;
+        }
     }
     const AdapterEntry * adapter_entry = NULL;
     if (!reqs[0].adapter.empty()) {
@@ -187,9 +278,13 @@ int main(int argc, char ** argv) {
     }
 
     // Fill params from registry lookups and CLI flags.
-    params.text_encoder_path = registry.text_enc[0].path.c_str();
+    params.text_encoder_path = text_entry ? text_entry->path.c_str() : NULL;
     params.dit_path          = dit_entry->path.c_str();
-    params.vae_path          = registry.vae[0].path.c_str();
+    params.aux_dit_path      = aux_dit_entry ? aux_dit_entry->path.c_str() : NULL;
+    params.vae_path          = NULL;
+    if (vae_entry && !str_ends_with(vae_entry->path, ".onnx")) {
+        params.vae_path = vae_entry->path.c_str();
+    }
     params.adapter_path      = adapter_entry ? adapter_entry->path.c_str() : NULL;
     params.adapter_scale     = reqs[0].adapter_scale;
     params.use_fa            = use_fa;

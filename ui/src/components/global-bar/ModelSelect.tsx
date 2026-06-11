@@ -9,8 +9,14 @@ import { ChevronDown, Check } from 'lucide-react';
 
 /** Detect model format from the raw model name/path.
  *  ONNX detection: .onnx extension OR known ONNX directory name patterns
- *  (the C++ registry registers ONNX subdirectories by directory name). */
-export function getModelFormat(name: string): 'gguf' | 'safetensors' | 'onnx' {
+ *  (the C++ registry registers ONNX subdirectories by directory name).
+ *  TRT detection: TRT-bundle directory names (acestep-v15-2b-<variant>),
+ *  the format the build-job API produces and the engine /props trt array reports. */
+export function getModelFormat(name: string): 'gguf' | 'safetensors' | 'onnx' | 'trt' {
+  // TRT bundles: built by the trt-bundle CLI, named acestep-v15-2b-<variant>
+  // (q8map-fp16 / w8a16 / fp32). Detected before the acestep-* safetensors
+  // fall-through so a built bundle gets the TRT badge, not ST.
+  if (/^acestep-v15-2b-/i.test(name)) return 'trt';
   if (/\.onnx$/i.test(name)) return 'onnx';
   if (/\.gguf$/i.test(name)) return 'gguf';
   // ONNX model directories: names like 'lm-4B', 'dit-xl', etc.
@@ -25,23 +31,27 @@ export function getModelFormat(name: string): 'gguf' | 'safetensors' | 'onnx' {
 }
 
 interface FormatBadgeProps {
-  format: 'gguf' | 'safetensors' | 'onnx';
+  format: 'gguf' | 'safetensors' | 'onnx' | 'trt';
   compact?: boolean;
 }
 
-/** Tiny pill showing GGUF, ST, or ONNX format */
+/** Tiny pill showing GGUF, ST, ONNX, or TRT format */
 export const FormatBadge: React.FC<FormatBadgeProps> = ({ format, compact }) => {
   const colorClass = format === 'gguf'
     ? 'bg-sky-500/15 text-sky-400 ring-1 ring-sky-500/20'
     : format === 'onnx'
     ? 'bg-emerald-500/15 text-emerald-400 ring-1 ring-emerald-500/20'
+    : format === 'trt'
+    ? 'bg-violet-500/15 text-violet-400 ring-1 ring-violet-500/20'
     : 'bg-amber-500/15 text-amber-400 ring-1 ring-amber-500/20';
-  const icon = format === 'gguf' ? '◆' : format === 'onnx' ? '⬡' : '◈';
+  const icon = format === 'gguf' ? '◆' : format === 'onnx' ? '⬡' : format === 'trt' ? '▲' : '◈';
   const label = format === 'gguf' ? (compact ? 'GG' : 'GGUF')
     : format === 'onnx' ? (compact ? 'OX' : 'ONNX')
+    : format === 'trt' ? (compact ? 'RT' : 'TRT')
     : (compact ? 'ST' : 'ST');
   const title = format === 'gguf' ? 'GGUF quantized format'
     : format === 'onnx' ? 'ONNX TensorRT-accelerated format'
+    : format === 'trt' ? 'TensorRT engine bundle'
     : 'SafeTensors native format';
   return (
     <span

@@ -25,6 +25,7 @@ find_package(Threads REQUIRED)
 # WIN32_LEAN_AND_MEAN: reduces Windows.h header bloat.
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>)
 endif()
 
 # Static MSVC runtime (/MT) for portable release builds.
@@ -158,6 +159,53 @@ endif()
 # CMAKE_CUDA_ARCHITECTURES, so on cached re-configures CUDAToolkit_FOUND
 # may be unset. Ensure it's always available for CUDA EP support.
 find_package(CUDAToolkit QUIET)
+if(NOT CUDAToolkit_FOUND)
+    set(_CUDA_ROOT "")
+    foreach(_CUDA_ENV CUDA_PATH CUDA_HOME)
+        if(NOT _CUDA_ROOT AND DEFINED ENV{${_CUDA_ENV}} AND EXISTS "$ENV{${_CUDA_ENV}}/include/cuda_runtime_api.h")
+            set(_CUDA_ROOT "$ENV{${_CUDA_ENV}}")
+        endif()
+    endforeach()
+    if(NOT _CUDA_ROOT)
+        file(GLOB _CUDA_ROOT_CANDIDATES "$ENV{ProgramFiles}/NVIDIA GPU Computing Toolkit/CUDA/v*")
+        list(SORT _CUDA_ROOT_CANDIDATES)
+        list(REVERSE _CUDA_ROOT_CANDIDATES)
+        foreach(_CUDA_CANDIDATE ${_CUDA_ROOT_CANDIDATES})
+            if(NOT _CUDA_ROOT AND EXISTS "${_CUDA_CANDIDATE}/include/cuda_runtime_api.h")
+                set(_CUDA_ROOT "${_CUDA_CANDIDATE}")
+            endif()
+        endforeach()
+    endif()
+    if(_CUDA_ROOT)
+        set(CUDAToolkit_FOUND TRUE)
+        set(CUDAToolkit_INCLUDE_DIRS "${_CUDA_ROOT}/include")
+        set(_CUDA_CUDART_LIB "${_CUDA_ROOT}/lib/x64/cudart.lib")
+        set(_CUDA_CUDART_STATIC_LIB "${_CUDA_ROOT}/lib/x64/cudart_static.lib")
+        if(_CUDA_ROOT MATCHES "v([0-9]+)\\.([0-9]+)")
+            set(CUDAToolkit_VERSION "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}")
+            set(CUDAToolkit_VERSION_MAJOR "${CMAKE_MATCH_1}")
+        endif()
+        if(NOT TARGET CUDA::cudart AND EXISTS "${_CUDA_CUDART_LIB}")
+            add_library(CUDA::cudart UNKNOWN IMPORTED)
+            set_target_properties(CUDA::cudart PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${_CUDA_ROOT}/include"
+                IMPORTED_IMPLIB "${_CUDA_CUDART_LIB}"
+                IMPORTED_LOCATION "${_CUDA_CUDART_LIB}")
+            file(GLOB _CUDA_CUDART_DLL "${_CUDA_ROOT}/bin/cudart64_*.dll")
+            if(_CUDA_CUDART_DLL)
+                list(GET _CUDA_CUDART_DLL 0 _CUDA_CUDART_DLL_FIRST)
+                set_target_properties(CUDA::cudart PROPERTIES IMPORTED_LOCATION "${_CUDA_CUDART_DLL_FIRST}")
+            endif()
+        endif()
+        if(NOT TARGET CUDA::cudart_static AND EXISTS "${_CUDA_CUDART_STATIC_LIB}")
+            add_library(CUDA::cudart_static UNKNOWN IMPORTED)
+            set_target_properties(CUDA::cudart_static PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${_CUDA_ROOT}/include"
+                IMPORTED_LOCATION "${_CUDA_CUDART_STATIC_LIB}")
+        endif()
+        message(STATUS "[CUDA] Found Toolkit fallback ${CUDAToolkit_VERSION} at ${_CUDA_ROOT}")
+    endif()
+endif()
 option(HOT_STEP_SUPERSEP "Enable SuperSep stem separation (requires ONNX Runtime)" ON)
 
 set(ORT_ROOT "" CACHE PATH "Path to ONNX Runtime pre-built package")
@@ -215,47 +263,84 @@ if(APPLE AND SUPERSEP_ENABLED)
 endif()
 # TensorRT Native SDK (DiT TRT acceleration + LoRA refitting)
 # ─────────────────────────────────────────────────────────────────────────────
-# Platform-specific TRT detection:
-#   Windows: vendored SDK in engine/deps/tensorrt/ (versioned import libs)
-#   Linux:   system-installed TRT packages via find_path/find_library
-# The runtime DLLs/SOs are expected on the library search path at runtime.
+# Pre-built TRT SDK (headers + import libs). Resolution order:
+#   1. TRT_ROOT CMake cache variable
+#   2. TENSORRT_ROOT environment variable
+#   3. engine/deps/tensorrt/
+#
+# TensorRT 11 is required for this backend. Windows package names are versioned
+# (nvinfer_11.lib, nvonnxparser_11.lib); Linux packages are usually neutral
+# (libnvinfer.so, libnvonnxparser.so). Prefer exact TRT 11 libraries when they
+# exist, then fall back to neutral names after the header version check passes.
 set(TRT_ENABLED FALSE)
-
-# --- Windows: vendored SDK in engine/deps/tensorrt/ ---
-set(_TRT_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/tensorrt")
-if(WIN32 AND EXISTS "${_TRT_DEPS_DIR}/include/NvInfer.h" AND EXISTS "${_TRT_DEPS_DIR}/lib/nvinfer_10.lib")
-    set(TRT_ENABLED TRUE)
-    set(_TRT_INCLUDE_DIR "${_TRT_DEPS_DIR}/include")
-    set(_TRT_LIB_DIR "${_TRT_DEPS_DIR}/lib")
-    # Windows vendored SDK ships versioned import libs
-    set(_TRT_NVINFER_LIB nvinfer_10)
-    set(_TRT_NVONNXPARSER_LIB nvonnxparser_10)
-    message(STATUS "[TRT] Found vendored SDK at ${_TRT_DEPS_DIR}")
-
-# --- Linux: system-installed TRT packages ---
-elseif(NOT WIN32)
-    find_path(_TRT_INCLUDE_DIR
-        NAMES NvInfer.h
-        PATHS /usr/include/x86_64-linux-gnu /usr/local/include /usr/include
-    )
-    find_library(_TRT_NVINFER_LIB
-        NAMES nvinfer
-        PATHS /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/lib
-    )
-    find_library(_TRT_NVONNXPARSER_LIB
-        NAMES nvonnxparser
-        PATHS /usr/lib/x86_64-linux-gnu /usr/local/lib /usr/lib
-    )
-    if(_TRT_INCLUDE_DIR AND _TRT_NVINFER_LIB AND _TRT_NVONNXPARSER_LIB)
-        set(TRT_ENABLED TRUE)
-        message(STATUS "[TRT] Found system TRT: ${_TRT_NVINFER_LIB}")
-    else()
-        message(STATUS "[TRT] Not found (install libnvinfer-dev + libnvonnxparsers-dev to enable)")
-    endif()
+set(TRT_ROOT "" CACHE PATH "Path to TensorRT 11 SDK root")
+if(NOT TRT_ROOT AND DEFINED ENV{TENSORRT_ROOT})
+    set(TRT_ROOT "$ENV{TENSORRT_ROOT}")
+endif()
+if(NOT TRT_ROOT)
+    set(TRT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/tensorrt")
 endif()
 
-if(NOT TRT_ENABLED AND WIN32)
-    message(STATUS "[TRT] Not found (set engine/deps/tensorrt/ to enable DiT TRT)")
+set(_TRT_INC_DIR "${TRT_ROOT}/include")
+set(_TRT_LIB_DIR "${TRT_ROOT}/lib")
+set(_TRT_BIN_DIR "${TRT_ROOT}/bin")
+set(_TRT_VERSION_HEADER "${_TRT_INC_DIR}/NvInferVersion.h")
+set(_TRT_NVINFER_LIB "")
+set(_TRT_NVONNXPARSER_LIB "")
+
+if(EXISTS "${_TRT_INC_DIR}/NvInfer.h" AND EXISTS "${_TRT_VERSION_HEADER}")
+    function(_trt_read_define out_name define_name)
+        file(STRINGS "${_TRT_VERSION_HEADER}" _line REGEX "^#define[ \t]+${define_name}[ \t]+[^ \t/]+")
+        string(REGEX REPLACE "^#define[ \t]+${define_name}[ \t]+([^ \t/]+).*" "\\1" _value "${_line}")
+        set(${out_name} "${_value}" PARENT_SCOPE)
+    endfunction()
+
+    _trt_read_define(TRT_VERSION_MAJOR NV_TENSORRT_MAJOR)
+    _trt_read_define(TRT_VERSION_MINOR NV_TENSORRT_MINOR)
+    _trt_read_define(TRT_VERSION_PATCH NV_TENSORRT_PATCH)
+    foreach(_TRT_VERSION_PART MAJOR MINOR PATCH)
+        if(NOT TRT_VERSION_${_TRT_VERSION_PART} MATCHES "^[0-9]+$")
+            _trt_read_define(TRT_VERSION_${_TRT_VERSION_PART} TRT_${_TRT_VERSION_PART}_ENTERPRISE)
+        endif()
+    endforeach()
+    if(NOT TRT_VERSION_MAJOR STREQUAL "11")
+        message(FATAL_ERROR "[TRT] TensorRT 11.x is required; found ${TRT_VERSION_MAJOR}.${TRT_VERSION_MINOR}.${TRT_VERSION_PATCH} at ${TRT_ROOT}")
+    endif()
+
+    foreach(_TRT_NVINFER_NAME nvinfer_11 nvinfer)
+        foreach(_TRT_LIB_EXT lib so dylib)
+            if(NOT _TRT_NVINFER_LIB AND EXISTS "${_TRT_LIB_DIR}/${_TRT_NVINFER_NAME}.${_TRT_LIB_EXT}")
+                set(_TRT_NVINFER_LIB "${_TRT_LIB_DIR}/${_TRT_NVINFER_NAME}.${_TRT_LIB_EXT}")
+            endif()
+        endforeach()
+    endforeach()
+    foreach(_TRT_NVONNXPARSER_NAME nvonnxparser_11 nvonnxparser)
+        foreach(_TRT_LIB_EXT lib so dylib)
+            if(NOT _TRT_NVONNXPARSER_LIB AND EXISTS "${_TRT_LIB_DIR}/${_TRT_NVONNXPARSER_NAME}.${_TRT_LIB_EXT}")
+                set(_TRT_NVONNXPARSER_LIB "${_TRT_LIB_DIR}/${_TRT_NVONNXPARSER_NAME}.${_TRT_LIB_EXT}")
+            endif()
+        endforeach()
+    endforeach()
+
+    find_library(_TRT_NVINFER_LIB
+        NAMES nvinfer_11 nvinfer
+        PATHS "${_TRT_LIB_DIR}"
+        NO_DEFAULT_PATH)
+    find_library(_TRT_NVONNXPARSER_LIB
+        NAMES nvonnxparser_11 nvonnxparser
+        PATHS "${_TRT_LIB_DIR}"
+        NO_DEFAULT_PATH)
+
+    if(_TRT_NVINFER_LIB AND _TRT_NVONNXPARSER_LIB)
+        set(TRT_ENABLED TRUE)
+        message(STATUS "[TRT] Found TensorRT ${TRT_VERSION_MAJOR}.${TRT_VERSION_MINOR}.${TRT_VERSION_PATCH} at ${TRT_ROOT}")
+        message(STATUS "[TRT] nvinfer: ${_TRT_NVINFER_LIB}")
+        message(STATUS "[TRT] nvonnxparser: ${_TRT_NVONNXPARSER_LIB}")
+    else()
+        message(STATUS "[TRT] TensorRT headers found at ${TRT_ROOT}, but nvinfer/nvonnxparser libraries were not found in ${_TRT_LIB_DIR}")
+    endif()
+else()
+    message(STATUS "[TRT] Not found (set TRT_ROOT or TENSORRT_ROOT to a TensorRT 11 SDK)")
 endif()
 
 # Core library (shared between binaries)
@@ -272,23 +357,16 @@ link_ggml_backends(acestep-core)
 
 # TRT native linkage for DiT acceleration (shared across platforms)
 if(TRT_ENABLED)
+    if(NOT CUDAToolkit_FOUND)
+        message(FATAL_ERROR "[TRT] CUDA Toolkit headers/runtime are required for TensorRT builds")
+    endif()
     target_compile_definitions(acestep-core PUBLIC HOT_STEP_TRT)
-    target_include_directories(acestep-core PUBLIC "${_TRT_INCLUDE_DIR}")
-    if(_TRT_LIB_DIR)
-        target_link_directories(acestep-core PUBLIC "${_TRT_LIB_DIR}")
-    endif()
-    target_link_libraries(acestep-core PUBLIC ${_TRT_NVINFER_LIB} ${_TRT_NVONNXPARSER_LIB})
-    # TRT headers include cuda_runtime_api.h — on Linux g++ needs the CUDA
-    # include path explicitly (nvcc gets it automatically, but acestep-core
-    # compiles as plain C++). Windows CUDA Toolkit puts headers on PATH.
-    if(NOT WIN32)
-        find_package(CUDAToolkit QUIET)
-        if(CUDAToolkit_FOUND)
-            target_include_directories(acestep-core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
-            target_link_libraries(acestep-core PUBLIC CUDA::cudart)
-            message(STATUS "[TRT] CUDA include: ${CUDAToolkit_INCLUDE_DIRS}")
-        endif()
-    endif()
+    target_compile_definitions(acestep-core PUBLIC
+        HOT_STEP_TRT_VERSION_MAJOR=${TRT_VERSION_MAJOR}
+        HOT_STEP_TRT_VERSION_MINOR=${TRT_VERSION_MINOR}
+        HOT_STEP_TRT_VERSION_PATCH=${TRT_VERSION_PATCH})
+    target_include_directories(acestep-core PUBLIC "${_TRT_INC_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(acestep-core PUBLIC "${_TRT_NVINFER_LIB}" "${_TRT_NVONNXPARSER_LIB}" CUDA::cudart)
     message(STATUS "[TRT] DiT TRT acceleration: ENABLED")
 endif()
 
@@ -344,6 +422,113 @@ if(CUDAToolkit_FOUND)
     endif()
 endif()
 
+# test-prune-bundle: behavior test for store_prune_bundle_except (TRT bundle group-evict).
+# Recompiles model-store.cpp with HOT_STEP_MODEL_STORE_TEST so the test seam
+# (store_test_install_synthetic / store_test_has_entry) is available. This object
+# satisfies every model-store symbol, so the production copy in acestep-core is
+# not pulled from the archive; loader symbols (qw3lm_load, etc.) still resolve
+# from acestep-core. Not wired into any default build; built/run on demand.
+add_executable(test-prune-bundle tests/test-prune-bundle.cpp src/model-store.cpp)
+target_compile_definitions(test-prune-bundle PRIVATE HOT_STEP_MODEL_STORE_TEST)
+target_link_libraries(test-prune-bundle PRIVATE acestep-core)
+link_ggml_backends(test-prune-bundle)
+if(CUDAToolkit_FOUND)
+    if(GGML_STATIC)
+        target_link_libraries(test-prune-bundle PRIVATE CUDA::cudart_static)
+    else()
+        target_link_libraries(test-prune-bundle PRIVATE CUDA::cudart)
+    endif()
+endif()
+
+# test-dit-trt-store: store-side ownership test for the MODEL_DIT_TRT model-store
+# integration. Recompiles model-store.cpp with HOT_STEP_MODEL_STORE_TEST so the
+# synthetic-entry seam is available, and links acestep-core (which propagates
+# HOT_STEP_TRT PUBLIC, activating the MODEL_DIT_TRT eviction logic in this
+# object). No real DiT engine is loaded — a live store-managed TRT-DiT load
+# requires a real DiT bundle. Guarded on TRT_ENABLED so the eviction behavior
+# is deterministic. Built/run on demand.
+if(TRT_ENABLED)
+    add_executable(test-dit-trt-store tests/test-dit-trt-store.cpp src/model-store.cpp)
+    target_compile_definitions(test-dit-trt-store PRIVATE HOT_STEP_MODEL_STORE_TEST)
+    target_link_libraries(test-dit-trt-store PRIVATE acestep-core)
+    link_ggml_backends(test-dit-trt-store)
+    if(CUDAToolkit_FOUND)
+        if(GGML_STATIC)
+            target_link_libraries(test-dit-trt-store PRIVATE CUDA::cudart_static)
+        else()
+            target_link_libraries(test-dit-trt-store PRIVATE CUDA::cudart)
+        endif()
+    endif()
+endif()
+
+# test-trt-bundle-manifest: all-three-or-nothing fail-closed gate test for the
+# native TRT bundle manifest reader (trt-bundle-manifest.h). Header-only gate;
+# links acestep-core for the yyjson parser symbols. Not TRT-gated (the manifest
+# reader has no TRT/CUDA dependency). Built/run on demand; not in default build.
+add_executable(test-trt-bundle-manifest tests/test-trt-bundle-manifest.cpp)
+target_link_libraries(test-trt-bundle-manifest PRIVATE acestep-core)
+link_ggml_backends(test-trt-bundle-manifest)
+if(CUDAToolkit_FOUND)
+    if(GGML_STATIC)
+        target_link_libraries(test-trt-bundle-manifest PRIVATE CUDA::cudart_static)
+    else()
+        target_link_libraries(test-trt-bundle-manifest PRIVATE CUDA::cudart)
+    endif()
+endif()
+
+# test-text-enc-trt: parity + evict/reactivate test for the native TRT text
+# encoder (text-enc-trt.h). Links acestep-core, which propagates HOT_STEP_TRT,
+# the TRT include dir, and nvinfer (PUBLIC). Only built when TRT is enabled.
+# Run on demand against the gitignored .enc-build fixtures; not in default build.
+if(TRT_ENABLED)
+    add_executable(test-text-enc-trt tests/test-text-enc-trt.cpp)
+    target_link_libraries(test-text-enc-trt PRIVATE acestep-core)
+    link_ggml_backends(test-text-enc-trt)
+    if(CUDAToolkit_FOUND)
+        if(GGML_STATIC)
+            target_link_libraries(test-text-enc-trt PRIVATE CUDA::cudart_static)
+        else()
+            target_link_libraries(test-text-enc-trt PRIVATE CUDA::cudart)
+        endif()
+    endif()
+endif()
+
+# test-cond-enc-trt: parity + evict/reactivate test for the native TRT condition
+# encoder (cond-enc-trt.h). Same structure as test-text-enc-trt. Links
+# acestep-core (propagates HOT_STEP_TRT + the TRT include dir + nvinfer PUBLIC).
+# Only built when TRT is enabled. Run on demand against the gitignored .enc-build
+# fixtures; not in the default build.
+if(TRT_ENABLED)
+    add_executable(test-cond-enc-trt tests/test-cond-enc-trt.cpp)
+    target_link_libraries(test-cond-enc-trt PRIVATE acestep-core)
+    link_ggml_backends(test-cond-enc-trt)
+    if(CUDAToolkit_FOUND)
+        if(GGML_STATIC)
+            target_link_libraries(test-cond-enc-trt PRIVATE CUDA::cudart_static)
+        else()
+            target_link_libraries(test-cond-enc-trt PRIVATE CUDA::cudart)
+        endif()
+    endif()
+endif()
+
+# test-lyric-embed-lut: parity oracle for the TRT-path lyric-embedding lookup
+# (lyric-embed-lut.h) vs the GGML qwen3_embed_lookup against the same embed
+# table. Links acestep-core (propagates HOT_STEP_TRT + the GGML text encoder).
+# Only built when TRT is enabled. Run on demand against the on-disk bundle +
+# GGUF text encoder; not in the default build.
+if(TRT_ENABLED)
+    add_executable(test-lyric-embed-lut tests/test-lyric-embed-lut.cpp)
+    target_link_libraries(test-lyric-embed-lut PRIVATE acestep-core)
+    link_ggml_backends(test-lyric-embed-lut)
+    if(CUDAToolkit_FOUND)
+        if(GGML_STATIC)
+            target_link_libraries(test-lyric-embed-lut PRIVATE CUDA::cudart_static)
+        else()
+            target_link_libraries(test-lyric-embed-lut PRIVATE CUDA::cudart)
+        endif()
+    endif()
+endif()
+
 # ace-lm: LLM inference (CoT + audio codes)
 add_executable(ace-lm tools/ace-lm.cpp)
 target_link_libraries(ace-lm PRIVATE acestep-core)
@@ -355,6 +540,27 @@ if(CUDAToolkit_FOUND)
     else()
         target_link_libraries(ace-lm PRIVATE CUDA::cudart)
     endif()
+endif()
+
+if(SUPERSEP_ENABLED)
+    add_executable(ace-ort-cache tools/ace-ort-cache.cpp)
+    target_include_directories(ace-ort-cache PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+        "${ORT_ROOT}/include"
+    )
+    target_link_directories(ace-ort-cache PRIVATE "${ORT_ROOT}/lib")
+    target_link_libraries(ace-ort-cache PRIVATE onnxruntime Threads::Threads)
+    if(CUDAToolkit_FOUND)
+        target_compile_definitions(ace-ort-cache PRIVATE GGML_USE_CUDA)
+        if(GGML_STATIC)
+            target_link_libraries(ace-ort-cache PRIVATE CUDA::cudart_static)
+        else()
+            target_link_libraries(ace-ort-cache PRIVATE CUDA::cudart)
+        endif()
+    endif()
+    add_dependencies(ace-ort-cache version)
 endif()
 
 # webui: convert tools/webui/public/index.html.gz to a C header for embedding.
@@ -378,7 +584,9 @@ target_include_directories(ace-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(ace-server PRIVATE acestep-core httplib supersep)
 link_ggml_backends(ace-server)
 # CUDA runtime for GET /vram (cudaMemGetInfo)
-find_package(CUDAToolkit QUIET)
+if(NOT CUDAToolkit_FOUND)
+    find_package(CUDAToolkit QUIET)
+endif()
 if(CUDAToolkit_FOUND)
     target_compile_definitions(ace-server PRIVATE GGML_USE_CUDA)
     if(GGML_STATIC)
@@ -390,7 +598,7 @@ if(CUDAToolkit_FOUND)
     # end users don't have the CUDA Toolkit, so cudart64_*.dll must ship with the binary)
     if(WIN32)
         get_target_property(_CUDART_LOC CUDA::cudart IMPORTED_LOCATION)
-        if(_CUDART_LOC)
+        if(_CUDART_LOC AND _CUDART_LOC MATCHES "\\.dll$")
             add_custom_command(TARGET ace-server POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${_CUDART_LOC}"
@@ -405,18 +613,20 @@ if(CUDAToolkit_FOUND)
          CONTENT "${CUDAToolkit_VERSION_MAJOR}")
 endif()
 
-# Copy ONNX Runtime DLLs next to ace-server at build time
+# Copy ONNX Runtime DLLs next to binaries that can load ORT models.
 if(SUPERSEP_ENABLED AND WIN32)
     set(_ORT_DLL_DIR "${ORT_ROOT}/lib")
-    foreach(_dll onnxruntime.dll onnxruntime_providers_shared.dll onnxruntime_providers_cuda.dll onnxruntime_providers_tensorrt.dll)
-        if(EXISTS "${_ORT_DLL_DIR}/${_dll}")
-            add_custom_command(TARGET ace-server POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_ORT_DLL_DIR}/${_dll}"
-                    "$<TARGET_FILE_DIR:ace-server>/${_dll}"
-                COMMENT "Copying ${_dll}"
-            )
-        endif()
+    foreach(_ort_target ace-synth ace-server ace-ort-cache)
+        foreach(_dll onnxruntime.dll onnxruntime_providers_shared.dll onnxruntime_providers_cuda.dll onnxruntime_providers_tensorrt.dll)
+            if(EXISTS "${_ORT_DLL_DIR}/${_dll}")
+                add_custom_command(TARGET ${_ort_target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_ORT_DLL_DIR}/${_dll}"
+                        "$<TARGET_FILE_DIR:${_ort_target}>/${_dll}"
+                    COMMENT "Copying ${_dll} for ${_ort_target}"
+                )
+            endif()
+        endforeach()
     endforeach()
 endif()
 

@@ -1,20 +1,20 @@
 #pragma once
-// lm-trt.h ÔÇö TensorRT runtime for Qwen3 4B autoregressive LM
+// lm-trt.h — TensorRT runtime for Qwen3 4B autoregressive LM
 //
 // Single full-vocab engine. Phase 2 audio-code logit slicing
 // is handled in C++ (offset = 151645), not in the ONNX graph.
 //
 // KV Cache Strategy:
 //   Pre-allocate [batch, n_kv_heads, max_seq_len, head_dim] per layer.
-//   Double-buffer: past_kv ÔåÆ engine ÔåÆ present_kv, then swap pointers.
+//   Double-buffer: past_kv → engine → present_kv, then swap pointers.
 //   kv_pos[set] tracks the valid length per KV set.
 //
 // Build (once per GPU arch):
-//   ONNX ÔåÆ TRT engine with kREFIT_IDENTICAL | kSTRIP_PLAN
-//   ÔåÆ ~50-100MB stripped engine file (weights in ONNX sidecar)
+//   ONNX → TRT engine with kREFIT_IDENTICAL + kWEIGHT_STREAMING (weights embedded)
+//   → full engine file with all weights
 //
 // Runtime:
-//   Load engine ÔåÆ Refit with base weights ÔåÆ Run
+//   Load engine → Cache base weights via ONNX refitter → Run
 
 #ifdef HOT_STEP_TRT
 
@@ -175,13 +175,17 @@ inline bool lm_trt_build(
     // Note: kEXPLICIT_BATCH was removed in TRT 10.x (always-on since TRT 8).
     uint32_t net_flags = 1U << static_cast<uint32_t>(
         nvinfer1::NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
+#if !defined(HOT_STEP_TRT_VERSION_MAJOR) || HOT_STEP_TRT_VERSION_MAJOR < 11
+    net_flags |= 1U << static_cast<uint32_t>(
+        nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+#endif
     auto network = builder->createNetworkV2(net_flags);
     if (!network) {
         fprintf(stderr, "[LM-TRT] Failed to create network\n");
         delete builder;
         return false;
     }
-    fprintf(stderr, "[LM-TRT] STRONGLY_TYPED network (bf16_mixed from dynamo)\n");
+    fprintf(stderr, "[LM-TRT] STRONGLY_TYPED network (ONNX tensor dtypes)\n");
 
     // Parse ONNX
     auto parser = nvonnxparser::createParser(*network, logger);
@@ -202,12 +206,12 @@ inline bool lm_trt_build(
     config->setBuilderOptimizationLevel(5);
     fprintf(stderr, "[LM-TRT] STRONGLY_TYPED + TF32, Optimization level 5\n");
 
-    // Refittable engine (for adapter/LoRA support)
+    // Refittable engine (for adapter/LoRA support) + weight streaming (build OOM avoidance)
     config->setFlag(nvinfer1::BuilderFlag::kREFIT_IDENTICAL);
-    config->setFlag(nvinfer1::BuilderFlag::kSTRIP_PLAN);
-    fprintf(stderr, "[LM-TRT] kREFIT_IDENTICAL + kSTRIP_PLAN enabled\n");
+    config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
+    fprintf(stderr, "[LM-TRT] kREFIT_IDENTICAL + kWEIGHT_STREAMING enabled (weights embedded in engine)\n");
 
-    // Workspace ÔÇö 8GB for 4B model (lots of large matmuls)
+    // Workspace — 8GB for 4B model (lots of large matmuls)
     config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE,
                                8ULL << 30);
 
@@ -455,7 +459,7 @@ inline bool lm_trt_load(
     }
 
     // Allocate scratch buffers for inputs/outputs
-    // input_ids, position_ids: [1, max_seq=2048] int64 ÔÇö matches profile max
+    // input_ids, position_ids: [1, max_seq=2048] int64 — matches profile max
     size_t ids_bytes = 1 * 2048 * sizeof(int64_t);
     cudaMalloc(&ctx->d_input_ids,    ids_bytes);
     cudaMalloc(&ctx->d_position_ids, ids_bytes);
@@ -470,11 +474,11 @@ inline bool lm_trt_load(
         cudaMemcpy(ctx->d_attn_mask, ones.data(), mask_bytes, cudaMemcpyHostToDevice);
     }
 
-    // logits: [1, max_seq=2048, vocab] fp32 ÔÇö must match profile max seq_len
+    // logits: [1, max_seq=2048, vocab] fp32 — must match profile max seq_len
     size_t logits_bytes = 1ULL * 2048 * ctx->vocab_size * sizeof(float);
     cudaMalloc(&ctx->d_logits, logits_bytes);
 
-    // Zero all KV cache buffers ÔÇö first forward reads past_len=1 of
+    // Zero all KV cache buffers — first forward reads past_len=1 of
     // uninitialized memory if kv_pos=0 (profile min=1 workaround)
     for (int s = 0; s < ctx->n_kv_sets; s++) {
         for (int l = 0; l < ctx->n_layers; l++) {
@@ -625,7 +629,7 @@ inline bool lm_trt_forward(
         context->setTensorAddress(ctx->tn_present_val[l], *lm_trt_present_val(ctx, kv_set, l));
     }
 
-    // Execute (no validation in release ÔÇö we checked at load time)
+    // Execute (no validation in release — we checked at load time)
     bool ok = context->enqueueV3(s);
     if (!ok) {
         fprintf(stderr, "[LM-TRT] enqueueV3 failed\n");

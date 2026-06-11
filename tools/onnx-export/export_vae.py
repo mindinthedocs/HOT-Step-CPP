@@ -47,7 +47,8 @@ class VAEDecoderWrapper(nn.Module):
         return decoded
 
 
-def export_vae(vae_path: str, output_path: str, opset: int = 18) -> str:
+def export_vae(vae_path: str, output_path: str, opset: int = 18,
+               low_memory_export: bool = True) -> str:
     """Export VAE decoder to ONNX.
 
     Args:
@@ -61,7 +62,8 @@ def export_vae(vae_path: str, output_path: str, opset: int = 18) -> str:
     from diffusers import AutoencoderOobleck
 
     print(f"Loading VAE from: {vae_path}")
-    vae = AutoencoderOobleck.from_pretrained(vae_path)
+    vae_kwargs = {"low_cpu_mem_usage": True} if low_memory_export else {}
+    vae = AutoencoderOobleck.from_pretrained(vae_path, **vae_kwargs)
     vae.eval()
 
     wrapper = VAEDecoderWrapper(vae)
@@ -102,7 +104,7 @@ def export_vae(vae_path: str, output_path: str, opset: int = 18) -> str:
         input_names=["latents"],
         output_names=["audio"],
         dynamic_axes=dynamic_axes,
-        do_constant_folding=True,
+        do_constant_folding=False,
         dynamo=False,  # Force legacy TorchScript exporter (dynamo hits cp1252 UnicodeError on Windows)
     )
 
@@ -234,6 +236,19 @@ def main():
         action="store_true",
         help="Validate ONNX output against PyTorch output using onnxruntime",
     )
+    parser.add_argument(
+        "--low-memory-export",
+        dest="low_memory_export",
+        action="store_true",
+        default=True,
+        help="Load weights with low CPU memory defaults and skip ONNX constant folding (default)",
+    )
+    parser.add_argument(
+        "--no-low-memory-export",
+        dest="low_memory_export",
+        action="store_false",
+        help="Use the legacy eager loader",
+    )
 
     args = parser.parse_args()
 
@@ -248,7 +263,8 @@ def main():
         sys.exit(1)
 
     # Export
-    onnx_path = export_vae(args.vae_path, args.output, args.opset)
+    onnx_path = export_vae(args.vae_path, args.output, args.opset,
+                           low_memory_export=args.low_memory_export)
 
     # Validate
     if args.validate:

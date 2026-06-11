@@ -6,7 +6,7 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Download } from 'lucide-react';
 import { useGlobalParams } from '../../context/GlobalParamsContext';
-import { modelApi } from '../../services/api';
+import { modelApi, trtBundleApi } from '../../services/api';
 import { formatDitModel, formatLmModel, formatVaeModel, formatEmbeddingModel, getDitModelDescription, getLmModelDescription, getVaeModelDescription } from './modelLabels';
 import { ModelManagerModal } from '../model-manager/ModelManagerModal';
 import { ModelSelect } from './ModelSelect';
@@ -16,6 +16,7 @@ export const ModelsDropdown: React.FC = () => {
   const gp = useGlobalParams();
   const { t } = useTranslation();
   const [models, setModels] = useState<AceModels | null>(null);
+  const [trtBundles, setTrtBundles] = useState<string[]>([]);
   const [showModelManager, setShowModelManager] = useState(false);
 
   useEffect(() => {
@@ -23,6 +24,15 @@ export const ModelsDropdown: React.FC = () => {
       .then(setModels)
       .catch(() => {});
   }, []);
+
+  // Available TRT bundles join the DiT options — selecting one sets ditModel,
+  // which the server maps to synth_model = <bundle name> at generate time.
+  const loadTrtBundles = () => {
+    trtBundleApi.list()
+      .then((r) => setTrtBundles(r.bundles.filter(b => b.available).map(b => b.name)))
+      .catch(() => {});
+  };
+  useEffect(() => { loadTrtBundles(); }, []);
 
   // Auto-select first available model when list loads and nothing is selected
   useEffect(() => {
@@ -46,7 +56,9 @@ export const ModelsDropdown: React.FC = () => {
     }
   }, [models]);
 
-  const ditModels = models?.models?.dit || [];
+  const baseDitModels = models?.models?.dit || [];
+  // Append TRT bundles not already present in the engine's dit list.
+  const ditModels = [...baseDitModels, ...trtBundles.filter(b => !baseDitModels.includes(b))];
   const lmModels = models?.models?.lm || [];
   const vaeModels = models?.models?.vae || [];
   const embeddingModels = models?.models?.embedding || [];
@@ -136,6 +148,7 @@ export const ModelsDropdown: React.FC = () => {
         <ModelManagerModal onClose={() => {
           setShowModelManager(false);
           sessionStorage.setItem('mm-auto-dismissed', '1');
+          loadTrtBundles();
         }} />
       )}
     </div>

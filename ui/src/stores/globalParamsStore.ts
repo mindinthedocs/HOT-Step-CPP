@@ -132,9 +132,6 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   postprocessEnabled: readKey('hs-postprocessEnabled', false),
   postprocessPlugin: readKey('hs-postprocessPlugin', ''),
 
-  // VAE backend selection (ONNX Runtime / TensorRT)
-  useOrtVae: readKey('hs-useOrtVae', false),
-
   // LUFS Normalization
   lufsEnabled: readKey('hs-lufsEnabled', false),
   lufsPreset: readKey('hs-lufsPreset', 'spotify'),
@@ -143,14 +140,7 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   // -- Actions --
   setDitModel: (v: any) => { set({ ditModel: v }); writeKey("hs-ditModel", v); },
   setLmModel: (v: any) => { set({ lmModel: v }); writeKey("hs-lmModel", v); },
-  setVaeModel: (v: any) => {
-    set({ vaeModel: v });
-    writeKey("hs-vaeModel", v);
-    // Auto-detect ORT backend from file extension
-    const isOnnx = /\.onnx$/i.test(v || '');
-    set({ useOrtVae: isOnnx });
-    writeKey('hs-useOrtVae', isOnnx);
-  },
+  setVaeModel: (v: any) => { set({ vaeModel: v }); writeKey("hs-vaeModel", v); },
   setEmbeddingModel: (v: any) => { set({ embeddingModel: v }); writeKey("hs-embeddingModel", v); },
   setAdapter: (v: any) => { set({ adapter: v }); writeKey("hs-adapter", v); },
   setAdapterScale: (v: any) => { set({ adapterScale: v }); writeKey("hs-adapterScale", v); },
@@ -239,7 +229,6 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
   setWhisperIsolateVocals: (v: any) => { set({ whisperIsolateVocals: v }); writeKey("hs-whisperIsolate", v); },
   setPostprocessEnabled: (v: any) => { set({ postprocessEnabled: v }); writeKey("hs-postprocessEnabled", v); },
   setPostprocessPlugin: (v: any) => { set({ postprocessPlugin: v }); writeKey("hs-postprocessPlugin", v); },
-  setUseOrtVae: (v: any) => { set({ useOrtVae: v }); writeKey('hs-useOrtVae', v); },
   setLufsEnabled: (v: any) => { set({ lufsEnabled: v }); writeKey('hs-lufsEnabled', v); },
   setLufsPreset: (v: any) => {
     set({ lufsPreset: v });
@@ -353,7 +342,6 @@ export const useGlobalParamsStore = create<any>()((set, get) => ({
       postprocessPlugin: (s.postProcessingEnabled && s.postprocessEnabled && s.postprocessPlugin) ? s.postprocessPlugin : undefined,
       lufsEnabled: (s.postProcessingEnabled && s.masteringEnabled && s.lufsEnabled) || undefined,
       lufsTarget: (s.postProcessingEnabled && s.masteringEnabled && s.lufsEnabled) ? s.lufsTarget : undefined,
-      useOrtVae: s.useOrtVae || undefined,
       whisperLyricsEnabled: s.whisperLyricsEnabled,
       whisperModel: s.whisperLyricsEnabled ? s.whisperModel : undefined,
       whisperLanguage: s.whisperLyricsEnabled ? s.whisperLanguage : undefined,

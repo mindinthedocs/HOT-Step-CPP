@@ -123,8 +123,6 @@ export interface GenerationParams {
   lmModel: string;
   vaeModel: string;
   embeddingModel?: string;
-  useOrtVae?: boolean;  // Use ONNX Runtime VAE instead of GGML
-
   // Adapter
   loraPath: string;
   loraScale: number;
