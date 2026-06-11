@@ -143,6 +143,7 @@ export const config = {
     //   }
     //   return '';
     // })(),
+    extraArgs: process.env.ACESTEPCPP_EXTRA_ARGS || '',
     get url() {
       return `http://${this.host}:${this.port}`;
     },
@@ -238,6 +239,7 @@ export const EXPOSED_ENV_KEYS = [
   // Engine
   'ACESTEPCPP_MODELS', 'ACESTEPCPP_ADAPTERS', 'ACESTEPCPP_PORT', 'ACESTEPCPP_HOST',
   'ACESTEPCPP_VAE_CHUNK', 'ACESTEPCPP_VAE_OVERLAP',
+  'ACESTEPCPP_EXTRA_ARGS',
   // GPU
   'CUDA_VISIBLE_DEVICES',
   // Server
@@ -261,6 +263,7 @@ export const EXPOSED_ENV_KEYS = [
 export const RESTART_REQUIRED_KEYS = new Set([
   'ACESTEPCPP_MODELS', 'ACESTEPCPP_ADAPTERS', 'ACESTEPCPP_PORT', 'ACESTEPCPP_HOST',
   'ACESTEPCPP_VAE_CHUNK', 'ACESTEPCPP_VAE_OVERLAP',
+  'ACESTEPCPP_EXTRA_ARGS',
   'CUDA_VISIBLE_DEVICES',
   'SERVER_PORT', 'DATA_DIR',
 ]);
@@ -298,6 +301,8 @@ export function reloadEnvConfig(): string[] {
     () => String(config.aceServer.vaeChunk));
   apply('ACESTEPCPP_VAE_OVERLAP', v => { config.aceServer.vaeOverlap = parseInt(v || '64', 10); },
     () => String(config.aceServer.vaeOverlap));
+  apply('ACESTEPCPP_EXTRA_ARGS', v => { config.aceServer.extraArgs = v; },
+    () => config.aceServer.extraArgs);
   apply('CUDA_VISIBLE_DEVICES', v => { config.aceServer.cudaVisibleDevices = v; },
     () => config.aceServer.cudaVisibleDevices);
 

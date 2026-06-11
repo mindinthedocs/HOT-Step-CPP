@@ -191,6 +191,15 @@ function startAceServer(): ChildProcess | null {
     args.push('--vae-overlap', String(config.aceServer.vaeOverlap));
   }
 
+
+    // Append user-supplied extra CLI flags (e.g. --no-fa, --vae-chunk 64, --keep-loaded)
+  if (config.aceServer.extraArgs) {
+    const extra = config.aceServer.extraArgs.split(/\s+/).filter(Boolean);
+    args.push(...extra);
+    console.log(`[Server] Extra args: ${extra.join(' ')}`);
+  }
+
+
   console.log(`[Server] Starting ace-server: ${path.basename(exe)}`);
   console.log(`[Server] Models: ${config.aceServer.models}`);
   console.log(`[Server] Port: ${config.aceServer.port}`);
