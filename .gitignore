@@ -82,6 +82,11 @@ tools/*
 !tools/onnx-export/
 !tools/trt/
 !tools/mcp-lyricstudio/
+!tools/install_trt.ps1
+!tools/setup_venv.ps1
+!tools/install_trt.sh
+!tools/setup_venv.sh
+!tools/build-trt-engine.py
 tools/mcp-lyricstudio/node_modules/
 
 # Test output logs

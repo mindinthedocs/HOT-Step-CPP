@@ -1,5 +1,55 @@
 {
   "version": 1,
+  "trtVariants": [
+    {
+      "id": "acestep-v15-base",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 Base",
+      "hfRepo": "ACE-Step/acestep-v15-base"
+    },
+    {
+      "id": "acestep-v15-sft",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 SFT",
+      "hfRepo": "ACE-Step/acestep-v15-sft"
+    },
+    {
+      "id": "acestep-v15-turbo-shift1",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 Turbo Shift1",
+      "hfRepo": "ACE-Step/acestep-v15-turbo-shift1"
+    },
+    {
+      "id": "acestep-v15-turbo-shift3",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 Turbo Shift3",
+      "hfRepo": "ACE-Step/acestep-v15-turbo-shift3"
+    },
+    {
+      "id": "acestep-v15-turbo-continuous",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 Turbo Continuous",
+      "hfRepo": "ACE-Step/acestep-v15-turbo-continuous"
+    },
+    {
+      "id": "acestep-v15-xl-base",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 XL Base",
+      "hfRepo": "ACE-Step/acestep-v15-xl-base"
+    },
+    {
+      "id": "acestep-v15-xl-sft",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 XL SFT",
+      "hfRepo": "ACE-Step/acestep-v15-xl-sft"
+    },
+    {
+      "id": "acestep-v15-xl-turbo",
+      "role": "dit-st",
+      "displayName": "ACE-Step v1.5 XL Turbo",
+      "hfRepo": "ACE-Step/acestep-v15-xl-turbo"
+    }
+  ],
   "packs": [
     {
       "id": "quick-start",
@@ -1470,7 +1520,9 @@
       "repo": "ACE-Step/Ace-Step1.5",
       "repoPath": "vae/diffusion_pytorch_model.safetensors",
       "description": "Original ACE-Step VAE in safetensors format. Full F32 precision — better encode quality for cover/restyle vs GGUF.",
-      "tags": ["recommended"]
+      "tags": [
+        "recommended"
+      ]
     },
     {
       "id": "scragvae-f32-st",
@@ -1484,7 +1536,9 @@
       "repo": "scragnog/Ace-Step-1.5-ScragVAE",
       "repoPath": "diffusion_pytorch_model.safetensors",
       "description": "ScragVAE in safetensors format. Full F32 precision + reduced artifacts. Best quality for cover/restyle.",
-      "tags": ["recommended"]
+      "tags": [
+        "recommended"
+      ]
     },
     {
       "id": "vae-dreamvae-onnx",
@@ -1949,7 +2003,9 @@
       "repo": "ggerganov/whisper.cpp",
       "repoPath": "ggml-large-v3-turbo.bin",
       "description": "Best balance of speed and accuracy (1.5 GB). Recommended. ~5-10s per 30s track on GPU.",
-      "tags": ["recommended"]
+      "tags": [
+        "recommended"
+      ]
     },
     {
       "id": "whisper-large-v3",

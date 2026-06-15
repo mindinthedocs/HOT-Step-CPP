@@ -1,22 +1,41 @@
 // trtBundles.ts — TRT-bundle build-job + enumeration API
 //
-// GET    /api/trt-bundles                 — list bundles (on-disk + engine /props trt array)
+// GET    /api/trt-bundles                 — list variant inventory + engine /props trt array
 // GET    /api/trt-bundles/variants        — available DiT build variants
 // POST   /api/trt-bundles/build           — start a build { variant, precision } (409 if one running)
 // GET    /api/trt-bundles/build/:id       — build job status
 // GET    /api/trt-bundles/build/:id/events— SSE progress stream from the CLI
 // POST   /api/trt-bundles/build/:id/cancel— cancel a running build
-// DELETE /api/trt-bundles/:variant        — delete a built bundle directory
+// DELETE /api/trt-bundles/:bundleName     — delete a built bundle directory
 
 import { Router } from 'express';
+import path from 'path';
 import { trtBundleService, BuildLockedError } from '../services/trtBundleService.js';
 import { aceClient } from '../services/aceClient.js';
 import type { AcePropsWithTrt } from '../types/aceTrtBundle.js';
+import { checkPrerequisites } from '../services/systemService.js';
+import { isAllowedVariant, validateBuildRequest } from '../services/validateBuildRequest.js';
+import { modelDownloadService } from '../services/modelDownloadService.js';
+import { PROJECT_ROOT } from '../config.js';
 
 const router = Router();
 
-// DiT precision recipes — mirrors trt_bundle_manager REGISTRY["dit"].precision_options.
-const VARIANTS = ['q8map-fp16', 'w8a16', 'fp32'] as const;
+const PRECISIONS = ['q8map-fp16', 'w8a16', 'fp32'] as const;
+
+function getTrtVariants() {
+  return modelDownloadService
+    .getTrtRegistry()
+    .filter((variant) => variant.role === 'dit' || variant.role === 'dit-st');
+}
+
+function assertSafeVariantInput(raw: unknown): string {
+  if (typeof raw !== 'string') throw new Error('variant is required');
+  const variant = raw.trim();
+  if (!variant) throw new Error('variant is required');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(variant)) throw new Error('Invalid variant format');
+  if (variant.includes('..') || variant.includes('/') || variant.includes('\\')) throw new Error('Path traversal denied');
+  return variant;
+}
 
 // GET /api/trt-bundles — on-disk bundles merged with the engine's /props trt array
 router.get('/', async (_req, res) => {
@@ -39,18 +58,67 @@ router.get('/', async (_req, res) => {
 
 // GET /api/trt-bundles/variants
 router.get('/variants', (_req, res) => {
-  res.json({ variants: VARIANTS });
+  res.json({ variants: getTrtVariants() });
+});
+
+router.get('/active-build', (_req, res) => {
+  const job = trtBundleService.getActiveBuild();
+  res.json({ job });
 });
 
 // POST /api/trt-bundles/build  { variant, precision }
-router.post('/build', (req, res) => {
-  const { variant } = req.body ?? {};
-  if (!variant || !VARIANTS.includes(variant)) {
-    res.status(400).json({ error: `variant is required; one of ${VARIANTS.join(', ')}` });
+router.post('/build', async (req, res) => {
+  const { variant: rawVariant, precision } = req.body ?? {};
+  let variant: string;
+  try {
+    variant = assertSafeVariantInput(rawVariant);
+  } catch (err: any) {
+    res.status(400).json({ error: err.message });
     return;
   }
+  const availableVariants = getTrtVariants();
+  const allowedVariantIds = availableVariants.map((entry) => entry.id);
+  if (!variant || !isAllowedVariant(variant) || !allowedVariantIds.includes(variant)) {
+    res.status(400).json({ error: `variant is required; one of ${allowedVariantIds.join(', ')}` });
+    return;
+  }
+  if (precision && !PRECISIONS.includes(precision)) {
+    res.status(400).json({ error: `precision must be one of ${PRECISIONS.join(', ')}` });
+    return;
+  }
+
+  const prereqs = await checkPrerequisites();
+  const validation = validateBuildRequest({ variant, precision, prerequisites: prereqs });
+  if (!validation.ok) {
+    res.status(validation.status).json({ error: validation.error });
+    return;
+  }
+
+  const variantMeta = availableVariants.find((entry) => entry.id === variant);
+  if (!variantMeta) {
+    res.status(400).json({ error: 'Unknown TRT variant' });
+    return;
+  }
+
   try {
-    const jobId = trtBundleService.startBuild(variant);
+    await modelDownloadService.ensureTrtVariantSources(variantMeta);
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Failed to prepare TRT variant sources' });
+    return;
+  }
+
+  const normalizedVariantToken = variant.replace(/[^A-Za-z0-9._-]/g, '-');
+  const ditDir = path.join(PROJECT_ROOT, '.enc-build', 'trt-src', normalizedVariantToken, 'dit');
+  const textEncoderDir = path.join(PROJECT_ROOT, '.enc-build', 'trt-src', normalizedVariantToken, 'qwen3-emb');
+
+  try {
+    const jobId = await trtBundleService.startBuild({
+      variant,
+      precision: (precision as string) ?? 'q8map-fp16',
+      ditDir,
+      textEncoderDir,
+      sourceModel: variantMeta.id,
+    });
     res.json({ jobId });
   } catch (err: any) {
     if (err instanceof BuildLockedError) {
@@ -117,14 +185,33 @@ router.get('/build/:id/events', (req, res) => {
 
 // POST /api/trt-bundles/build/:id/cancel
 router.post('/build/:id/cancel', (req, res) => {
-  const ok = trtBundleService.cancelBuild(req.params.id);
-  res.json({ ok });
+  trtBundleService.cancelBuild(req.params.id)
+    .then((ok) => res.json({ ok }))
+    .catch((err: any) => res.status(400).json({ error: err?.message || 'Cancel failed' }));
 });
 
-// DELETE /api/trt-bundles/:variant
-router.delete('/:variant', (req, res) => {
+router.get('/build/:id/log', (req, res) => {
+  const text = trtBundleService.getBuildLog(req.params.id);
+  if (text === null) {
+    res.status(404).json({ error: 'Build log not found' });
+    return;
+  }
+  res.type('text/plain').send(text);
+});
+
+router.post('/build/:id/open-log-folder', (req, res) => {
+  const ok = trtBundleService.openBuildLogFolder(req.params.id);
+  if (!ok) {
+    res.status(404).json({ error: 'Log folder unavailable' });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+// DELETE /api/trt-bundles/:bundleName
+router.delete('/:bundleName', async (req, res) => {
   try {
-    const ok = trtBundleService.deleteBundle(req.params.variant);
+    const ok = trtBundleService.deleteBundle(req.params.bundleName);
     res.json({ ok });
   } catch (err: any) {
     res.status(400).json({ error: err.message });

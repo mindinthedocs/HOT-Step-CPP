@@ -11,6 +11,8 @@ import type { TrtBuildJob } from '../../services/api';
 interface Props {
   job: TrtBuildJob;
   onCancel: () => void;
+  onCopyLogs?: () => void;
+  onOpenLogFolder?: () => void;
 }
 
 const statusColors: Record<string, string> = {
@@ -20,7 +22,7 @@ const statusColors: Record<string, string> = {
   cancelled: 'bg-zinc-600 text-zinc-600 dark:text-zinc-400',
 };
 
-export const TrtBuildProgressBar: React.FC<Props> = ({ job, onCancel }) => {
+export const TrtBuildProgressBar: React.FC<Props> = ({ job, onCancel, onCopyLogs, onOpenLogFolder }) => {
   const pct = Math.min(100, Math.max(0, job.progress * 100));
   const isActive = job.status === 'running';
 
@@ -64,6 +66,24 @@ export const TrtBuildProgressBar: React.FC<Props> = ({ job, onCancel }) => {
           <span className="text-red-400 truncate ml-2">{job.error}</span>
         )}
       </div>
+      {job.status === 'failed' && (
+        <div className="mt-2 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onCopyLogs}
+            className="text-[10px] text-zinc-300 hover:text-zinc-100 underline underline-offset-2"
+          >
+            Copy Logs
+          </button>
+          <button
+            type="button"
+            onClick={onOpenLogFolder}
+            className="text-[10px] text-zinc-300 hover:text-zinc-100 underline underline-offset-2"
+          >
+            Open Log Folder
+          </button>
+        </div>
+      )}
     </div>
   );
 };

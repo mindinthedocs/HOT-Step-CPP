@@ -24,12 +24,14 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ONNX_EXPORT_DIR = SCRIPT_DIR.parent / "onnx-export"
+TOOLS_DIR = SCRIPT_DIR.parent
 if str(ONNX_EXPORT_DIR) not in sys.path:
     sys.path.insert(0, str(ONNX_EXPORT_DIR))
 
 # REUSE the existing exporter-orchestration core (do not re-implement).
 from export_runtime_bundle import copy_sidecar, run_tool  # noqa: E402
 from prepare_dit_source import (  # noqa: E402
+    DIT_MODELING_PY,
     SILENCE_LATENT,
     prepare_dit_dir,
     safetensors_is_bf16,
@@ -171,6 +173,10 @@ def _exporter(script: str, args: Sequence[str]) -> tuple[str, ...]:
     return (sys.executable, str(ONNX_EXPORT_DIR / script), *args)
 
 
+def _tools_script(script: str, args: Sequence[str]) -> tuple[str, ...]:
+    return (sys.executable, str(TOOLS_DIR / script), *args)
+
+
 def _build_encoder(module: str, onnx: Path, stem: str, output_dir: Path) -> tuple[str, ...]:
     return _exporter(
         "build_encoder_trt.py",
@@ -233,7 +239,7 @@ def build_plan(
     cond_engine = output_dir / "cond_encoder.engine"
     fsq_sidecar = output_dir / "fsq.safetensors"
     manifest = output_dir / "manifest.json"
-    prepare_outputs = (dit_src / "model.safetensors", dit_src / SILENCE_LATENT)
+    prepare_outputs = (dit_src / "model.safetensors", dit_src / SILENCE_LATENT, dit_src / DIT_MODELING_PY)
 
     # text_enc is invoked WITHOUT --dit-dir so it is NOT a second producer of
     # null_condition_emb — cond_enc is the sole owner. build-trt-engine writes
@@ -260,9 +266,9 @@ def build_plan(
         Step("build-cond_enc", (cond_onnx,), (cond_engine,), 2.0,
              command=_build_encoder("cond-enc", cond_onnx, "cond_encoder", output_dir)),
         Step("build-dit", (dit_onnx,), (dit_engine,), 6.0,
-             command=_exporter("build-trt-engine.py",
-                               ["--onnx", str(dit_onnx), "--out-dir", str(output_dir / "engines"),
-                                "--precision-policy", variant])),
+             command=_tools_script("build-trt-engine.py",
+                                   ["--onnx", str(dit_onnx), "--out-dir", str(output_dir / "engines"),
+                                    "--precision-policy", variant])),
         Step("fsq-sidecar", (dit_src / "config.json",), (fsq_sidecar,), 1.0,
              command=_exporter("export_fsq_sidecar.py",
                                ["--model-dir", str(dit_src), "--output-dir", str(output_dir)])),

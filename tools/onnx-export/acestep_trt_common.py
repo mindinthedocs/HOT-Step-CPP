@@ -479,8 +479,10 @@ def validate_engine_metadata(
         raise SystemExit("Engine metadata does not describe a strongly typed network.")
     if payload.get("global_fp16_builder_flag") is not False or payload.get("global_bf16_builder_flag") is not False:
         raise SystemExit("Engine metadata indicates global FP16/BF16 builder flags were used.")
-    if payload.get("strip_plan") is not True or payload.get("refit_identical") is not True:
-        raise SystemExit("Engine metadata is missing strip-plan/refit-identical guarantees.")
+    if payload.get("refit_identical") is not True:
+        raise SystemExit("Engine metadata is missing the refit-identical guarantee.")
+    if payload.get("strip_plan") is not False:
+        raise SystemExit("Engine metadata reports a stripped plan; HOT-Step engines must embed weights.")
     weight_streaming = payload.get("weight_streaming", False)
     if not isinstance(weight_streaming, bool):
         raise SystemExit("Engine metadata weight_streaming must be a bool when present.")

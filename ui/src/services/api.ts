@@ -312,12 +312,19 @@ export interface TrtBuildJob {
   lines: { step: number; name: string; progress: number; status: string }[];
   error?: string;
   exitCode?: number;
+  logPath?: string;
+  bundleDir?: string;
 }
 
 export interface TrtBundleEntry {
-  name: string;
-  available: boolean;
-  variant?: string;
+  variant: string;
+  safetensorsComplete: boolean;
+  engines: { 'q8map-fp16': boolean; w8a16: boolean };
+  corrupt: boolean;
+  bundleNames: Partial<Record<'q8map-fp16' | 'w8a16', string>>;
+  /** @deprecated legacy shape — prefer variant + engines */
+  name?: string;
+  available?: boolean;
 }
 
 export interface TrtBundleList {
@@ -327,11 +334,20 @@ export interface TrtBundleList {
   aceServerDown: boolean;
 }
 
+export interface TrtVariant {
+  id: string;
+  role: 'dit' | 'dit-st';
+  displayName: string;
+  hfRepo: string;
+}
+
 export const trtBundleApi = {
   /** List on-disk bundles + engine /props trt view + build-lock state */
   list: () => get<TrtBundleList>('/trt-bundles'),
   /** Available DiT build variants */
-  variants: () => get<{ variants: string[] }>('/trt-bundles/variants'),
+  variants: () => get<{ variants: TrtVariant[] }>('/trt-bundles/variants'),
+  /** Active build rehydration for browser refresh */
+  activeBuild: () => get<{ job: TrtBuildJob | null }>('/trt-bundles/active-build'),
   /** Start a build { variant, precision }. Throws on 409 (single-GPU lock). */
   build: (variant: string, precision?: string) =>
     post<{ jobId: string }>('/trt-bundles/build', { variant, precision }),
@@ -339,8 +355,57 @@ export const trtBundleApi = {
   status: (jobId: string) => get<TrtBuildJob>(`/trt-bundles/build/${jobId}`),
   /** Cancel a running build */
   cancel: (jobId: string) => post<{ ok: boolean }>(`/trt-bundles/build/${jobId}/cancel`),
+  /** Fetch full build log text for clipboard copy */
+  logText: async (jobId: string): Promise<string> => {
+    const res = await fetch(`${BASE}/trt-bundles/build/${jobId}/log`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || `API error: ${res.status}`);
+    }
+    return res.text();
+  },
+  /** Ask backend to open folder that contains log files */
+  openLogFolder: (jobId: string) => post<{ ok: boolean }>(`/trt-bundles/build/${jobId}/open-log-folder`, {}),
+  /** Delete a built bundle by directory name */
+  deleteBundle: (bundleName: string) => del<{ ok: boolean }>(`/trt-bundles/${encodeURIComponent(bundleName)}`),
   /** SSE endpoint URL for a build job's progress stream */
   eventsUrl: (jobId: string) => `${BASE}/trt-bundles/build/${jobId}/events`,
+};
+
+export interface SystemDependenciesResponse {
+  cuda: { installed: boolean; version?: string };
+  trt: { installed: boolean; path?: string };
+  venv: { installed: boolean };
+  gpuCapability: number | null;
+  gpuCapabilityLabel: string | null;
+  freeDiskSpaceGb: number;
+  totalRamGb: number;
+  gpuVramMb: number | null;
+}
+
+export interface SystemInstallLine {
+  stream: 'stdout' | 'stderr';
+  raw: string;
+  ts: string;
+  parsed?: Record<string, unknown>;
+}
+
+export interface SystemInstallJob {
+  jobId: string;
+  kind: 'install-trt';
+  status: 'running' | 'completed' | 'failed';
+  startedAt: string;
+  finishedAt?: string;
+  exitCode?: number;
+  error?: string;
+  lines: SystemInstallLine[];
+}
+
+export const systemApi = {
+  getDependencies: () => get<SystemDependenciesResponse>('/system/dependencies'),
+  installTrt: () => post<{ jobId: string }>('/system/install-trt', {}),
+  setupVenv: () => post<{ ok: boolean }>('/system/setup-venv', {}),
+  installTrtEvents: (jobId: string) => `${BASE}/system/install-trt/${jobId}/events`,
 };
 
 // ── Retranscribe Lyrics ─────────────────────────────────────

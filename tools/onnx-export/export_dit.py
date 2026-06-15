@@ -2238,10 +2238,26 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
     wrapper = DiTForwardWrapper(dit_model, precision=precision)
     wrapper.eval()
     
-    # Create dummy inputs for tracing
+    # Create dummy inputs for tracing.
+    #
+    # WARNING — symbolic-dimension aliasing trap:
+    # torch.export's ShapeEnv unifies two dynamic dimensions when they share the
+    # same *concrete* value during tracing. The DiT patchifies the latent
+    # sequence (T -> T // patch_size), so if the dummy encoder length S happens to
+    # equal T // patch_size, the exported graph binds the patchified latent length
+    # to the *encoder* sequence symbol. The result is a Reshape whose target
+    # volume tracks enc_hidden instead of input_latents, which TensorRT later
+    # rejects ("reshaping failed ... would change volume") for any profile where
+    # T // patch_size != S. Keep T, T // patch_size and S pairwise distinct.
+    patch_size = int(getattr(config, "patch_size", 2))
     B = 1
-    T = 512   # typical sequence length (divisible by patch_size=2)
-    S = 256   # typical encoder sequence length
+    T = 512   # latent sequence length (must be divisible by patch_size)
+    S = 320   # encoder sequence length: distinct from T and from T // patch_size
+    assert T % patch_size == 0, f"dummy T={T} must be divisible by patch_size={patch_size}"
+    assert S != T and S != T // patch_size, (
+        f"dummy trace shapes alias symbolic dims (T={T}, T//patch_size={T // patch_size}, "
+        f"S={S}); choose S so that T, T//patch_size and S are pairwise distinct"
+    )
     
     dummy_input_latents = torch.randn(B, T, 192, device=device, dtype=tensor_dtype)
     dummy_enc_hidden = torch.randn(B, S, 2048, device=device, dtype=tensor_dtype)
@@ -2605,8 +2621,13 @@ def verify_onnx(onnx_path: str, dit_model, config, precision: str = "q8map-fp16"
     wrapper = DiTForwardWrapper(dit_model, precision=precision)
     wrapper.eval()
     
-    # Create test inputs
-    B, T, S = 1, 256, 128
+    # Create test inputs.
+    # Use shapes where T // patch_size != S so verification actually exercises the
+    # independent latent/encoder sequence dimensions. (Degenerate shapes with
+    # T // patch_size == S hide symbolic-dimension aliasing bugs in the export.)
+    patch_size = int(getattr(config, "patch_size", 2))
+    B, T, S = 1, 512, 320
+    assert S != T and S != T // patch_size, "verify shapes must not alias symbolic dims"
     input_latents = torch.randn(B, T, 192, device=device, dtype=tensor_dtype)
     enc_hidden = torch.randn(B, S, 2048, device=device, dtype=tensor_dtype)
     t = torch.tensor([0.3], device=device, dtype=torch.float32)

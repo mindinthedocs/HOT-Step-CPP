@@ -22,7 +22,6 @@ import { config, PORTABLE_MODE, PROJECT_ROOT } from '../config.js';
 const registryPath = PORTABLE_MODE
   ? path.join(PROJECT_ROOT, 'server', 'data', 'model-registry.json')
   : path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data', 'model-registry.json');
-const registry = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
 
 // Engine variant detection — controls which registry items are visible.
 // 'cuda' (default for legacy/pre-v1.1 builds) shows everything;
@@ -90,6 +89,32 @@ interface RegistryFile {
   description: string;
   tags: string[];
 }
+
+export interface TrtRegistryVariant {
+  id: string;
+  role: 'dit' | 'dit-st';
+  displayName: string;
+  hfRepo: string;
+}
+
+interface ModelRegistryData {
+  version: number;
+  packs: any[];
+  files: RegistryFile[];
+  trtVariants?: TrtRegistryVariant[];
+}
+
+function parseRegistry(rawText: string): ModelRegistryData {
+  const normalized = rawText.replace(/^\uFEFF/, '');
+  return JSON.parse(normalized) as ModelRegistryData;
+}
+
+function getRegistry(): ModelRegistryData {
+  const raw = fs.readFileSync(registryPath, 'utf-8');
+  return parseRegistry(raw);
+}
+
+const registry = getRegistry();
 
 // ── Service ─────────────────────────────────────────────────
 
@@ -172,28 +197,87 @@ class ModelDownloadService extends EventEmitter {
     };
   }
 
+  /** Get TensorRT-capable DiT variants declared in registry. */
+  getTrtRegistry(): TrtRegistryVariant[] {
+    return registry.trtVariants ?? [];
+  }
+
+  async ensureTrtVariantSources(variant: TrtRegistryVariant): Promise<{ ditDir: string; textEncoderDir: string }> {
+    const safeToken = variant.id.replace(/[^A-Za-z0-9._-]/g, '-');
+    const rootDir = path.join(PROJECT_ROOT, '.enc-build', 'trt-src', safeToken);
+    const ditDir = path.join(rootDir, 'dit');
+    const textEncoderDir = path.join(rootDir, 'qwen3-emb');
+
+    fs.mkdirSync(ditDir, { recursive: true });
+    fs.mkdirSync(textEncoderDir, { recursive: true });
+
+    await this.downloadFromHuggingFace(variant.hfRepo, ['config.json', 'silence_latent.pt'], ditDir);
+    // Download Python modeling files required by export_cond_enc.py and export_dit.py.
+    // Fault-tolerant: some variant repos may name them differently; a missing file here
+    // will be caught at build time with a clear error rather than a silent skip.
+    const pyModelingFiles = [
+      'configuration_acestep_v15.py',
+      'modeling_acestep_v15_base.py',
+      'apg_guidance.py',
+    ];
+    for (const pyFile of pyModelingFiles) {
+      const targetPath = path.join(ditDir, pyFile);
+      if (!fs.existsSync(targetPath)) {
+        try {
+          const url = `https://huggingface.co/${variant.hfRepo}/resolve/main/${pyFile}`;
+          await this.downloadSingleFile(url, targetPath);
+        } catch {
+          // Optional: some variant repos may use different file names; the build will
+          // surface a clear "No modeling_acestep_v15*.py found" error if critical files are absent.
+        }
+      }
+    }
+    await this.downloadSafetensorsWeights(variant.hfRepo, ditDir);
+
+    await this.downloadFromHuggingFace('Qwen/Qwen3-Embedding-0.6B', [
+      'config.json',
+      'vocab.json',
+      'merges.txt',
+      'tokenizer.json',
+      'tokenizer_config.json',
+    ], textEncoderDir);
+    await this.downloadSafetensorsWeights('Qwen/Qwen3-Embedding-0.6B', textEncoderDir);
+
+    return { ditDir, textEncoderDir };
+  }
+
   /** Scan models directory for installed model files (.gguf, .onnx, .safetensors),
    *  and engine directory for runtime DLLs */
   getInstalledFiles(): Set<string> {
     const dir = this.modelsDir;
     const files = new Set<string>();
-
-    // Scan models root directory
-    if (fs.existsSync(dir)) {
-      for (const f of fs.readdirSync(dir)) {
-        if (f.endsWith('.gguf') || f.endsWith('.onnx') || f.endsWith('.safetensors') || f.endsWith('.bin')) files.add(f);
+    const exts = ['.gguf', '.onnx', '.safetensors', '.bin'];
+    const addModelFile = (filename: string) => {
+      if (exts.some((ext) => filename.endsWith(ext))) files.add(filename);
+    };
+    const walk = (root: string): void => {
+      let entries: string[] = [];
+      try {
+        entries = fs.readdirSync(root);
+      } catch {
+        return;
       }
-      // Scan subdirectories (e.g. supersep/)
-      for (const sub of fs.readdirSync(dir)) {
-        const subPath = path.join(dir, sub);
+      for (const entry of entries) {
+        const p = path.join(root, entry);
         try {
-          if (fs.statSync(subPath).isDirectory()) {
-            for (const f of fs.readdirSync(subPath)) {
-              if (f.endsWith('.gguf') || f.endsWith('.onnx') || f.endsWith('.safetensors') || f.endsWith('.bin')) files.add(f);
-            }
+          const stat = fs.statSync(p);
+          if (stat.isDirectory()) {
+            walk(p);
+          } else {
+            addModelFile(entry);
           }
         } catch {}
       }
+    };
+
+    // Scan models root directory
+    if (fs.existsSync(dir)) {
+      walk(dir);
     }
 
     // Scan engine directory for runtime DLLs
@@ -423,6 +507,99 @@ class ModelDownloadService extends EventEmitter {
         }
       }
     }
+  }
+
+  private async downloadFromHuggingFace(repo: string, files: string[], outDir: string): Promise<void> {
+    for (const repoPath of files) {
+      const targetPath = path.join(outDir, path.basename(repoPath));
+      if (fs.existsSync(targetPath)) continue;
+
+      const url = `https://huggingface.co/${repo}/resolve/main/${repoPath}`;
+      try {
+        await this.downloadSingleFile(url, targetPath);
+      } catch (err: any) {
+        if (repoPath.endsWith('.index.json')) {
+          continue;
+        }
+        throw new Error(`Failed to download ${repo}/${repoPath}: ${err?.message || String(err)}`);
+      }
+    }
+  }
+
+  private async downloadSafetensorsWeights(repo: string, outDir: string): Promise<void> {
+    const indexName = 'model.safetensors.index.json';
+    const indexPath = path.join(outDir, indexName);
+    const directWeights = path.join(outDir, 'model.safetensors');
+    if (fs.existsSync(indexPath) || fs.existsSync(directWeights)) return;
+
+    try {
+      await this.downloadFromHuggingFace(repo, [indexName], outDir);
+    } catch {
+      await this.downloadFromHuggingFace(repo, ['model.safetensors'], outDir);
+      return;
+    }
+
+    if (!fs.existsSync(indexPath)) {
+      await this.downloadFromHuggingFace(repo, ['model.safetensors'], outDir);
+      return;
+    }
+
+    let shardFiles: string[] = [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(indexPath, 'utf-8')) as {
+        weight_map?: Record<string, string>;
+      };
+      const weightMap = parsed.weight_map ?? {};
+      shardFiles = Array.from(new Set(Object.values(weightMap).filter((v) => typeof v === 'string')));
+    } catch (err: any) {
+      throw new Error(`Failed to parse ${repo}/${indexName}: ${err?.message || String(err)}`);
+    }
+    if (shardFiles.length === 0) {
+      throw new Error(`No shard files listed in ${repo}/${indexName}`);
+    }
+    await this.downloadFromHuggingFace(repo, shardFiles, outDir);
+  }
+
+  private async downloadSingleFile(url: string, targetPath: string): Promise<void> {
+    const tempPath = `${targetPath}.part`;
+    if (fs.existsSync(tempPath)) {
+      try { fs.unlinkSync(tempPath); } catch {}
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const transport = parsedUrl.protocol === 'https:' ? https : http;
+      const req = transport.get(parsedUrl, {
+        headers: { 'User-Agent': 'HOT-Step-CPP/1.0' },
+      }, (res) => {
+        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          const redirected = new URL(res.headers.location, parsedUrl).href;
+          this.downloadSingleFile(redirected, targetPath).then(resolve).catch(reject);
+          return;
+        }
+        if (res.statusCode && res.statusCode >= 400) {
+          res.resume();
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+        const writeStream = fs.createWriteStream(tempPath, { flags: 'w' });
+        res.pipe(writeStream);
+        writeStream.on('finish', () => {
+          writeStream.close();
+          fs.renameSync(tempPath, targetPath);
+          resolve();
+        });
+        writeStream.on('error', (err) => {
+          try { fs.unlinkSync(tempPath); } catch {}
+          reject(err);
+        });
+      });
+      req.on('error', (err) => {
+        try { fs.unlinkSync(tempPath); } catch {}
+        reject(err);
+      });
+    });
   }
 
   /** Validate a downloaded file is a real binary (not an HTML error page) */

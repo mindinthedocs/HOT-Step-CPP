@@ -50,6 +50,20 @@ export function useTrtBuildStream(opts?: UseTrtBuildStreamOptions) {
     };
   }, [activeJobId]);
 
+  useEffect(() => {
+    let mounted = true;
+    trtBundleApi.activeBuild()
+      .then(({ job: active }) => {
+        if (!mounted || !active) return;
+        setJob(active);
+        if (active.status === 'running') {
+          setActiveJobId(active.jobId);
+        }
+      })
+      .catch(() => {});
+    return () => { mounted = false; };
+  }, []);
+
   /** Start a build and begin streaming its progress. Surfaces 409/errors to the caller. */
   const startBuild = useCallback(async (variant: string, precision?: string) => {
     const { jobId } = await trtBundleApi.build(variant, precision);
@@ -64,6 +78,7 @@ export function useTrtBuildStream(opts?: UseTrtBuildStreamOptions) {
   const cancelBuild = useCallback(async () => {
     if (!activeJobId) return;
     await trtBundleApi.cancel(activeJobId);
+    setActiveJobId(null);
   }, [activeJobId]);
 
   const clear = useCallback(() => {

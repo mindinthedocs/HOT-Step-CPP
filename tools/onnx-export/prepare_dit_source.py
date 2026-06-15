@@ -27,6 +27,11 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+# The canonical base modeling file name; also used by trt_bundle_manager.py as a
+# prepare-step output marker so that a staging dir missing this file forces
+# prepare-dit to re-run and copy it from the (freshly downloaded) source.
+DIT_MODELING_PY = "modeling_acestep_v15_base.py"
+
 # Modeling/config files copied alongside the converted weights so the F32
 # staging dir is a drop-in replacement for the source snapshot.
 _DIT_AUX_FILES = (
@@ -34,7 +39,7 @@ _DIT_AUX_FILES = (
     "silence_latent.pt",
     "apg_guidance.py",
     "configuration_acestep_v15.py",
-    "modeling_acestep_v15_base.py",
+    DIT_MODELING_PY,
 )
 
 SILENCE_LATENT = "silence_latent.pt"

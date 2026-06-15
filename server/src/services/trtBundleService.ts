@@ -1,17 +1,3 @@
-// trtBundleService.ts — Transient TRT-bundle build-job store
-//
-// Sibling of modelDownloadService: a single-GPU-locked build-job manager that
-// spawns the Python TRT-bundle orchestrator (tools/trt/trt_bundle_cli.py bundle)
-// and streams its stdout JSON progress protocol via an EventEmitter (SSE).
-//
-// Only one build runs at a time (single GPU). A second start while one is
-// active is rejected by the route with 409.
-//
-// CLI stdout protocol (one JSON object per line):
-//   {"step": N, "name": "...", "progress": 0..1, "status": "skipped|running|done|complete|dry-run"}
-// CLI stderr error protocol:
-//   {"error": true, "step": "...", "message": "..."}
-
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
@@ -19,16 +5,13 @@ import { spawn, ChildProcess } from 'child_process';
 import { randomUUID } from 'crypto';
 import { config, PROJECT_ROOT } from '../config.js';
 
-// ── Types ───────────────────────────────────────────────────
-
 export type BuildStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
-/** One progress line parsed from the CLI's stdout JSON protocol. */
 export interface BuildProgress {
   step: number;
   name: string;
-  progress: number; // 0..1
-  status: string;   // skipped | running | done | complete | dry-run
+  progress: number;
+  status: string;
 }
 
 export interface BuildJob {
@@ -36,30 +19,60 @@ export interface BuildJob {
   variant: string;
   bundleName: string;
   status: BuildStatus;
-  progress: number;            // 0..1, latest cumulative
-  step: string;                // latest step name
-  lines: BuildProgress[];      // full progress history (for replay on SSE connect)
+  progress: number;
+  step: string;
+  lines: BuildProgress[];
   error?: string;
   exitCode?: number;
+  logPath?: string;
+  bundleDir?: string;
+}
+
+interface StartBuildInput {
+  variant: string;
+  precision: string;
+  ditDir: string;
+  textEncoderDir: string;
+  sourceModel?: string;
+}
+
+interface PersistentBuildLock {
+  jobId: string;
+  variant: string;
+  bundleName: string;
+  pid: number;
+  startedAt: string;
+  logPath: string;
+  bundleDir: string;
 }
 
 interface InternalJob extends BuildJob {
   child?: ChildProcess;
+  childPid?: number;
 }
-
-// ── Service ─────────────────────────────────────────────────
 
 class TrtBundleService extends EventEmitter {
   private jobs = new Map<string, InternalJob>();
-  /** Single-GPU lock: the jobId of the currently running build, if any. */
   private activeJobId: string | null = null;
+  private recoveredPidPoll: NodeJS.Timeout | null = null;
 
-  /** Directory holding built TRT bundles. */
+  constructor() {
+    super();
+    void this.recoverPersistentLock();
+  }
+
   get bundlesDir(): string {
     return path.join(config.aceServer.models, 'trt-bundles');
   }
 
-  /** Resolve the repo's venv python (the CLI's interpreter). */
+  get logsDir(): string {
+    return path.join(PROJECT_ROOT, 'logs');
+  }
+
+  private get lockPath(): string {
+    return path.join(PROJECT_ROOT, '.trt-build-lock.json');
+  }
+
   private get pythonExe(): string {
     const winPy = path.join(PROJECT_ROOT, '.venv', 'Scripts', 'python.exe');
     const nixPy = path.join(PROJECT_ROOT, '.venv', 'bin', 'python');
@@ -72,12 +85,18 @@ class TrtBundleService extends EventEmitter {
     return path.join(PROJECT_ROOT, 'tools', 'trt', 'trt_bundle_cli.py');
   }
 
-  /** True when a build is currently running (single-GPU lock held). */
   isBuilding(): boolean {
-    return this.activeJobId !== null;
+    const active = this.activeJobId ? this.jobs.get(this.activeJobId) : undefined;
+    return Boolean(active && active.status === 'running');
   }
 
-  /** List built bundles on disk with completeness status (manifest + engines present). */
+  getActiveBuild(): BuildJob | null {
+    if (!this.activeJobId) return null;
+    const job = this.jobs.get(this.activeJobId);
+    if (!job) return null;
+    return this.publicJob(job);
+  }
+
   listBundles(): { name: string; available: boolean; variant?: string }[] {
     const dir = this.bundlesDir;
     if (!fs.existsSync(dir)) return [];
@@ -95,7 +114,6 @@ class TrtBundleService extends EventEmitter {
         try {
           const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
           variant = typeof manifest.variant === 'string' ? manifest.variant : undefined;
-          // "available" = manifest parses AND every declared engine exists on disk.
           available = this.manifestEnginesPresent(bundleDir, manifest);
         } catch {
           available = false;
@@ -106,69 +124,66 @@ class TrtBundleService extends EventEmitter {
     return out;
   }
 
-  /** Verify every engine/sidecar a manifest declares exists relative to the bundle root. */
-  private manifestEnginesPresent(bundleDir: string, manifest: any): boolean {
-    const components = manifest?.components;
-    if (!components || typeof components !== 'object') return false;
-    for (const comp of Object.values<any>(components)) {
-      const rel = comp?.engine ?? comp?.sidecar;
-      if (!rel) continue;
-      if (!fs.existsSync(path.join(bundleDir, rel))) return false;
-    }
-    return true;
-  }
-
-  /** Bundle directory name for a variant (mirrors the build output-dir convention). */
-  private bundleNameFor(variant: string): string {
-    return `acestep-v15-2b-${variant}`;
-  }
-
-  /** Snapshot of all jobs (newest internal state, no child handle). */
   getJobs(): BuildJob[] {
-    return Array.from(this.jobs.values()).map(j => this.publicJob(j));
+    return Array.from(this.jobs.values()).map((j) => this.publicJob(j));
   }
 
   getJob(jobId: string): BuildJob | undefined {
-    const j = this.jobs.get(jobId);
-    return j ? this.publicJob(j) : undefined;
+    const job = this.jobs.get(jobId);
+    return job ? this.publicJob(job) : undefined;
   }
 
-  private publicJob(j: InternalJob): BuildJob {
-    return {
-      jobId: j.jobId,
-      variant: j.variant,
-      bundleName: j.bundleName,
-      status: j.status,
-      progress: j.progress,
-      step: j.step,
-      lines: j.lines,
-      error: j.error,
-      exitCode: j.exitCode,
-    };
+  getBuildLog(jobId: string): string | null {
+    const job = this.jobs.get(jobId);
+    const logPath = job?.logPath;
+    if (!logPath || !fs.existsSync(logPath)) return null;
+    return fs.readFileSync(logPath, 'utf-8');
   }
 
-  /** Start a build job. Throws if a build is already running (caller maps to 409). */
-  startBuild(variant: string): string {
+  openBuildLogFolder(jobId: string): boolean {
+    const job = this.jobs.get(jobId);
+    if (!job?.logPath) return false;
+    const folder = path.dirname(job.logPath);
+    if (!fs.existsSync(folder)) return false;
+    try {
+      if (process.platform === 'win32') {
+        const child = spawn('explorer', [folder], { detached: true, stdio: 'ignore' });
+        child.unref();
+      } else if (process.platform === 'darwin') {
+        const child = spawn('open', [folder], { detached: true, stdio: 'ignore' });
+        child.unref();
+      } else {
+        const child = spawn('xdg-open', [folder], { detached: true, stdio: 'ignore' });
+        child.unref();
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async startBuild(input: StartBuildInput): Promise<string> {
     if (this.activeJobId !== null) {
       throw new BuildLockedError('A TRT build is already running (single-GPU-locked)');
     }
 
-    const bundleName = this.bundleNameFor(variant);
-    const outputDir = path.join('models', 'trt-bundles', bundleName); // CLI runs cwd=PROJECT_ROOT
-    const ditDir = path.join(PROJECT_ROOT, '.enc-build', 'dit-fp32');
-    const textEncDir = path.join(PROJECT_ROOT, '.enc-build', 'qwen3-emb');
-    const gguf = path.join('models', 'acestep-v15-sft-BF16.gguf');
+    const variant = this.assertSafeVariant(input.variant);
+    if (!fs.existsSync(this.pythonExe)) {
+      throw new Error(`Missing required .venv Python interpreter: ${this.pythonExe}`);
+    }
+    if (!fs.existsSync(this.cliScript)) {
+      throw new Error(`Missing TRT bundle CLI script: ${this.cliScript}`);
+    }
 
-    const argv = [
-      this.cliScript, 'bundle',
-      '--variant', variant,
-      '--output-dir', outputDir,
-      '--dit-dir', ditDir,
-      '--text-encoder-dir', textEncDir,
-      '--gguf', gguf,
-    ];
+    const bundleName = this.bundleNameFor(variant);
+    const outputDir = path.join('models', 'trt-bundles', bundleName);
+    const bundleDir = path.join(PROJECT_ROOT, outputDir);
+
+    fs.mkdirSync(this.logsDir, { recursive: true });
+    fs.mkdirSync(path.dirname(bundleDir), { recursive: true });
 
     const jobId = randomUUID().slice(0, 8);
+    const logPath = path.join(this.logsDir, `build-${jobId}.log`);
     const job: InternalJob = {
       jobId,
       variant,
@@ -177,7 +192,24 @@ class TrtBundleService extends EventEmitter {
       progress: 0,
       step: 'starting',
       lines: [],
+      logPath,
+      bundleDir,
     };
+
+    const ggufPath = path.join('models', 'acestep-v15-sft-BF16.gguf');
+    const argv = [
+      this.cliScript,
+      'bundle',
+      '--variant', input.precision,
+      '--output-dir', outputDir,
+      '--dit-dir', input.ditDir,
+      '--text-encoder-dir', input.textEncoderDir,
+      '--gguf', ggufPath,
+    ];
+    if (input.sourceModel) {
+      argv.push('--source-model', input.sourceModel);
+    }
+
     this.jobs.set(jobId, job);
     this.activeJobId = jobId;
 
@@ -186,43 +218,49 @@ class TrtBundleService extends EventEmitter {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     job.child = child;
+    job.childPid = child.pid ?? undefined;
 
-    this._wireChild(job, child);
+    this.writeLock({
+      jobId,
+      variant,
+      bundleName,
+      pid: child.pid ?? 0,
+      startedAt: new Date().toISOString(),
+      logPath,
+      bundleDir,
+    });
+
+    this.wireChild(job, child);
     this.emit('progress');
     return jobId;
   }
 
-  /** Cancel a running build. Returns false if the job is unknown or already settled. */
-  cancelBuild(jobId: string): boolean {
+  async cancelBuild(jobId: string): Promise<boolean> {
     const job = this.jobs.get(jobId);
     if (!job || job.status !== 'running') return false;
 
-    job.status = 'cancelled';
-    if (job.child && job.child.pid && !job.child.killed) {
-      // Tree-kill on Windows so child python + any TRT subprocess die together.
-      try {
-        if (process.platform === 'win32') {
-          spawn('taskkill', ['/PID', String(job.child.pid), '/T', '/F'], { stdio: 'ignore' });
-        } else {
-          job.child.kill('SIGTERM');
-        }
-      } catch { /* process may already be gone */ }
+    const pid = job.child?.pid ?? job.childPid;
+    if (pid) {
+      this.killPidTree(pid);
     }
-    if (this.activeJobId === jobId) this.activeJobId = null;
-    this.emit('progress');
+
+    this.cleanupPartialBundle(job.bundleDir);
+    this.settleJob(job, {
+      status: 'cancelled',
+      step: 'cancelled',
+      error: 'Build cancelled by user.',
+    });
     return true;
   }
 
-  /** Delete a built bundle directory by variant (or bundle name). */
   deleteBundle(variant: string): boolean {
-    // Accept either the variant (acestep-v15-2b-<variant>) or a literal bundle name.
-    const candidates = [this.bundleNameFor(variant), variant];
+    const safeName = this.assertSafeVariant(variant);
+    const candidates = [safeName];
     const dir = this.bundlesDir;
     const dirResolved = path.resolve(dir);
     for (const name of candidates) {
       const target = path.join(dir, name);
       const resolved = path.resolve(target);
-      // Path-traversal guard: must stay inside the bundles dir.
       if (resolved !== dirResolved && !resolved.startsWith(dirResolved + path.sep)) {
         throw new Error('Path traversal denied');
       }
@@ -234,58 +272,147 @@ class TrtBundleService extends EventEmitter {
     return false;
   }
 
-  // ── Internal ──────────────────────────────────────────────
+  private manifestEnginesPresent(bundleDir: string, manifest: any): boolean {
+    const components = manifest?.components;
+    if (!components || typeof components !== 'object') return false;
+    for (const comp of Object.values<any>(components)) {
+      const rel = comp?.engine ?? comp?.sidecar;
+      if (!rel) continue;
+      if (!fs.existsSync(path.join(bundleDir, rel))) return false;
+    }
+    return true;
+  }
 
-  private _wireChild(job: InternalJob, child: ChildProcess): void {
+  private bundleNameFor(variant: string): string {
+    return `acestep-v15-2b-${variant}`;
+  }
+
+  private publicJob(job: InternalJob): BuildJob {
+    return {
+      jobId: job.jobId,
+      variant: job.variant,
+      bundleName: job.bundleName,
+      status: job.status,
+      progress: job.progress,
+      step: job.step,
+      lines: job.lines,
+      error: job.error,
+      exitCode: job.exitCode,
+      logPath: job.logPath,
+      bundleDir: job.bundleDir,
+    };
+  }
+
+  private writeBuildLog(job: InternalJob, stream: 'stdout' | 'stderr', line: string): void {
+    if (!job.logPath) return;
+    try {
+      const ts = new Date().toISOString();
+      fs.appendFileSync(job.logPath, `${ts} [${stream}] ${line}\n`);
+    } catch {
+      // best effort logging only
+    }
+  }
+
+  private wireChild(job: InternalJob, child: ChildProcess): void {
     let stdoutBuf = '';
     let stderrBuf = '';
 
     child.stdout?.on('data', (chunk: Buffer) => {
       stdoutBuf += chunk.toString();
-      let nl: number;
-      while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
+      let nl = stdoutBuf.indexOf('\n');
+      while (nl >= 0) {
         const line = stdoutBuf.slice(0, nl).trim();
         stdoutBuf = stdoutBuf.slice(nl + 1);
-        if (line) this._handleStdoutLine(job, line);
+        if (line) {
+          this.writeBuildLog(job, 'stdout', line);
+          this.handleStdoutLine(job, line);
+        }
+        nl = stdoutBuf.indexOf('\n');
       }
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
       stderrBuf += chunk.toString();
-      let nl: number;
-      while ((nl = stderrBuf.indexOf('\n')) >= 0) {
+      let nl = stderrBuf.indexOf('\n');
+      while (nl >= 0) {
         const line = stderrBuf.slice(0, nl).trim();
         stderrBuf = stderrBuf.slice(nl + 1);
-        if (line) this._handleStderrLine(job, line);
+        if (line) {
+          this.writeBuildLog(job, 'stderr', line);
+          this.handleStderrLine(job, line);
+        }
+        nl = stderrBuf.indexOf('\n');
       }
     });
 
     child.on('error', (err) => {
-      if (job.status === 'running') {
-        job.status = 'failed';
-        job.error = `Failed to spawn build: ${err.message}`;
-      }
-      if (this.activeJobId === job.jobId) this.activeJobId = null;
-      this.emit('progress');
+      this.settleJob(job, {
+        status: 'failed',
+        step: 'spawn-failed',
+        error: `Failed to spawn build: ${err.message}`,
+      });
     });
 
-    child.on('exit', (code) => {
-      job.exitCode = code ?? undefined;
+    child.on('exit', (code, signal) => {
       if (job.status === 'cancelled') {
-        // Already settled by cancelBuild.
-      } else if (code === 0) {
-        job.status = 'completed';
-        job.progress = 1;
-      } else {
-        job.status = 'failed';
-        if (!job.error) job.error = `Build exited with code ${code}`;
+        this.settleJob(job, {
+          status: 'cancelled',
+          step: 'cancelled',
+          exitCode: code ?? undefined,
+        });
+        return;
       }
-      if (this.activeJobId === job.jobId) this.activeJobId = null;
-      this.emit('progress');
+      if (code === 0) {
+        this.settleJob(job, {
+          status: 'completed',
+          step: 'completed',
+          progress: 1,
+          exitCode: 0,
+        });
+        return;
+      }
+
+      const exitCode = code ?? undefined;
+      const wasRunning = job.status === 'running';
+      const lastLine = job.lines.length > 0 ? job.lines[job.lines.length - 1] : undefined;
+      const lastStatusRunning = lastLine?.status === 'running';
+
+      // Forced-kill / OOM detection across platforms:
+      // - POSIX OOM/forced kill surfaces as exit code 137 (128 + SIGKILL) or a kill signal.
+      // - Windows taskkill /F can surface as STATUS_CONTROL_C_EXIT (0xC000013A = 3221225786).
+      // - Narrow win32 fallback: taskkill /F /T of the Python child commonly bubbles up to the
+      //   parent as a plain exit code 1. Only treat code 1 as a forced kill when the job was
+      //   actively running mid-step (last progress line status === 'running'), i.e. abrupt
+      //   termination during an active build step, so ordinary code-1 build failures are not masked.
+      const isForcedKill =
+        exitCode === 137 ||
+        signal === 'SIGKILL' ||
+        signal === 'SIGTERM' ||
+        (process.platform === 'win32' && exitCode === 3221225786) ||
+        (process.platform === 'win32' && exitCode === 1 && wasRunning && lastStatusRunning);
+
+      if (isForcedKill) {
+        // Same partial-bundle cleanup as the cancel path: a forced kill leaves a half-written bundle.
+        this.cleanupPartialBundle(job.bundleDir);
+        this.settleJob(job, {
+          status: 'failed',
+          step: 'failed',
+          error: 'Build exited with code 137 (likely OOM or forced kill by OS/GPU driver).',
+          exitCode,
+        });
+        return;
+      }
+
+      this.settleJob(job, {
+        status: 'failed',
+        step: 'failed',
+        error: job.error || `Build exited with code ${code}`,
+        exitCode,
+      });
     });
   }
 
-  private _handleStdoutLine(job: InternalJob, line: string): void {
+  private handleStdoutLine(job: InternalJob, line: string): void {
     let parsed: BuildProgress | null = null;
     try {
       const obj = JSON.parse(line);
@@ -297,31 +424,190 @@ class TrtBundleService extends EventEmitter {
           status: typeof obj.status === 'string' ? obj.status : '',
         };
       }
-    } catch { /* non-JSON stdout (e.g. manifest print) is ignored for progress */ }
-
-    if (parsed) {
-      job.lines.push(parsed);
-      job.progress = parsed.progress;
-      job.step = parsed.name;
-      this.emit('progress');
+    } catch {
+      // Non-JSON stdout is still useful in logs but not progress.
     }
+
+    if (!parsed) return;
+    job.lines.push(parsed);
+    job.progress = parsed.progress;
+    job.step = parsed.name;
+    this.emit('progress');
   }
 
-  private _handleStderrLine(job: InternalJob, line: string): void {
+  private handleStderrLine(job: InternalJob, line: string): void {
     try {
       const obj = JSON.parse(line);
       if (obj && obj.error) {
-        // Surface the CLI's structured error (no silent ignore).
         job.error = `[${obj.step ?? '?'}] ${obj.message ?? 'build error'}`;
         this.emit('progress');
         return;
       }
-    } catch { /* plain stderr text — capture as last-resort error context */ }
+    } catch {
+      // Plain stderr; capture best available context.
+    }
     if (!job.error) job.error = line;
+  }
+
+  private cleanupPartialBundle(bundleDir?: string): void {
+    if (!bundleDir) return;
+    const bundlesRootResolved = path.resolve(this.bundlesDir);
+    const bundleResolved = path.resolve(bundleDir);
+    if (bundleResolved !== bundlesRootResolved && !bundleResolved.startsWith(bundlesRootResolved + path.sep)) {
+      return;
+    }
+    try {
+      fs.rmSync(bundleResolved, { recursive: true, force: true });
+    } catch {
+      // best effort only
+    }
+  }
+
+  private settleJob(
+    job: InternalJob,
+    update: {
+      status: BuildStatus;
+      step: string;
+      progress?: number;
+      error?: string;
+      exitCode?: number;
+    },
+  ): void {
+    job.status = update.status;
+    job.step = update.step;
+    if (typeof update.progress === 'number') job.progress = update.progress;
+    if (typeof update.exitCode === 'number') job.exitCode = update.exitCode;
+    if (update.error) job.error = update.error;
+
+    if (this.activeJobId === job.jobId) this.activeJobId = null;
+    this.clearLock();
+    this.clearRecoveredPoll();
+    this.emit('progress');
+  }
+
+  private killPidTree(pid: number): void {
+    try {
+      if (process.platform === 'win32') {
+        spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+      } else {
+        process.kill(pid, 'SIGTERM');
+      }
+    } catch {
+      // process may already be gone
+    }
+  }
+
+  private writeLock(lock: PersistentBuildLock): void {
+    try {
+      fs.writeFileSync(this.lockPath, JSON.stringify(lock, null, 2), 'utf-8');
+    } catch {
+      // best effort only
+    }
+  }
+
+  private readLock(): PersistentBuildLock | null {
+    if (!fs.existsSync(this.lockPath)) return null;
+    try {
+      const raw = fs.readFileSync(this.lockPath, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<PersistentBuildLock>;
+      if (!parsed || typeof parsed !== 'object') return null;
+      if (typeof parsed.jobId !== 'string' || typeof parsed.variant !== 'string' || typeof parsed.bundleName !== 'string') {
+        return null;
+      }
+      if (typeof parsed.pid !== 'number' || parsed.pid <= 0) return null;
+      if (typeof parsed.logPath !== 'string' || typeof parsed.bundleDir !== 'string') return null;
+      return {
+        jobId: parsed.jobId,
+        variant: parsed.variant,
+        bundleName: parsed.bundleName,
+        pid: parsed.pid,
+        startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : '',
+        logPath: parsed.logPath,
+        bundleDir: parsed.bundleDir,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private clearLock(): void {
+    try {
+      if (fs.existsSync(this.lockPath)) fs.unlinkSync(this.lockPath);
+    } catch {
+      // best effort only
+    }
+  }
+
+  private isPidRunning(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private recoverPersistentLock(): void {
+    const lock = this.readLock();
+    if (!lock) {
+      this.clearLock();
+      return;
+    }
+
+    if (!this.isPidRunning(lock.pid)) {
+      this.clearLock();
+      return;
+    }
+
+    const recovered: InternalJob = {
+      jobId: lock.jobId,
+      variant: lock.variant,
+      bundleName: lock.bundleName,
+      status: 'running',
+      progress: 0,
+      step: 'rehydrated',
+      lines: [],
+      error: 'Build process was rehydrated from persistent lock.',
+      logPath: lock.logPath,
+      bundleDir: lock.bundleDir,
+      childPid: lock.pid,
+    };
+    this.jobs.set(recovered.jobId, recovered);
+    this.activeJobId = recovered.jobId;
+    this.emit('progress');
+
+    this.clearRecoveredPoll();
+    this.recoveredPidPoll = setInterval(() => {
+      if (!this.isPidRunning(lock.pid)) {
+        this.settleJob(recovered, {
+          status: 'failed',
+          step: 'orphaned-build-exited',
+          error: 'Recovered build process exited after server startup.',
+        });
+      }
+    }, 2000);
+  }
+
+  private clearRecoveredPoll(): void {
+    if (this.recoveredPidPoll) {
+      clearInterval(this.recoveredPidPoll);
+      this.recoveredPidPoll = null;
+    }
+  }
+
+  private assertSafeVariant(variant: string): string {
+    const v = variant.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(v)) {
+      throw new Error('Invalid variant format.');
+    }
+    if (v.includes('..') || v.includes('/') || v.includes('\\')) {
+      throw new Error('Path traversal denied');
+    }
+    return v;
   }
 }
 
-/** Thrown by startBuild when the single-GPU lock is held; route maps to 409. */
 export class BuildLockedError extends Error {
   constructor(message: string) {
     super(message);

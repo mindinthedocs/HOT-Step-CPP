@@ -29,7 +29,15 @@ export const ModelsDropdown: React.FC = () => {
   // which the server maps to synth_model = <bundle name> at generate time.
   const loadTrtBundles = () => {
     trtBundleApi.list()
-      .then((r) => setTrtBundles(r.bundles.filter(b => b.available).map(b => b.name)))
+      .then((r) => {
+        const names = r.bundles.flatMap((b) => {
+          const out: string[] = [];
+          if (b.engines['q8map-fp16'] && b.bundleNames?.['q8map-fp16']) out.push(b.bundleNames['q8map-fp16']);
+          if (b.engines.w8a16 && b.bundleNames?.w8a16) out.push(b.bundleNames.w8a16);
+          return out;
+        });
+        setTrtBundles(names);
+      })
       .catch(() => {});
   };
   useEffect(() => { loadTrtBundles(); }, []);
