@@ -3,11 +3,8 @@
 
 Produces a self-contained ``trt-bundles/<name>/`` directory (DiT + encoder
 ``.engine`` files + FSQ + CPU sidecars + ``manifest.json``) by INVOKING the
-existing single-purpose export/build scripts. It does not re-implement the
-subprocess-invoke or sidecar-copy logic: it reuses ``run_tool`` and
-``copy_sidecar`` from ``tools/onnx-export/export_runtime_bundle.py`` (the
-existing exporter-orchestration core) and adds the component registry, the
-resumable step model, the CLI, and the JSON progress protocol.
+existing single-purpose export/build scripts. It adds the component registry,
+the resumable step model, the CLI, and the JSON progress protocol.
 
 Resume is stateless and disk-to-disk: a step is skipped when every output it
 declares already exists. There is no cleanup on failure, so a re-run resumes
@@ -17,6 +14,8 @@ from the first step whose outputs are missing.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -28,8 +27,6 @@ TOOLS_DIR = SCRIPT_DIR.parent
 if str(ONNX_EXPORT_DIR) not in sys.path:
     sys.path.insert(0, str(ONNX_EXPORT_DIR))
 
-# REUSE the existing exporter-orchestration core (do not re-implement).
-from export_runtime_bundle import copy_sidecar, run_tool  # noqa: E402
 from prepare_dit_source import (  # noqa: E402
     DIT_MODELING_PY,
     SILENCE_LATENT,
@@ -37,6 +34,24 @@ from prepare_dit_source import (  # noqa: E402
     safetensors_is_bf16,
     _shard_paths,
 )
+
+
+def require_file(path: Path, label: str) -> None:
+    if not path.is_file():
+        raise SystemExit(f"missing {label}: {path}")
+
+
+def copy_sidecar(src: Path, dst: Path, label: str) -> None:
+    require_file(src, label)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.resolve() != dst.resolve():
+        shutil.copy2(src, dst)
+    print(f"[bundle] {label}: {dst}")
+
+
+def run_tool(args: list[str]) -> None:
+    print("[bundle] run:", " ".join(args))
+    subprocess.run(args, check=True)
 
 
 # --------------------------------------------------------------------------

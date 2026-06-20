@@ -75,20 +75,6 @@ TRT_PROFILES = {
     },
 }
 
-ORT_TRT_ENGINE_ROOT_NAME = "ort-trt-engines"
-
-ORT_TRT_DEFAULTS = {
-    "text_opt_tokens": 128,
-    "text_max_tokens": 512,
-    "lyric_opt_tokens": 256,
-    "lyric_max_tokens": 1024,
-    "timbre_opt_frames": 1,
-    "timbre_max_frames": 512,
-    "vae_opt_frames": 1024,
-    "vae_max_frames": 2250,
-    "builder_optimization_level": 0,
-}
-
 # Q8_0-equivalent DiT decoder matrix allowlist.
 #
 # Accepted prefixes reflect the different names produced by safetensors,
@@ -216,114 +202,6 @@ def artifact_fingerprint(paths: Iterable[Path | str]) -> str:
         file_hash = fnv1a_file(path) if path.is_file() else 0
         parts.append(f"{path}={hex64(file_hash)};")
     return "".join(parts)
-
-
-def ort_trt_cache_root(onnx_path: Path, out_dir: Path | None = None) -> Path:
-    return Path(out_dir).resolve() if out_dir else Path(onnx_path).resolve().parent / ORT_TRT_ENGINE_ROOT_NAME
-
-
-def ort_trt_cache_dir(onnx_path: Path,
-                      module_tag: str,
-                      artifact_fp: str,
-                      out_dir: Path | None = None,
-                      builder_optimization_level: int = ORT_TRT_DEFAULTS["builder_optimization_level"],
-                      profile_kwargs: dict | None = None) -> Path:
-    shapes = ort_trt_profile_shapes(module_tag, **(profile_kwargs or {}))
-    seed = (
-        f"{module_tag}\n{artifact_fp or str(Path(onnx_path).resolve())}"
-        f"\nbuilder={builder_optimization_level}"
-        f"\nmin={shapes['min']}"
-        f"\nopt={shapes['opt']}"
-        f"\nmax={shapes['max']}"
-    )
-    return ort_trt_cache_root(onnx_path, out_dir) / f"{module_tag}-{hex64(fnv1a_text(seed))}"
-
-
-def ort_trt_profile_shapes(module_tag: str,
-                           text_opt_tokens: int = ORT_TRT_DEFAULTS["text_opt_tokens"],
-                           text_max_tokens: int = ORT_TRT_DEFAULTS["text_max_tokens"],
-                           lyric_opt_tokens: int = ORT_TRT_DEFAULTS["lyric_opt_tokens"],
-                           lyric_max_tokens: int = ORT_TRT_DEFAULTS["lyric_max_tokens"],
-                           timbre_opt_frames: int = ORT_TRT_DEFAULTS["timbre_opt_frames"],
-                           timbre_max_frames: int = ORT_TRT_DEFAULTS["timbre_max_frames"],
-                           vae_opt_frames: int = ORT_TRT_DEFAULTS["vae_opt_frames"],
-                           vae_max_frames: int = ORT_TRT_DEFAULTS["vae_max_frames"]) -> dict[str, str]:
-    if module_tag == "text-enc":
-        return {
-            "min": "input_ids:1x1",
-            "opt": f"input_ids:1x{text_opt_tokens}",
-            "max": f"input_ids:1x{text_max_tokens}",
-        }
-    if module_tag == "cond-enc":
-        return {
-            "min": "text_hidden:1x1x1024,lyric_embed:1x1x1024,timbre_feats:1x1x64",
-            "opt": (
-                f"text_hidden:1x{text_opt_tokens}x1024,"
-                f"lyric_embed:1x{lyric_opt_tokens}x1024,"
-                f"timbre_feats:1x{timbre_opt_frames}x64"
-            ),
-            "max": (
-                f"text_hidden:1x{text_max_tokens}x1024,"
-                f"lyric_embed:1x{lyric_max_tokens}x1024,"
-                f"timbre_feats:1x{timbre_max_frames}x64"
-            ),
-        }
-    if module_tag == "vae-dec":
-        return {
-            "min": "latents:1x64x64",
-            "opt": f"latents:1x64x{vae_opt_frames}",
-            "max": f"latents:1x64x{vae_max_frames}",
-        }
-    raise ValueError(f"unknown ORT/TRT module tag: {module_tag}")
-
-
-def ort_trt_provider_options(onnx_path: Path,
-                             module_tag: str,
-                             artifact_fp: str,
-                             out_dir: Path | None,
-                             device_id: int,
-                             fp16: bool,
-                             workspace_gb: float,
-                             builder_optimization_level: int,
-                             profile_kwargs: dict) -> tuple[dict[str, str], Path]:
-    shapes = ort_trt_profile_shapes(module_tag, **profile_kwargs)
-    cache_dir = ort_trt_cache_dir(onnx_path, module_tag, artifact_fp, out_dir,
-                                  builder_optimization_level, profile_kwargs)
-    cache_root = ort_trt_cache_root(onnx_path, out_dir)
-    options = {
-        "device_id": str(device_id),
-        "trt_max_partition_iterations": "1000",
-        "trt_min_subgraph_size": "1",
-        "trt_max_workspace_size": str(int(workspace_gb * (1024 ** 3))),
-        "trt_fp16_enable": "1" if fp16 else "0",
-        "trt_engine_cache_enable": "1",
-        "trt_engine_cache_path": str(cache_dir),
-        "trt_engine_cache_prefix": module_tag,
-        "trt_timing_cache_enable": "1",
-        "trt_timing_cache_path": str(cache_root),
-        "trt_force_sequential_engine_build": "1",
-        "trt_context_memory_sharing_enable": "1",
-        "trt_builder_optimization_level": str(builder_optimization_level),
-        "trt_profile_min_shapes": shapes["min"],
-        "trt_profile_opt_shapes": shapes["opt"],
-        "trt_profile_max_shapes": shapes["max"],
-    }
-    return options, cache_dir
-
-
-def validate_ort_trt_cache(cache_dir: Path) -> dict:
-    cache_dir = Path(cache_dir)
-    engines = sorted(cache_dir.glob("*.engine"))
-    profiles = sorted(cache_dir.glob("*.profile"))
-    if not engines or not profiles:
-        raise SystemExit(f"ORT TensorRT cache is incomplete: {cache_dir}")
-    return {
-        "cache_dir": cache_dir.name,
-        "engine_count": len(engines),
-        "profile_count": len(profiles),
-        "engine_bytes": sum(p.stat().st_size for p in engines),
-        "profile_bytes": sum(p.stat().st_size for p in profiles),
-    }
 
 
 def write_export_metadata(path: Path, metadata: ExportMetadata) -> None:

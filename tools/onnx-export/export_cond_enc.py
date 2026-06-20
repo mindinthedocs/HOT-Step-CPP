@@ -513,45 +513,6 @@ def export_null_cond_emb(model_dir: str, output_path: str):
     print(f"[export_cond_enc] null_condition_emb: [{len(vec)}] -> {output_path} ({len(vec)*4} bytes)")
 
 
-def verify_onnx(onnx_path: str, cond_encoder, config, use_timbre_cls: bool = False):
-    """Verify ONNX output matches PyTorch."""
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("[export_cond_enc] onnxruntime not installed, skipping verification")
-        return
-    
-    device = next(cond_encoder.parameters()).device
-    dtype = next(cond_encoder.parameters()).dtype
-    wrapper = CondEncoderWrapperFixed(cond_encoder, use_timbre_cls=use_timbre_cls)
-    wrapper.eval()
-    
-    B, S_text, S_lyric, S_ref = 1, 32, 64, 8
-    text_hidden = torch.randn(B, S_text, config.text_hidden_dim, device=device, dtype=dtype)
-    lyric_embed = torch.randn(B, S_lyric, config.text_hidden_dim, device=device, dtype=dtype)
-    timbre_feats = torch.randn(B, S_ref, config.timbre_hidden_dim, device=device, dtype=dtype)
-    
-    with torch.no_grad():
-        ref_out = wrapper(text_hidden, lyric_embed, timbre_feats).cpu().float().numpy()
-    
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    sess = ort.InferenceSession(onnx_path, providers=providers)
-    ort_out = sess.run(None, {
-        "text_hidden": text_hidden.cpu().float().numpy(),
-        "lyric_embed": lyric_embed.cpu().float().numpy(),
-        "timbre_feats": timbre_feats.cpu().float().numpy(),
-    })[0]
-    
-    max_diff = np.max(np.abs(ref_out - ort_out))
-    mean_diff = np.mean(np.abs(ref_out - ort_out))
-    print(f"[export_cond_enc] Verification: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-    
-    if max_diff < 0.05:
-        print("[export_cond_enc] PASS: ONNX output matches PyTorch")
-    else:
-        print("[export_cond_enc] WARNING: Large difference — may need investigation")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Export AceStep condition encoder to ONNX")
     parser.add_argument("--model-dir", required=True,
@@ -559,7 +520,6 @@ def main():
     parser.add_argument("--output", default=None,
                         help="Output ONNX file (default: models/onnx/cond_encoder.onnx)")
     parser.add_argument("--opset", type=int, default=18)
-    parser.add_argument("--verify", action="store_true")
     parser.add_argument("--device", default="cpu",
                         help="Device for model loading (cpu or cuda). ONNX tracing works on CPU.")
     parser.add_argument("--timbre-cls", choices=["auto", "on", "off"], default="auto",
@@ -620,10 +580,6 @@ def main():
     # Export null_condition_emb
     null_cond_path = os.path.join(output_dir, "null_condition_emb.bin")
     export_null_cond_emb(args.model_dir, null_cond_path)
-    
-    # Verify
-    if args.verify:
-        verify_onnx(args.output, cond_encoder, config, use_timbre_cls=use_timbre_cls)
     
     print("[export_cond_enc] Done!")
 

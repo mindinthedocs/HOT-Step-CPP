@@ -201,44 +201,6 @@ def export_null_cond(model_dir: str, output_path: str):
     print(f"[export_text_enc] null_condition_emb: [{vec.shape[0]}] -> {output_path}")
 
 
-def verify_onnx(onnx_path: str, model, config):
-    """Verify ONNX output matches PyTorch."""
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("[export_text_enc] onnxruntime not installed, skipping verification")
-        return
-    
-    device = next(model.parameters()).device
-    wrapper = TextEncoderWrapper(model)
-    wrapper.eval()
-    
-    # Test inputs
-    B, S = 1, 64
-    input_ids = torch.randint(0, config.vocab_size, (B, S), device=device, dtype=torch.long)
-    
-    # PyTorch reference
-    with torch.no_grad():
-        ref_out = wrapper(input_ids).cpu().float().numpy()
-    
-    # ONNX inference
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    sess = ort.InferenceSession(onnx_path, providers=providers)
-    ort_out = sess.run(None, {
-        "input_ids": input_ids.cpu().numpy(),
-    })[0]
-    
-    # Compare
-    max_diff = np.max(np.abs(ref_out - ort_out))
-    mean_diff = np.mean(np.abs(ref_out - ort_out))
-    print(f"[export_text_enc] Verification: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-    
-    if max_diff < 0.05:
-        print("[export_text_enc] PASS: ONNX output matches PyTorch (within FP16 tolerance)")
-    else:
-        print("[export_text_enc] WARNING: Large difference — may need investigation")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Export Qwen3-Embedding text encoder to ONNX")
     parser.add_argument("--model-dir", required=True,
@@ -249,8 +211,6 @@ def main():
                         help="Path to DiT model dir (for null_condition_emb export)")
     parser.add_argument("--opset", type=int, default=18,
                         help="ONNX opset version (default: 18)")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify ONNX output matches PyTorch")
     parser.add_argument("--device", default="cpu",
                         help="Device for model loading (default: cpu)")
     parser.add_argument("--fp16", action="store_true",
@@ -303,10 +263,6 @@ def main():
     if args.dit_dir:
         null_cond_path = os.path.join(output_dir, "null_condition_emb.bin")
         export_null_cond(args.dit_dir, null_cond_path)
-    
-    # Verify
-    if args.verify:
-        verify_onnx(args.output, model, config)
     
     print("[export_text_enc] Done!")
 

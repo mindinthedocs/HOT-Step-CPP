@@ -2149,247 +2149,10 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
     }
 
 
-
-def _save_model_external(model, output_path: str) -> None:
-    import onnx
-
-    data_path = output_path + ".data"
-    if os.path.exists(data_path):
-        os.remove(data_path)
-    onnx.save_model(
-        model,
-        output_path,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=os.path.basename(data_path),
-        size_threshold=1024,
-        convert_attribute=False,
-    )
-    onnx.checker.check_model(output_path)
-
-
-def apply_precision_policy_to_onnx(output_path: str, wrapper: nn.Module, precision: str) -> dict:
-    """Apply the hardcoded DiT precision policy and emit a manifest."""
-    import onnx
-    import numpy as np
-    from onnx import TensorProto, numpy_helper
-
-    all_param_names = [name for name, _ in wrapper.named_parameters()]
-    matrix_param_names = [name for name, p in wrapper.named_parameters() if p.dim() >= 2]
-    non_matrix_param_names = sorted(set(all_param_names) - set(matrix_param_names))
-    fp16_names, fp32_matrix_names = classify_tensor_names(matrix_param_names)
-    preserved_names = sorted(fp32_matrix_names + non_matrix_param_names)
-    pattern_match_counts = {
-        pattern: sum(1 for name in matrix_param_names if re.match(pattern, name))
-        for pattern in TRT_FP16_WEIGHT_ALLOWLIST_PATTERNS
-    }
-    unmatched_patterns = [pattern for pattern, count in pattern_match_counts.items() if count == 0]
-    common_report = {
-        "allowlist_patterns": TRT_FP16_WEIGHT_ALLOWLIST_PATTERNS,
-        "allowlist_pattern_match_counts": pattern_match_counts,
-        "unmatched_allowlist_patterns": unmatched_patterns,
-        "all_parameter_count": len(all_param_names),
-        "matrix_parameter_count": len(matrix_param_names),
-        "non_matrix_parameter_count": len(non_matrix_param_names),
-        "preserved_fp32_matrix": fp32_matrix_names,
-        "preserved_fp32_non_matrix": non_matrix_param_names,
-    }
-    if precision == "fp32":
-        model = onnx.load(output_path)
-        rewrite_report = {}
-        sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model)
-        if sequence_rewrite_report["split_to_sequence_rewritten"]:
-            rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
-        constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(model)
-        if constant_fold_report["constant_nodes_folded_to_initializers"]:
-            rewrite_report["constant_initializer_fold"] = constant_fold_report
-        removed_initializer_inputs = _remove_initializer_graph_inputs(model)
-        if removed_initializer_inputs:
-            rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
-        if rewrite_report:
-            _save_model_external(model, output_path)
-        report = {
-            "precision_policy": "fp32",
-            "matched_allowlist": [],
-            "downcast_to_fp16": [],
-            "quantized_to_int8": [],
-            "preserved_fp32": sorted(all_param_names),
-            "missing_initializers": [],
-            **common_report,
-        }
-        if rewrite_report:
-            report["rewrite"] = rewrite_report
-        write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
-        return report
-
-    if precision == "w8a8":
-        # W8A8 + ConvRot: true INT8×INT8 matmul with per-row activation
-        # quantization and per-output-channel weight quantization. The weight
-        # is rotated offline by a regular Hadamard matrix (ConvRot) before
-        # quantization; the matching activation rotation is emitted as an
-        # ONNX subgraph so the runtime applies it online before the dynamic
-        # per-row INT8 quantizer. See convrot.py and the w8a8 helpers above
-        # for the full design.
-        if not fp16_names:
-            raise SystemExit("hardcoded DiT W8A8 allowlist matched zero exported parameters")
-        if unmatched_patterns:
-            raise SystemExit(
-                "hardcoded DiT W8A8 allowlist pattern(s) matched zero exported parameters: "
-                + ", ".join(unmatched_patterns)
-            )
-
-        group_size = _convrot_default_group_size()
-        model = onnx.load(output_path)
-        initializers = {init.name: init for init in model.graph.initializer}
-        selected_initializer_names = {name for name in fp16_names if name in initializers}
-        missing = sorted(set(fp16_names) - selected_initializer_names)
-        if missing:
-            raise SystemExit(
-                "hardcoded DiT W8A8 allowlist matched parameters missing from ONNX initializers: "
-                + ", ".join(missing[:12])
-                + (" ..." if len(missing) > 12 else "")
-            )
-        axes = _collect_w8a8_weight_axes(model, selected_initializer_names)
-        quant_report = _quantize_w8a8_initializers_with_convrot(
-            model, selected_initializer_names, axes, group_size
-        )
-        if quant_report["missing"]:
-            raise SystemExit(
-                "hardcoded DiT W8A8 allowlist matched parameters missing from ONNX initializers: "
-                + ", ".join(quant_report["missing"][:12])
-                + (" ..." if len(quant_report["missing"]) > 12 else "")
-            )
-        if quant_report["skipped"]:
-            raise SystemExit(
-                "hardcoded DiT W8A8 allowlist matched parameters that were not MatMul/Gemm weights: "
-                + ", ".join(quant_report["skipped"][:12])
-                + (" ..." if len(quant_report["skipped"]) > 12 else "")
-            )
-        if not quant_report["quantized"]:
-            raise SystemExit("hardcoded DiT W8A8 allowlist matched parameters but no ONNX initializers were quantized")
-
-        rewrite_report = _w8a8_rewrite_dispatch(model, quant_report)
-        if not rewrite_report["rewritten_nodes"]:
-            raise SystemExit("W8A8 quantized weights but rewrote zero MatMul/Gemm nodes")
-        sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model)
-        if sequence_rewrite_report["split_to_sequence_rewritten"]:
-            rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
-        constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(model)
-        if constant_fold_report["constant_nodes_folded_to_initializers"]:
-            rewrite_report["constant_initializer_fold"] = constant_fold_report
-        removed_initializer_inputs = _remove_initializer_graph_inputs(model)
-        if removed_initializer_inputs:
-            rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
-        _save_model_external(model, output_path)
-
-        report = {
-            "precision_policy": precision,
-            "matched_allowlist": fp16_names,
-            "downcast_to_fp16": [],
-            "quantized_to_int8": quant_report["quantized"],
-            "preserved_fp32": preserved_names,
-            "missing_initializers": [],
-            "rewrite": rewrite_report,
-            "weight_activation_quantization": {
-                "weight_dtype": "int8",
-                "activation_dtype": "int8",
-                "compute_dtype": "fp32",
-                "weight_scale_dtype": "fp32",
-                "weight_scale_granularity": "per-output-channel",
-                "activation_scale_dtype": "fp32",
-                "activation_scale_granularity": "per-row",
-                "scheme": "symmetric",
-                "q_range": [-127, 127],
-                "matmul": "ConvRotInt8Linear",
-            },
-            "convrot": {
-                "enabled": quant_report["convrot_applied"],
-                "group_size": group_size,
-                "hadamard_initializer": quant_report["convrot_h_name"],
-                "rotated_weights": [
-                    name for name in quant_report["quantized"]
-                    if quant_report["rotated_by_name"].get(name, False)
-                ],
-                "skipped_weights": [
-                    name for name in quant_report["quantized"]
-                    if not quant_report["rotated_by_name"].get(name, False)
-                ],
-            },
-            "w8a8_axis_by_name": quant_report["axis_by_name"],
-            **common_report,
-        }
-        write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
-        write_json(Path(output_path).with_suffix(".precision.json"), report)
-        return report
-
-    if precision != "q8map-fp16":
-        raise SystemExit(f"unknown precision policy: {precision}")
-    if not fp16_names:
-        raise SystemExit("hardcoded DiT precision allowlist matched zero exported parameters")
-    if unmatched_patterns:
-        raise SystemExit(
-            "hardcoded DiT precision allowlist pattern(s) matched zero exported parameters: "
-            + ", ".join(unmatched_patterns)
-        )
-
-    model = onnx.load(output_path)
-    initializers = {init.name: init for init in model.graph.initializer}
-    converted = []
-    missing = []
-    fp16_initializer_names: set[str] = set()
-
-    for name in fp16_names:
-        init = initializers.get(name)
-        if init is None:
-            missing.append(name)
-            continue
-        arr = numpy_helper.to_array(init).astype(np.float16)
-        init.CopyFrom(numpy_helper.from_array(arr, name=name))
-        init.data_type = TensorProto.FLOAT16
-        converted.append(name)
-        fp16_initializer_names.add(name)
-
-    if not converted:
-        raise SystemExit("hardcoded DiT precision allowlist matched parameters but no ONNX initializers were downcast")
-    if missing:
-        raise SystemExit(
-            "hardcoded DiT precision allowlist matched parameters missing from ONNX initializers: "
-            + ", ".join(missing[:12])
-            + (" ..." if len(missing) > 12 else "")
-        )
-
-    rewrite_report = _rewrite_fp16_weight_ops(model, fp16_initializer_names)
-    sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model)
-    if sequence_rewrite_report["split_to_sequence_rewritten"]:
-        rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
-    constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(model)
-    if constant_fold_report["constant_nodes_folded_to_initializers"]:
-        rewrite_report["constant_initializer_fold"] = constant_fold_report
-    removed_initializer_inputs = _remove_initializer_graph_inputs(model)
-    if removed_initializer_inputs:
-        rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
-    _save_model_external(model, output_path)
-
-    report = {
-        "precision_policy": precision,
-        "matched_allowlist": fp16_names,
-        "downcast_to_fp16": converted,
-        "preserved_fp32": preserved_names,
-        "missing_initializers": missing,
-        "quantized_to_int8": [],
-        "rewrite": rewrite_report,
-        **common_report,
-    }
-    write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
-    write_json(Path(output_path).with_suffix(".precision.json"), report)
-    return report
-
-
 def load_dit_model(
     model_dir: str,
     device: str = "cpu",
     precision: str = "q8map-fp16",
-    low_memory_export: bool = False,
 ):
     """Load the AceStepDiTModel from a safetensors checkpoint."""
     model_dir = Path(model_dir)
@@ -2453,50 +2216,17 @@ def load_dit_model(
     # Force SDPA for ONNX export (no flash attention)
     config._attn_implementation = "sdpa"
     
-    if low_memory_export and device != "cpu":
+    if device != "cpu":
         raise SystemExit("low-memory export keeps weights CPU-mapped; use --device cpu")
 
     print(f"[export_dit] Loading model from {model_dir}...")
     print(f"[export_dit] Precision recipe: {precision}")
-    if low_memory_export:
-        print("[export_dit] Low-memory export: meta init only; weights stream after graph export")
+    print("[export_dit] Low-memory export: meta init only; weights stream after graph export")
     t0 = time.time()
     
-    # Create just the DiT model (decoder) — no need for full model
-    if low_memory_export:
-        with torch.device("meta"):
-            dit_model = AceStepDiTModel(config)
-        dit_model = dit_model.to(dtype=torch.float32)
-        missing = []
-        unexpected = []
-    else:
-        # Load weights — handle both single-file and sharded safetensors
-        from safetensors.torch import load_file
-
-        shard_paths = _safetensor_paths(model_dir)
-        if len(shard_paths) > 1:
-            print(f"[export_dit] Loading {len(shard_paths)} shards...")
-            state_dict = {}
-            for shard_path in shard_paths:
-                print(f"[export_dit]   Loading {shard_path.name}...")
-                state_dict.update(load_file(str(shard_path)))
-        else:
-            state_dict = load_file(str(shard_paths[0]))
-
-        # Filter and remap: "decoder.X" -> "X" for the DiT model
-        dit_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith("decoder."):
-                dit_state_dict[k[len("decoder."):]] = v
-
-        missing, unexpected = dit_model.load_state_dict(dit_state_dict, strict=False)
-    if missing:
-        prefix = "ERROR" if low_memory_export else "Warning"
-        print(f"[export_dit] {prefix}: {len(missing)} missing keys (first 5: {missing[:5]})")
-        if low_memory_export:
-            raise SystemExit("low-memory export cannot continue with meta tensors left unloaded")
-    if unexpected:
-        print(f"[export_dit] Warning: {len(unexpected)} unexpected keys")
+    with torch.device("meta"):
+        dit_model = AceStepDiTModel(config)
+    dit_model = dit_model.to(dtype=torch.float32)
     
     # Supported handoff policies keep the PyTorch export in FP32. q8map-fp16
     # and w8a8 transform selected ONNX initializers after export according to
@@ -2505,13 +2235,10 @@ def load_dit_model(
         raise ValueError(
             f"Unknown precision: {precision}. Use 'q8map-fp16', 'w8a8', or 'fp32'."
         )
-    if not low_memory_export:
-        dit_model = dit_model.to(device=device, dtype=torch.float32)
     
     # Replace Conv1d/ConvTranspose1d with Linear equivalents for ALL precision modes.
     # TensorRT handles the patch path more reliably as reshape+matmul.
     dit_model = replace_conv_with_linear(dit_model)
-    
     dit_model.eval()
     
     t1 = time.time()
@@ -2531,8 +2258,7 @@ def load_dit_model(
 
 def export_onnx(dit_model, config, output_path: str, opset: int = 18,
                 precision: str = "q8map-fp16", source_model: str = "",
-                model_dir: str = "", low_memory_export: bool = False,
-                stream_chunk_mb: int = 16):
+                model_dir: str = "", stream_chunk_mb: int = 16):
     """Export the DiT forward pass to ONNX."""
     device = next(dit_model.parameters()).device
     
@@ -2575,20 +2301,7 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
           f"enc_hidden={list(dummy_enc_hidden.shape)}, t={list(dummy_t.shape)}")
     print(f"[export_dit] Input dtype: {tensor_dtype}, t/t_r dtype: fp32")
     
-    # Test forward pass first
-    if low_memory_export:
-        print("[export_dit] Skipping PyTorch forward preflight for low-memory export")
-    else:
-        print("[export_dit] Testing forward pass...")
-        with torch.no_grad():
-            test_out = wrapper(dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r)
-        print(f"[export_dit] Output shape: {list(test_out.shape)} (expected [{B}, {T}, 64])")
-        print(f"[export_dit] Output dtype: {test_out.dtype}")
-
-        # Check for NaN
-        if torch.isnan(test_out).any():
-            print("[export_dit] ERROR: Output contains NaN! Aborting export.")
-            sys.exit(1)
+    print("[export_dit] Skipping PyTorch forward preflight for low-memory export")
     
     # Export to ONNX
     print(f"[export_dit] Exporting to ONNX (opset {opset})...")
@@ -2607,260 +2320,55 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
         "t_r":           {0: batch},
     }
     
-    export_target = None if low_memory_export else output_path
     onnx_program = torch.onnx.export(
         wrapper,
         (dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r),
-        export_target,
+        None,
         opset_version=opset,
         input_names=["input_latents", "enc_hidden", "t", "t_r"],
         output_names=["velocity"],
         dynamic_shapes=dynamic_shapes,
-        export_params=not low_memory_export,
-        keep_initializers_as_inputs=low_memory_export,
+        export_params=False,
+        keep_initializers_as_inputs=True,
         external_data=True,
         dynamo=True,
-        optimize=not low_memory_export,
+        optimize=False,
     )
 
-    if low_memory_export:
-        if not model_dir:
-            raise SystemExit("low-memory export requires model_dir for safetensors streaming")
-        graph_shell_path = output_path + ".graph-shell.onnx"
-        for stale_path in (output_path, output_path + ".data", graph_shell_path, graph_shell_path + ".data"):
+    if not model_dir:
+        raise SystemExit("low-memory export requires model_dir for safetensors streaming")
+    graph_shell_path = output_path + ".graph-shell.onnx"
+    for stale_path in (output_path, output_path + ".data", graph_shell_path, graph_shell_path + ".data"):
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+    print("[export_dit] Saving graph without embedded initializers...")
+    onnx_program.save(
+        graph_shell_path,
+        include_initializers=False,
+        keep_initializers_as_inputs=True,
+        external_data=True,
+    )
+    print(f"[export_dit] Streaming {precision} safetensors into ONNX external data...")
+    try:
+        stream_result = _externalize_initializers_from_safetensors(
+            onnx_program,
+            output_path,
+            Path(model_dir),
+            wrapper,
+            precision=precision,
+            chunk_mb=stream_chunk_mb,
+            graph_shell_path=graph_shell_path,
+        )
+    except BaseException:
+        for stale_path in (output_path, output_path + ".data"):
             if os.path.exists(stale_path):
                 os.remove(stale_path)
-        print("[export_dit] Saving graph without embedded initializers...")
-        onnx_program.save(
-            graph_shell_path,
-            include_initializers=False,
-            keep_initializers_as_inputs=True,
-            external_data=True,
-        )
-        print(f"[export_dit] Streaming {precision} safetensors into ONNX external data...")
-        try:
-            stream_result = _externalize_initializers_from_safetensors(
-                onnx_program,
-                output_path,
-                Path(model_dir),
-                wrapper,
-                precision=precision,
-                chunk_mb=stream_chunk_mb,
-                graph_shell_path=graph_shell_path,
-            )
-        except BaseException:
-            for stale_path in (output_path, output_path + ".data"):
-                if os.path.exists(stale_path):
-                    os.remove(stale_path)
-            raise
-        finally:
-            if os.path.exists(graph_shell_path):
-                os.remove(graph_shell_path)
-        manifest = stream_result["manifest"]
-        precision_report = stream_result["precision_report"]
-        write_export_metadata(
-            Path(output_path).with_suffix(".metadata.json"),
-            ExportMetadata(
-                family="acestep-v15",
-                source_model=source_model,
-                profile="dynamic-4input",
-                precision_policy=precision,
-                tensor_names_fp16=precision_report.get("matched_allowlist", []),
-                tensor_names_fp32=precision_report.get("preserved_fp32", []),
-            ),
-        )
-
-        t1 = time.time()
-        data_path = output_path + ".data"
-        onnx_size = os.path.getsize(output_path)
-        data_size = os.path.getsize(data_path) if os.path.exists(data_path) else 0
-        print(f"[export_dit] Low-memory stream manifest: {manifest['streamed_from_safetensors']} streamed, "
-              f"{manifest['materialized_fallback_parameters']} small fallback")
-        print(f"[export_dit] ONNX trace completed in {t1-t0:.1f}s")
-        print(f"[export_dit] Exported to {output_path}")
-        print(f"[export_dit] ONNX graph file: {onnx_size/1e6:.1f} MB")
-        print(f"[export_dit] ONNX external weight data: {data_size/1e9:.2f} GB ({os.path.basename(data_path)})")
-        print("[export_dit] Keep the .onnx and .onnx.data files together; pass the .onnx path to TensorRT.")
-        for item in manifest.get("external_data_files", []):
-            print(
-                f"[export_dit] External data validated: {item['path']} "
-                f"{item['size_bytes']/1e9:.2f} GB, {item['initializer_count']} initializers"
-            )
-        print(f"[export_dit] Total export time: {time.time()-t0:.1f}s")
-        return output_path
-    
-    # ── Post-process: rename val_N initializers to original parameter FQNs ──
-    # Ported from Demon's rename_val_initializers_to_fqn (export.py:636-879).
-    #
-    # The dynamo exporter replaces parameter names with opaque val_0, val_1, ...
-    # TRT refit addresses weights by ONNX name, so we must restore FQNs.
-    #
-    # Strategy: SHA-256 byte hash of full tensor data, tried in both
-    # orientations (torch [out,in] and ONNX MatMul [in,out]). Dynamo
-    # transposes Linear weights for MatMul but preserves the raw bytes,
-    # so exact-hash matching is reliable.
-    #
-    # Proto-only save: we never re-encode the external data file (onnx's
-    # writer has been observed to silently convert bf16→fp16 on re-save).
-    
-    print("[export_dit] Renaming val_N initializers to parameter FQNs...")
-    import hashlib, json
-    import onnx
-    from onnx import TensorProto
-    import numpy as np
-    
-    model_proto = onnx.load(output_path, load_external_data=False)
-    base_dir = os.path.dirname(output_path)
-    
-    def _sha(b: bytes) -> bytes:
-        return hashlib.sha256(b).digest()
-    
-    def _bytes_for(p: torch.Tensor):
-        """Raw bytes of a torch tensor in its native dtype."""
-        p_cpu = p.detach().cpu().contiguous()
-        if p_cpu.dtype in (torch.float16, torch.float32):
-            return p_cpu.numpy().tobytes()
-        return None
-    
-    _TORCH_TO_ONNX_DT = {
-        torch.float32: TensorProto.FLOAT,
-        torch.float16: TensorProto.FLOAT16,
-    }
-    
-    # Build torch-side hash index: (onnx_dtype, shape, sha256) → (fqn, transposed)
-    # Hash each 2D param in both orientations.
-    torch_hash_index = {}
-    for name, p in wrapper.named_parameters():
-        if p.dim() != 2:
-            continue
-        canon = "dit." + name if not name.startswith("dit.") else name
-        onnx_dt = _TORCH_TO_ONNX_DT.get(p.dtype)
-        if onnx_dt is None:
-            continue
-        
-        # Original orientation [out, in]
-        b_orig = _bytes_for(p)
-        if b_orig is None:
-            continue
-        shape_orig = tuple(p.shape)
-        torch_hash_index.setdefault(
-            (onnx_dt, shape_orig, _sha(b_orig)), (canon, False)
-        )
-        
-        # Transposed orientation [in, out] — how ONNX MatMul stores it
-        p_t = p.transpose(0, 1)
-        b_trans = _bytes_for(p_t)
-        if b_trans is not None:
-            shape_trans = (shape_orig[1], shape_orig[0])
-            torch_hash_index.setdefault(
-                (onnx_dt, shape_trans, _sha(b_trans)), (canon, True)
-            )
-    
-    print(f"[export_dit] Built hash index: {len(torch_hash_index)} entries "
-          f"from {sum(1 for _,p in wrapper.named_parameters() if p.dim()==2)} 2D params")
-    
-    def _read_external_bytes(init):
-        """Read raw bytes for one initializer from its external data file."""
-        loc = None
-        offset = 0
-        length = None
-        for ed in init.external_data:
-            if ed.key == "location":
-                loc = ed.value
-            elif ed.key == "offset":
-                offset = int(ed.value)
-            elif ed.key == "length":
-                length = int(ed.value)
-        if loc is None:
-            return None
-        ext_path = os.path.join(base_dir, loc)
-        with open(ext_path, "rb") as f:
-            f.seek(offset)
-            return f.read(length) if length is not None else f.read()
-    
-    # Match val_N initializers to torch parameters by SHA-256
-    used_names = {init.name for init in model_proto.graph.initializer}
-    val_inits_changed = {}  # old_name → new_name
-    transposed_fqns = []
-    claimed_torch = set()
-    float_dtypes = (TensorProto.FLOAT16, TensorProto.FLOAT)
-    renamed = 0
-    skipped = 0
-    
-    for init in model_proto.graph.initializer:
-        if not init.name.startswith("val_"):
-            continue
-        dims = tuple(init.dims)
-        if len(dims) != 2:
-            continue
-        nelem = int(np.prod(dims))
-        if nelem < 16:
-            continue
-        if init.data_type not in float_dtypes:
-            continue
-        
-        raw = _read_external_bytes(init)
-        if raw is None:
-            raw = bytes(init.raw_data) if init.raw_data else None
-        if raw is None:
-            continue
-        
-        expected_bytes = nelem * (4 if init.data_type == TensorProto.FLOAT else 2)
-        if len(raw) != expected_bytes:
-            skipped += 1
-            continue
-        
-        key = (init.data_type, dims, _sha(raw))
-        result = torch_hash_index.get(key)
-        if result is None:
-            skipped += 1
-            continue
-        canon, is_transposed = result
-        if canon in claimed_torch or canon in used_names:
-            skipped += 1
-            continue
-        
-        val_inits_changed[init.name] = canon
-        claimed_torch.add(canon)
-        used_names.add(canon)
-        if is_transposed:
-            transposed_fqns.append(canon)
-        renamed += 1
-    
-    # Apply renames to proto (initializers + node inputs + graph inputs/value_info)
-    if val_inits_changed:
-        for init in model_proto.graph.initializer:
-            if init.name in val_inits_changed:
-                init.name = val_inits_changed[init.name]
-        for node in model_proto.graph.node:
-            for i, ref in enumerate(node.input):
-                if ref in val_inits_changed:
-                    node.input[i] = val_inits_changed[ref]
-        for vi in list(model_proto.graph.input) + list(model_proto.graph.value_info):
-            if vi.name in val_inits_changed:
-                vi.name = val_inits_changed[vi.name]
-        
-        # Proto-only save — external data files keep original bytes
-        onnx.save(model_proto, output_path)
-        
-        print(f"[export_dit] Renamed {renamed} val_N initializers to FQNs "
-              f"({len(transposed_fqns)} transposed, {skipped} skipped)")
-    else:
-        print("[export_dit] WARNING: No val_N initializers matched any parameter")
-    
-    # Emit refit manifest sidecar
-    manifest = {
-        "version": 1,
-        "onnx_path": os.path.basename(output_path),
-        "weights_transposed": sorted(transposed_fqns),
-        "weights_renamed": renamed,
-    }
-    manifest_path = output_path + ".refit_manifest.json"
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
-    print(f"[export_dit] Refit manifest saved to {manifest_path}")
-
-    precision_report = apply_precision_policy_to_onnx(output_path, wrapper, precision)
+        raise
+    finally:
+        if os.path.exists(graph_shell_path):
+            os.remove(graph_shell_path)
+    manifest = stream_result["manifest"]
+    precision_report = stream_result["precision_report"]
     write_export_metadata(
         Path(output_path).with_suffix(".metadata.json"),
         ExportMetadata(
@@ -2872,100 +2380,25 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
             tensor_names_fp32=precision_report.get("preserved_fp32", []),
         ),
     )
-    print(f"[export_dit] Precision policy: {precision} "
-          f"({len(precision_report.get('downcast_to_fp16', []))} tensors downcast)")
-    
+
     t1 = time.time()
-    print(f"[export_dit] ONNX trace completed in {t1-t0:.1f}s")
-    
-    # Verify files exist
     data_path = output_path + ".data"
     onnx_size = os.path.getsize(output_path)
     data_size = os.path.getsize(data_path) if os.path.exists(data_path) else 0
-    
-    if data_size == 0:
-        # Dynamo didn't write external data — re-save manually
-        print("[export_dit] External data missing, re-saving with onnx library...")
-        import onnx
-        from onnx.external_data_helper import convert_model_to_external_data
-        
-        model_proto = onnx.load(output_path, load_external_data=False)
-        data_filename = os.path.basename(output_path) + ".data"
-        convert_model_to_external_data(
-            model_proto,
-            all_tensors_to_one_file=True,
-            location=data_filename,
-            size_threshold=1024,
-            convert_attribute=False,
-        )
-        onnx.save(model_proto, output_path)
-        onnx_size = os.path.getsize(output_path)
-        data_size = os.path.getsize(data_path) if os.path.exists(data_path) else 0
-    
+    print(f"[export_dit] Low-memory stream manifest: {manifest['streamed_from_safetensors']} streamed, "
+          f"{manifest['materialized_fallback_parameters']} small fallback")
+    print(f"[export_dit] ONNX trace completed in {t1-t0:.1f}s")
     print(f"[export_dit] Exported to {output_path}")
-    print(f"[export_dit] ONNX graph: {onnx_size/1e6:.1f} MB")
-    print(f"[export_dit] Weight data: {data_size/1e9:.2f} GB")
+    print(f"[export_dit] ONNX graph file: {onnx_size/1e6:.1f} MB")
+    print(f"[export_dit] ONNX external weight data: {data_size/1e9:.2f} GB ({os.path.basename(data_path)})")
+    print("[export_dit] Keep the .onnx and .onnx.data files together; pass the .onnx path to TensorRT.")
+    for item in manifest.get("external_data_files", []):
+        print(
+            f"[export_dit] External data validated: {item['path']} "
+            f"{item['size_bytes']/1e9:.2f} GB, {item['initializer_count']} initializers"
+        )
     print(f"[export_dit] Total export time: {time.time()-t0:.1f}s")
-    
     return output_path
-
-
-def verify_onnx(onnx_path: str, dit_model, config, precision: str = "q8map-fp16"):
-    """Verify the ONNX model produces matching output."""
-    try:
-        import onnxruntime as ort
-    except ImportError:
-        print("[export_dit] onnxruntime not installed, skipping verification")
-        return
-    
-    device = next(dit_model.parameters()).device
-    
-    if precision not in {"q8map-fp16", "w8a8", "fp32"}:
-        raise SystemExit(f"unknown precision policy: {precision}")
-
-    tensor_dtype = torch.float32
-    
-    wrapper = DiTForwardWrapper(dit_model, precision=precision)
-    wrapper.eval()
-    
-    # Create test inputs.
-    # Use shapes where T // patch_size != S so verification actually exercises the
-    # independent latent/encoder sequence dimensions. (Degenerate shapes with
-    # T // patch_size == S hide symbolic-dimension aliasing bugs in the export.)
-    patch_size = int(getattr(config, "patch_size", 2))
-    B, T, S = 1, 512, 320
-    assert S != T and S != T // patch_size, "verify shapes must not alias symbolic dims"
-    input_latents = torch.randn(B, T, 192, device=device, dtype=tensor_dtype)
-    enc_hidden = torch.randn(B, S, 2048, device=device, dtype=tensor_dtype)
-    t = torch.tensor([0.3], device=device, dtype=torch.float32)
-    t_r = torch.tensor([0.3], device=device, dtype=torch.float32)
-    
-    # PyTorch reference
-    with torch.no_grad():
-        ref_out = wrapper(input_latents, enc_hidden, t, t_r)
-    
-    # ONNX inference — feed fp32 (ORT doesn't support bf16 on most providers)
-    sess = ort.InferenceSession(onnx_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-    ort_out = sess.run(None, {
-        "input_latents": input_latents.cpu().float().numpy(),
-        "enc_hidden": enc_hidden.cpu().float().numpy(),
-        "t": t.cpu().numpy(),
-        "t_r": t_r.cpu().numpy(),
-    })
-    
-    # Compare
-    import numpy as np
-    ref_np = ref_out.cpu().float().numpy()
-    ort_np = ort_out[0]
-    
-    max_diff = np.max(np.abs(ref_np - ort_np))
-    mean_diff = np.mean(np.abs(ref_np - ort_np))
-    print(f"[export_dit] Verification: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
-    
-    if max_diff < 0.05:
-        print("[export_dit] PASS: ONNX output matches PyTorch (within q8map-fp16 tolerance)")
-    else:
-        print("[export_dit] WARNING: Large difference detected — may need investigation")
 
 
 def main():
@@ -2979,14 +2412,8 @@ def main():
     parser.add_argument("--precision", default="q8map-fp16",
                         choices=["q8map-fp16", "w8a8", "fp32"],
                         help="Precision recipe (default: q8map-fp16). 'w8a8' = INT8 weights + INT8 activations with ConvRot rotation.")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify ONNX output matches PyTorch")
     parser.add_argument("--device", default="cpu",
                         help="Device for model loading (default: cpu)")
-    parser.add_argument("--low-memory-export", dest="low_memory_export", action="store_true", default=True,
-                        help="Export ONNX by streaming safetensors into external data (default)")
-    parser.add_argument("--no-low-memory-export", dest="low_memory_export", action="store_false",
-                        help="Use the legacy in-memory export path")
     parser.add_argument("--stream-chunk-mb", type=int, default=16,
                         help="Chunk size in MB for low-memory tensor streaming (default: 16)")
     parser.add_argument("--convrot-group-size", type=int, default=None,
@@ -2996,8 +2423,6 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="Re-export even if the output ONNX already exists")
     args = parser.parse_args()
-    if args.low_memory_export and args.verify:
-        raise SystemExit("--verify runs PyTorch and ONNX inference and is not compatible with --low-memory-export")
     if args.convrot_group_size is not None:
         os.environ["HOTSTEP_CONVROT_GROUP_SIZE"] = str(args.convrot_group_size)
     
@@ -3021,18 +2446,12 @@ def main():
         args.model_dir,
         device=args.device,
         precision=args.precision,
-        low_memory_export=args.low_memory_export,
     )
     
     # Export
     export_onnx(dit_model, config, args.output, opset=args.opset,
                 precision=args.precision, source_model=args.model_dir,
-                model_dir=args.model_dir, low_memory_export=args.low_memory_export,
-                stream_chunk_mb=args.stream_chunk_mb)
-    
-    # Verify
-    if args.verify:
-        verify_onnx(args.output, dit_model, config, precision=args.precision)
+                model_dir=args.model_dir, stream_chunk_mb=args.stream_chunk_mb)
     
     print("[export_dit] Done!")
 
