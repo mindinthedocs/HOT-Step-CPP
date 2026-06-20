@@ -175,7 +175,8 @@ class TrtBundleService extends EventEmitter {
       throw new Error(`Missing TRT bundle CLI script: ${this.cliScript}`);
     }
 
-    const bundleName = this.bundleNameFor(variant);
+    const precision = input.precision ?? 'q8map-fp16';
+    const bundleName = this.bundleNameFor(variant, precision);
     const outputDir = path.join('models', 'trt-bundles', bundleName);
     const bundleDir = path.join(PROJECT_ROOT, outputDir);
 
@@ -283,8 +284,26 @@ class TrtBundleService extends EventEmitter {
     return true;
   }
 
-  private bundleNameFor(variant: string): string {
-    return `acestep-v15-2b-${variant}`;
+  private bundleNameFor(variant: string, precision: string): string {
+    // Bundle directory naming: ``trt-<sourceModel>-<precision>``
+    //
+    // The original scheme was ``acestep-v15-2b-<variant>`` but the hardcoded
+    // ``2b`` was misleading — ACE-Step v1.5 XL is a ~4B-parameter DiT, not 2B,
+    // and the bare-letter ``b`` collides with the LM size namespace (the LM
+    // ships in 4B too). The new scheme:
+    //   - drops the ``2b`` size tag entirely (it was wrong and ambiguous);
+    //   - prefixes with ``trt-`` so a built bundle is unambiguously a TRT
+    //     artifact in the models/trt-bundles/ directory;
+    //   - suffixes with the precision recipe (q8map-fp16 | w8a8 | fp32) so
+    //     the user can hold multiple precision variants of the same source
+    //     model without overwriting each other.
+    //
+    // The legacy ``acestep-v15-2b-*`` pattern is still recognized by the UI
+    // (ModelSelect.tsx / modelLabels.ts) and by listBundles() so existing
+    // bundles keep loading after the rename.
+    const safeVariant = this.assertSafeVariant(variant);
+    const safePrecision = this.assertSafeVariant(precision);
+    return `trt-${safeVariant}-${safePrecision}`;
   }
 
   private publicJob(job: InternalJob): BuildJob {

@@ -20,7 +20,7 @@ import { PROJECT_ROOT } from '../config.js';
 
 const router = Router();
 
-const PRECISIONS = ['q8map-fp16', 'w8a16', 'fp32'] as const;
+const PRECISIONS = ['q8map-fp16', 'w8a8', 'fp32'] as const;
 
 function getTrtVariants() {
   return modelDownloadService

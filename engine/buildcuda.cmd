@@ -84,6 +84,19 @@ if "%CLEAN_BUILD%"=="1" (
 
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%" || exit /b 1
 
+rem Discover TensorRT SDK (optional — TRT acceleration for DiT w8a8 path).
+rem Checks TRT_ROOT or TENSORRT_ROOT env vars; passes -DTRT_ROOT to CMake if found.
+set "CMAKE_TRT_OPT="
+if defined TRT_ROOT (
+    set "CMAKE_TRT_OPT=-DTRT_ROOT=%TRT_ROOT%"
+    echo TRT_ROOT : %TRT_ROOT%
+) else if defined TENSORRT_ROOT (
+    set "CMAKE_TRT_OPT=-DTRT_ROOT=%TENSORRT_ROOT%"
+    echo TENSORRT_ROOT : %TENSORRT_ROOT%
+) else (
+    echo TRT      : not set (set TRT_ROOT or TENSORRT_ROOT for TRT acceleration)
+)
+
 "%CMAKE_EXE%" -S "%SCRIPT_DIR%." -B "%BUILD_DIR%" -G Ninja ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DGGML_CUDA=ON ^
@@ -94,7 +107,8 @@ if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%" || exit /b 1
   -DCMAKE_POLICY_DEFAULT_CMP0141=OLD ^
   -DCMAKE_C_FLAGS="/W0" ^
   -DCMAKE_CXX_FLAGS="/W0" ^
-  -DCMAKE_CUDA_FLAGS="-w -Xcompiler /W0"
+  -DCMAKE_CUDA_FLAGS="-w -Xcompiler /W0" ^
+  %CMAKE_TRT_OPT%
 if errorlevel 1 exit /b %errorlevel%
 
 set "BUILD_PARALLEL=%NUMBER_OF_PROCESSORS%"

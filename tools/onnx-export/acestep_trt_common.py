@@ -31,10 +31,30 @@ DIT_DEFAULTS = {
 }
 
 TRT_PROFILES = {
+    # "default" — 2-minute test profile for 6GB cards.
+    # max_T=3000 = 120s × 25Hz. The DiT internally patchifies T→T/2 (12.5Hz),
+    # so max internal sequence length = 1500 tokens. Combined with the 4GB
+    # w8a8 engine this leaves ~1GB for activations on a 6GB card.
+    # For longer songs use the "full-10min" profile (requires ≥8GB VRAM).
     "default": {
         "min_T": 64,
         "opt_T": 2048,
-        "max_T": 8192,
+        "max_T": 3000,
+        "min_enc_S": 64,
+        "opt_enc_S": 512,
+        "max_enc_S": 2048,
+        "min_N": 1,
+        "opt_N": 1,
+        "max_N": 1,
+    },
+    # "full-10min" — 10-minute profile for ≥8GB cards.
+    # max_T=15000 = 600s × 25Hz (the silence_latent max). Internal sequence
+    # length after patchify = 7500 tokens at 12.5Hz. This is the official
+    # ACE-Step v1.5 max song length.
+    "full-10min": {
+        "min_T": 64,
+        "opt_T": 2048,
+        "max_T": 15000,
         "min_enc_S": 64,
         "opt_enc_S": 512,
         "max_enc_S": 2048,
@@ -327,7 +347,7 @@ def validate_dit_precision_manifest(onnx_path: Path, precision_policy: str | Non
         raise SystemExit(f"Cannot read DiT precision manifest {manifest_path}: {exc}") from None
 
     got_policy = manifest.get("precision_policy")
-    if got_policy not in {"q8map-fp16", "w8a16", "fp32"}:
+    if got_policy not in {"q8map-fp16", "w8a8", "fp32"}:
         raise SystemExit(f"Unsupported DiT precision policy in manifest: {got_policy!r}")
     if precision_policy is not None and got_policy != precision_policy:
         raise SystemExit(
@@ -361,7 +381,14 @@ def validate_dit_precision_manifest(onnx_path: Path, precision_policy: str | Non
             raise SystemExit("DiT precision manifest downcast set does not match allowlist match set.")
         if quantized:
             raise SystemExit("q8map-fp16 precision manifest unexpectedly contains INT8 quantized tensors.")
-    elif got_policy == "w8a16":
+    elif got_policy == "w8a8":
+        # w8a8 + ConvRot: INT8 weights AND INT8 activations, fused by the
+        # ConvRotInt8Linear TRT plugin. Same allowlist contract as q8map-fp16
+        # (every matched matrix weight is quantized to INT8 with
+        # per-output-channel symmetric scale), but the rewrite also emits
+        # the ConvRotInt8Linear custom-op node and records convrot metadata
+        # (group_size, hadamard_initializer name) so downstream consumers
+        # (engine builder, refit tooling) can verify the rotation group size.
         if unmatched_patterns:
             raise SystemExit(
                 "DiT precision manifest reports allowlist pattern(s) with zero matches: "
@@ -370,11 +397,21 @@ def validate_dit_precision_manifest(onnx_path: Path, precision_policy: str | Non
         if not matched:
             raise SystemExit("DiT precision manifest matched zero allowlisted tensors.")
         if downcast:
-            raise SystemExit("W8A16 precision manifest unexpectedly contains FP16-downcast tensors.")
+            raise SystemExit("W8A8 precision manifest unexpectedly contains FP16-downcast tensors.")
         if not quantized:
-            raise SystemExit("W8A16 precision manifest quantized zero tensors.")
+            raise SystemExit("W8A8 precision manifest quantized zero tensors.")
         if set(quantized) != set(matched) or len(quantized) != len(matched):
-            raise SystemExit("W8A16 precision manifest quantized set does not match allowlist match set.")
+            raise SystemExit("W8A8 precision manifest quantized set does not match allowlist match set.")
+        convrot = manifest.get("convrot") or {}
+        if not isinstance(convrot, dict):
+            raise SystemExit("W8A8 precision manifest is missing the convrot metadata block.")
+        if convrot.get("enabled") and not convrot.get("hadamard_initializer"):
+            raise SystemExit(
+                "W8A8 precision manifest reports ConvRot enabled but is missing the hadamard_initializer name."
+            )
+        gs = convrot.get("group_size")
+        if convrot.get("enabled") and not isinstance(gs, int):
+            raise SystemExit("W8A8 precision manifest convrot.group_size must be an integer when enabled.")
     else:
         if downcast:
             raise SystemExit("FP32 precision manifest unexpectedly contains downcast tensors.")

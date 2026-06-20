@@ -35,6 +35,7 @@ from prepare_dit_source import (  # noqa: E402
     SILENCE_LATENT,
     prepare_dit_dir,
     safetensors_is_bf16,
+    _shard_paths,
 )
 
 
@@ -70,16 +71,18 @@ class ComponentSpec:
             )
 
 
-# DiT precision recipes: q8map-fp16 (default) / w8a16 / fp32, enforced on-disk by
-# acestep_trt_common.validate_dit_precision_manifest. Encoders run FP16
-# strongly-typed: sm_75 has no BF16 tensor cores.
+# DiT precision recipes: q8map-fp16 (default) / w8a8 / fp32, enforced on-disk by
+# acestep_trt_common.validate_dit_precision_manifest. w8a8 uses the
+# ConvRotInt8Linear TRT plugin (see tools/onnx-export/trt_plugins/ and
+# engine/src/plugins/). Encoders run FP16 strongly-typed: sm_75 has no BF16
+# tensor cores.
 REGISTRY: dict[str, ComponentSpec] = {
     "dit": ComponentSpec(
         name="dit",
         display_name="DiT transformer",
         export_script="export_dit.py",
         build_flag_weight_stream=True,
-        precision_options=("q8map-fp16", "w8a16", "fp32"),
+        precision_options=("q8map-fp16", "w8a8", "fp32"),
         default_precision="q8map-fp16",
         sidecar_files=("config.json", "silence_latent.pt"),
         onnx_dynamic_shapes=True,
@@ -123,6 +126,11 @@ class Step:
     ``run_tool``) or ``action`` (a Python callable, e.g. sidecar copy / manifest
     write) drives the step. ``outputs`` are the files whose collective existence
     means the step is already done — the basis for stateless resume.
+
+    ``complete_check`` overrides the default all-outputs-exist logic when a
+    step's completion cannot be expressed as a fixed set of output paths (e.g.
+    the DiT TRT build, whose primary engine filename embeds the TRT version and
+    is therefore not known at plan-construction time).
     """
 
     name: str
@@ -131,6 +139,7 @@ class Step:
     progress_weight: float
     command: tuple[str, ...] | None = None
     action: Callable[[], None] | None = None
+    complete_check: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         if (self.command is None) == (self.action is None):
@@ -139,6 +148,8 @@ class Step:
             raise ValueError(f"step {self.name!r}: must declare at least one output")
 
     def is_complete(self) -> bool:
+        if self.complete_check is not None:
+            return self.complete_check()
         return all(out.exists() for out in self.outputs)
 
     def run(self) -> None:
@@ -194,13 +205,37 @@ def _resolve_dit_source(dit_dir: Path, output_dir: Path) -> tuple[Path, Path | N
     downstream steps must read a converted F32 staging dir instead; the ``prepare``
     step materializes it. F32 sources are used in place (no staging). Detection is
     a cheap safetensors-header read; the conversion itself happens in ``prepare``.
+
+    Handles both single-file (``model.safetensors``) and sharded
+    (``model-NNNNN-of-MMMMM.safetensors`` + ``model.safetensors.index.json``)
+    layouts.
     """
 
+    # Sharded model: check first shard for BF16
+    shards = _shard_paths(dit_dir)
+    if shards is not None:
+        if safetensors_is_bf16(shards[0]):
+            staging = output_dir / "dit-fp32-source"
+            return staging, staging
+        return dit_dir, None
+
+    # Single-file model
     model = dit_dir / "model.safetensors"
     if model.is_file() and safetensors_is_bf16(model):
         staging = output_dir / "dit-fp32-source"
         return staging, staging
     return dit_dir, None
+
+
+def _dit_build_complete(engine_path: Path) -> bool:
+    """Return True when the DiT TRT build step is fully done.
+
+    build-trt-engine.py now writes the engine directly as ``dit.engine`` next
+    to ``dit.onnx`` (single source of truth — no engines/ subdir, no alias,
+    no copy). The step is complete when the engine file exists and is
+    non-empty. A zero-byte engine means a previous build was interrupted.
+    """
+    return engine_path.is_file() and engine_path.stat().st_size > 0
 
 
 def build_plan(
@@ -224,6 +259,16 @@ def build_plan(
     re-runs only it after an OOM.
     """
 
+    # Resolve all paths to absolute so that Step.is_complete() checks
+    # work regardless of the current working directory. Relative paths
+    # cause exists() to resolve against CWD, which may differ between
+    # the server process and the filesystem.
+    output_dir = output_dir.resolve()
+    dit_dir = dit_dir.resolve()
+    text_encoder_dir = text_encoder_dir.resolve()
+    if gguf_path is not None:
+        gguf_path = gguf_path.resolve()
+
     selected = [REGISTRY[name] for name in components]
     if "dit" not in components:
         raise ValueError("plan requires the dit component")
@@ -239,11 +284,20 @@ def build_plan(
     cond_engine = output_dir / "cond_encoder.engine"
     fsq_sidecar = output_dir / "fsq.safetensors"
     manifest = output_dir / "manifest.json"
-    prepare_outputs = (dit_src / "model.safetensors", dit_src / SILENCE_LATENT, dit_src / DIT_MODELING_PY)
+    # For sharded models the marker is model.safetensors.index.json;
+    # for single-file models it is model.safetensors. Either way,
+    # SILENCE_LATENT and DIT_MODELING_PY are also required outputs.
+    # Check dit_dir (the original source) because dit_src may be a
+    # staging dir that doesn't exist yet at plan-construction time.
+    _is_sharded = (dit_dir / "model.safetensors.index.json").is_file()
+    _marker = dit_src / ("model.safetensors.index.json" if _is_sharded else "model.safetensors")
+    prepare_outputs = (_marker, dit_src / SILENCE_LATENT, dit_src / DIT_MODELING_PY)
 
     # text_enc is invoked WITHOUT --dit-dir so it is NOT a second producer of
-    # null_condition_emb — cond_enc is the sole owner. build-trt-engine writes
-    # the runtime alias dit.engine next to dit.onnx via --runtime-alias.
+    # null_condition_emb — cond_enc is the sole owner.  build-trt-engine.py
+    # writes the primary engine into engines/<stem>.engine then copies the
+    # runtime alias dit.engine next to dit.onnx.  See _dit_build_complete for
+    # the resume logic that handles crashes between those two writes.
     steps: list[Step] = [
         Step("download", (), (dit_dir / "config.json", text_encoder_dir / "config.json"),
              1.0, action=lambda: _require_sources(dit_dir, text_encoder_dir)),
@@ -256,7 +310,7 @@ def build_plan(
         Step("export-cond_enc", (dit_src / "config.json",),
              (cond_onnx, output_dir / "null_condition_emb.bin"), 2.0,
              command=_exporter("export_cond_enc.py",
-                               ["--model-dir", str(dit_src), "--output", str(cond_onnx)])),
+                               ["--model-dir", str(dit_src), "--output", str(cond_onnx), "--fp16"])),
         Step("export-dit", (dit_src / "config.json",), (dit_onnx,), 4.0,
              command=_exporter("export_dit.py",
                                ["--model-dir", str(dit_src), "--output", str(dit_onnx),
@@ -265,10 +319,16 @@ def build_plan(
              command=_build_encoder("text-enc", text_onnx, "text_encoder", output_dir)),
         Step("build-cond_enc", (cond_onnx,), (cond_engine,), 2.0,
              command=_build_encoder("cond-enc", cond_onnx, "cond_encoder", output_dir)),
+        # build-dit: build-trt-engine.py writes dit.engine directly next to
+        # dit.onnx (single source of truth — no engines/ subdir, no alias).
+        # The step's outputs list dit_engine, so Step.is_complete() checks
+        # it directly; the complete_check is a belt-and-suspenders guard
+        # that also rejects zero-byte engines from interrupted builds.
         Step("build-dit", (dit_onnx,), (dit_engine,), 6.0,
              command=_tools_script("build-trt-engine.py",
-                                   ["--onnx", str(dit_onnx), "--out-dir", str(output_dir / "engines"),
-                                    "--precision-policy", variant])),
+                                   ["--onnx", str(dit_onnx),
+                                    "--precision-policy", variant]),
+             complete_check=lambda: _dit_build_complete(dit_engine)),
         Step("fsq-sidecar", (dit_src / "config.json",), (fsq_sidecar,), 1.0,
              command=_exporter("export_fsq_sidecar.py",
                                ["--model-dir", str(dit_src), "--output-dir", str(output_dir)])),
@@ -335,7 +395,7 @@ def _build_manifest(variant: str, source_model: str) -> dict[str, object]:
     object keyed ``dit``/``text_enc``/``cond_enc``/``fsq``, each with a relative
     ``engine`` (or ``sidecar`` for fsq), optional ``metadata``/``precision``/
     ``sidecars``/``weight_streaming``. Paths are relative to the manifest (bundle
-    root). The DiT precision is the build variant (``q8map-fp16``/``w8a16``/
+    root). The DiT precision is the build variant (``q8map-fp16``/``w8a8``/
     ``fp32``); the encoders are FP16 — never ``bf16``, since sm_75 has no BF16
     tensor cores.
     """

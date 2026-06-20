@@ -9,7 +9,7 @@ import { modelDownloadService } from './modelDownloadService.js';
 const ALLOWED_VARIANTS = new Set(
   modelDownloadService.getTrtRegistry().map((variant) => variant.id),
 );
-const ALLOWED_PRECISIONS = new Set(['q8map-fp16', 'w8a16', 'fp32']);
+const ALLOWED_PRECISIONS = new Set(['q8map-fp16', 'w8a8', 'fp32']);
 
 type BuildInput = {
   variant?: string;
@@ -42,12 +42,15 @@ export function validateBuildRequest(input: BuildInput): BuildValidationResult {
     };
   }
 
-  if (precision === 'w8a16' && !isGpuCompatible(prerequisites.gpuCapability)) {
+  // w8a8 requires sm_75+ for INT8 tensor cores.
+  // The ConvRotInt8Linear TRT plugin uses INT8 MMA instructions that don't
+  // exist on pre-Turing GPUs.
+  if (precision === 'w8a8' && !isGpuCompatible(prerequisites.gpuCapability)) {
     const capability = prerequisites.gpuCapability ?? 'unknown';
     return {
       ok: false,
       status: 403,
-      error: `GPU compute capability ${capability} is below sm_75; w8a16 builds are not supported.`,
+      error: `GPU compute capability ${capability} is below sm_75; w8a8 builds are not supported.`,
     };
   }
 

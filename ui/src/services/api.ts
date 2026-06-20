@@ -319,9 +319,9 @@ export interface TrtBuildJob {
 export interface TrtBundleEntry {
   variant: string;
   safetensorsComplete: boolean;
-  engines: { 'q8map-fp16': boolean; w8a16: boolean };
+  engines: { 'q8map-fp16': boolean; w8a8: boolean };
   corrupt: boolean;
-  bundleNames: Partial<Record<'q8map-fp16' | 'w8a16', string>>;
+  bundleNames: Partial<Record<'q8map-fp16' | 'w8a8', string>>;
   /** @deprecated legacy shape — prefer variant + engines */
   name?: string;
   available?: boolean;

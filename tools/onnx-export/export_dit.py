@@ -11,14 +11,23 @@ Precision recipes (--precision):
                Q8_0-equivalent DiT matrix-weight allowlist to FP16 and add
                explicit Cast nodes so TensorRT 11 strongly typed builds honor
                the graph-level policy.
-  w8a16     — Weight-only INT8. Export FP32, quantize the same matrix-weight
-               allowlist to INT8 with per-output-channel scales, then
-               DequantizeLinear those weights to FP16 compute islands.
+  w8a8      — INT8 weights + INT8 activations, fused by the
+               ConvRotInt8Linear TRT plugin. Export FP32, quantize the
+               matrix-weight allowlist to INT8 with per-output-channel
+               symmetric scales (after ConvRot rotation), AND emit a
+               single ConvRotInt8Linear custom-op node per MatMul/Gemm
+               site. The plugin fuses online activation rotation, per-row
+               dynamic INT8 quantization, INT8×INT8 matmul, dequant, and
+               bias add into one GPU kernel launch. ConvRot (regular
+               Hadamard rotation) is applied offline to weights and online
+               to activations so per-row quantization survives
+               diffusion-model outliers. See tools/onnx-export/trt_plugins/
+               and engine/src/plugins/ for the plugin implementation.
   fp32       — Full FP32. Correct but slow. Baseline for validation.
 
 Usage:
     python export_dit.py --model-dir <path-to-safetensors-model> --output <output.onnx>
-    python export_dit.py --model-dir <path> --output <path> --precision fp32
+    python export_dit.py --model-dir <path> --output <path> --precision w8a8
 
 The diffusion loop, guidance (APG/CFG), and solvers stay in C++.
 TRT compiles the ONNX graph once; LoRA adapters use IRefitter weight swapping.
@@ -1006,91 +1015,6 @@ def _stream_f32_transposed(
     return offset, int(length)
 
 
-def _compute_w8_scale_streaming(
-    source: dict,
-    source_dims: list[int],
-    onnx_dims: list[int],
-    transposed: bool,
-    axis: int,
-    chunk_bytes: int,
-):
-    import numpy as np
-
-    if len(source_dims) != 2 or len(onnx_dims) != 2:
-        raise SystemExit(f"W8A16 streaming currently supports 2D weights only, got {source_dims} -> {onnx_dims}")
-    if axis < 0:
-        axis += len(onnx_dims)
-    if axis not in (0, 1):
-        raise SystemExit(f"W8A16 axis {axis} is out of range for {onnx_dims}")
-
-    max_abs = np.zeros((onnx_dims[axis],), dtype=np.float32)
-    rows_per_chunk = _rows_per_chunk(source_dims, chunk_bytes)
-    for row_start in range(0, source_dims[0], rows_per_chunk):
-        rows = min(rows_per_chunk, source_dims[0] - row_start)
-        chunk = _read_f32_rows(source, source_dims, row_start, rows)
-        abs_chunk = np.abs(chunk)
-        if not transposed and axis == 0:
-            max_abs[row_start:row_start + rows] = np.max(abs_chunk, axis=1)
-        elif not transposed and axis == 1:
-            max_abs = np.maximum(max_abs, np.max(abs_chunk, axis=0))
-        elif transposed and axis == 0:
-            max_abs = np.maximum(max_abs, np.max(abs_chunk, axis=0))
-        else:
-            max_abs[row_start:row_start + rows] = np.max(abs_chunk, axis=1)
-
-    scale = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
-    return scale
-
-
-def _quantize_chunk_w8(chunk, scale, axis: int, transposed: bool, row_start: int):
-    import numpy as np
-
-    if not transposed and axis == 0:
-        denom = scale[row_start:row_start + chunk.shape[0]].astype(np.float32).reshape(-1, 1)
-    elif not transposed and axis == 1:
-        denom = scale.astype(np.float32).reshape(1, -1)
-    elif transposed and axis == 0:
-        denom = scale.astype(np.float32).reshape(1, -1)
-    else:
-        denom = scale[row_start:row_start + chunk.shape[0]].astype(np.float32).reshape(-1, 1)
-    q = np.rint(chunk / denom)
-    return np.clip(q, -127, 127).astype(np.int8)
-
-
-def _stream_w8_quantized(
-    source: dict,
-    source_dims: list[int],
-    onnx_dims: list[int],
-    transposed: bool,
-    axis: int,
-    scale,
-    data_path: str,
-    out,
-    chunk_bytes: int,
-) -> tuple[int, int]:
-    import numpy as np
-
-    if transposed:
-        return _stream_f32_transposed(
-            source,
-            source_dims,
-            data_path,
-            out,
-            np.int8,
-            chunk_bytes,
-            transform=lambda chunk, row_start: _quantize_chunk_w8(chunk, scale, axis, True, row_start),
-        )
-
-    offset = out.tell()
-    rows_per_chunk = _rows_per_chunk(source_dims, chunk_bytes)
-    for row_start in range(0, source_dims[0], rows_per_chunk):
-        rows = min(rows_per_chunk, source_dims[0] - row_start)
-        chunk = _read_f32_rows(source, source_dims, row_start, rows)
-        q = _quantize_chunk_w8(chunk, scale, axis, False, row_start)
-        out.write(memoryview(q).cast("B"))
-    return offset, _shape_numel(onnx_dims)
-
-
 def _write_low_memory_precision_manifest(
     output_path: str,
     wrapper: nn.Module,
@@ -1099,6 +1023,9 @@ def _write_low_memory_precision_manifest(
     quantized_to_int8: list[str],
     rewrite_report: dict | None = None,
     w8_axes: dict[str, int] | None = None,
+    w8a8_rotated_by_name: dict[str, bool] | None = None,
+    w8a8_group_size: int | None = None,
+    w8a8_h_name: str | None = None,
 ) -> dict:
     all_param_names = [name for name, _ in wrapper.named_parameters()]
     matrix_param_names = [name for name, p in wrapper.named_parameters() if p.dim() >= 2]
@@ -1112,7 +1039,7 @@ def _write_low_memory_precision_manifest(
     preserved_names = sorted(fp32_matrix_names + non_matrix_param_names)
     report = {
         "precision_policy": precision,
-        "matched_allowlist": fp16_names if precision in {"q8map-fp16", "w8a16"} else [],
+        "matched_allowlist": fp16_names if precision in {"q8map-fp16", "w8a8"} else [],
         "downcast_to_fp16": sorted(downcast_to_fp16),
         "quantized_to_int8": sorted(quantized_to_int8),
         "preserved_fp32": sorted(all_param_names) if precision == "fp32" else preserved_names,
@@ -1129,19 +1056,29 @@ def _write_low_memory_precision_manifest(
     }
     if rewrite_report:
         report["rewrite"] = rewrite_report
-    if precision == "w8a16":
-        report["dequantized_to_fp16"] = sorted(quantized_to_int8)
-        report["w8a16_axis_by_name"] = w8_axes or {}
-        report["weight_only_quantization"] = {
+    if precision == "w8a8":
+        report["w8a8_axis_by_name"] = w8_axes or {}
+        report["weight_activation_quantization"] = {
             "weight_dtype": "int8",
-            "activation_dtype": "fp16",
-            "scale_dtype": "fp16",
-            "zero_point_dtype": "int8",
-            "granularity": "per-output-channel",
+            "activation_dtype": "int8",
+            "compute_dtype": "fp32",
+            "weight_scale_dtype": "fp32",
+            "weight_scale_granularity": "per-output-channel",
+            "activation_scale_dtype": "fp32",
+            "activation_scale_granularity": "per-row",
             "scheme": "symmetric",
             "q_range": [-127, 127],
+            "matmul": "ConvRotInt8Linear",
         }
-    if precision in {"q8map-fp16", "w8a16"}:
+        rotated_by_name = w8a8_rotated_by_name or {}
+        report["convrot"] = {
+            "enabled": any(rotated_by_name.values()) if rotated_by_name else False,
+            "group_size": int(w8a8_group_size) if w8a8_group_size is not None else 0,
+            "hadamard_initializer": w8a8_h_name or "",
+            "rotated_weights": sorted(name for name, r in rotated_by_name.items() if r),
+            "skipped_weights": sorted(name for name, r in rotated_by_name.items() if not r),
+        }
+    if precision in {"q8map-fp16", "w8a8"}:
         if not fp16_names:
             raise SystemExit(f"hardcoded DiT {precision} allowlist matched zero exported parameters")
         if unmatched_patterns:
@@ -1176,7 +1113,7 @@ def _externalize_initializers_from_safetensors(
     if not initializer_specs:
         raise SystemExit("low-memory export could not recover initializer specs from ONNX IR metadata")
 
-    if precision not in {"fp32", "q8map-fp16", "w8a16"}:
+    if precision not in {"fp32", "q8map-fp16", "w8a8"}:
         raise SystemExit(f"unknown low-memory precision policy: {precision}")
 
     source_index = _build_safetensor_index(model_dir)
@@ -1187,7 +1124,7 @@ def _externalize_initializers_from_safetensors(
     }
     matrix_param_names = [name for name, p in wrapper.named_parameters() if p.dim() >= 2]
     fp16_names, _ = classify_tensor_names(matrix_param_names)
-    selected_names = set(fp16_names) if precision in {"q8map-fp16", "w8a16"} else set()
+    selected_names = set(fp16_names) if precision in {"q8map-fp16", "w8a8"} else set()
     chunk_bytes = max(1, int(chunk_mb)) * 1024 * 1024
 
     data_path = output_path + ".data"
@@ -1261,7 +1198,7 @@ def _externalize_initializers_from_safetensors(
 
     record_names = {record["target_name"] for record in records}
     selected_initializer_names = set()
-    if precision in {"q8map-fp16", "w8a16"}:
+    if precision in {"q8map-fp16", "w8a8"}:
         selected_initializer_names = selected_names & record_names
         missing = sorted(selected_names - selected_initializer_names)
         if missing:
@@ -1273,12 +1210,12 @@ def _externalize_initializers_from_safetensors(
 
     _remove_graph_inputs(model_proto, removed_inputs)
     w8_axes: dict[str, int] = {}
-    if precision == "w8a16":
-        w8_axes = _collect_w8a16_weight_axes(model_proto, selected_initializer_names)
+    if precision == "w8a8":
+        w8_axes = _collect_w8a8_weight_axes(model_proto, selected_initializer_names)
         missing_axes = sorted(selected_initializer_names - set(w8_axes))
         if missing_axes:
             raise SystemExit(
-                "hardcoded DiT W8A16 allowlist matched parameters that were not MatMul/Gemm weights: "
+                "hardcoded DiT W8A8 allowlist matched parameters that were not MatMul/Gemm weights: "
                 + ", ".join(missing_axes[:12])
                 + (" ..." if len(missing_axes) > 12 else "")
             )
@@ -1293,6 +1230,30 @@ def _externalize_initializers_from_safetensors(
     quantized_to_int8 = []
     scale_names: dict[str, str] = {}
     zero_point_names: dict[str, str] = {}
+    # w8a8-specific bookkeeping
+    w8a8_rotated_by_name: dict[str, bool] = {}
+    w8a8_group_size: int | None = None
+    w8a8_h_name: str | None = None
+
+    # The w8a8 path needs a shared H initializer (the regular Hadamard
+    # matrix used by both the offline weight rotation and the online
+    # activation rotation subgraph). We build the NumPy array up-front
+    # so the per-weight quantizer can pass it to rotate_weight(); the
+    # initializer itself is written to the external data file inside the
+    # loop below, alongside the per-weight INT8/scale data, so the
+    # _validate_external_data_artifacts pass (which rejects embedded
+    # initializers) stays happy.
+    _w8a8_H_np = None
+    if precision == "w8a8":
+        from convrot import build_hadamard, is_valid_group_size as _convrot_valid
+
+        w8a8_group_size = _convrot_default_group_size()
+        if not _convrot_valid(w8a8_group_size):
+            raise SystemExit(
+                f"W8A8 streaming ConvRot group_size must be a power of 4, got {w8a8_group_size}"
+            )
+        w8a8_h_name = "convrot.hadamard"
+        _w8a8_H_np = build_hadamard(w8a8_group_size).astype(np.float32)
 
     with open(data_path, "wb") as data_out:
         for record in records:
@@ -1305,45 +1266,54 @@ def _externalize_initializers_from_safetensors(
             if is_transposed:
                 transposed.append(name)
 
-            if precision == "w8a16" and name in selected_initializer_names:
+            if precision == "w8a8" and name in selected_initializer_names:
+                # W8A8 + ConvRot streaming path. ConvRot rotates each
+                # weight row along in_features, so we must materialize
+                # ConvRot rotates each weight row along in_features, so we
+                # must materialize the full weight in memory before
+                # quantizing. Peak memory: one weight at a time
+                # (~50 MB for the largest DiT matmul: 6144 × 2048 × 4).
                 axis = w8_axes[name]
-                scale = _compute_w8_scale_streaming(source, source_dims, dims, is_transposed, axis, chunk_bytes) if source else None
+                # 1. Materialize the weight in ONNX storage layout (dims).
                 if source is not None:
-                    offset, length = _stream_w8_quantized(
-                        source,
-                        source_dims,
-                        dims,
-                        is_transposed,
-                        axis,
-                        scale,
-                        data_path,
-                        data_out,
-                        chunk_bytes,
-                    )
+                    src_arr = _read_f32_source_array(source)  # shape == source_dims
+                    if is_transposed:
+                        arr = np.ascontiguousarray(src_arr.T)  # → ONNX layout
+                    else:
+                        arr = np.ascontiguousarray(src_arr)
                 elif derived_array is not None:
-                    q, scale = _quantize_symmetric_int8_per_channel(derived_array, axis)
-                    offset, length = _write_numpy_external(data_out, q)
+                    arr = np.ascontiguousarray(derived_array, dtype=np.float32)
                 else:
                     param = wrapper_tensors[name].detach().cpu().contiguous()
                     arr = param.numpy().T if is_transposed else param.numpy()
-                    q, scale = _quantize_symmetric_int8_per_channel(arr, axis)
-                    offset, length = _write_numpy_external(data_out, q)
+                    arr = np.ascontiguousarray(arr, dtype=np.float32)
                     fallback += 1
-                added_initializers.append(_external_initializer(name, TensorProto.INT8, dims, data_location, offset, length))
-
-                scale_name = f"{name}.w8_scale"
-                zero_name = f"{name}.w8_zero_point"
-                scale_offset, scale_length = _write_numpy_external(data_out, np.ascontiguousarray(scale, dtype=np.float16))
-                zero = np.zeros((dims[axis],), dtype=np.int8)
-                zero_offset, zero_length = _write_numpy_external(data_out, zero)
+                # 2. Apply ConvRot rotation + per-output-channel INT8 quant.
+                q_int8, scale_fp32, rotated = _quantize_w8a8_weight_array(
+                    arr, axis=axis, group_size=w8a8_group_size, H=_w8a8_H_np
+                )
+                w8a8_rotated_by_name[name] = rotated
+                # 3. Write the INT8 weight to external data.
+                offset, length = _write_numpy_external(data_out, q_int8)
                 added_initializers.append(
-                    _external_initializer(scale_name, TensorProto.FLOAT16, [dims[axis]], data_location, scale_offset, scale_length)
+                    _external_initializer(name, TensorProto.INT8, list(q_int8.shape), data_location, offset, length)
+                )
+                # 4. Write the FP32 per-output-channel scale.
+                scale_name = f"{name}.w8a8_scale"
+                scale_offset, scale_length = _write_numpy_external(
+                    data_out, np.ascontiguousarray(scale_fp32, dtype=np.float32)
                 )
                 added_initializers.append(
-                    _external_initializer(zero_name, TensorProto.INT8, [dims[axis]], data_location, zero_offset, zero_length)
+                    _external_initializer(
+                        scale_name,
+                        TensorProto.FLOAT,
+                        [int(q_int8.shape[0])],
+                        data_location,
+                        scale_offset,
+                        scale_length,
+                    )
                 )
                 scale_names[name] = scale_name
-                zero_point_names[name] = zero_name
                 quantized_to_int8.append(name)
                 streamed_int8 += 1
                 continue
@@ -1384,24 +1354,49 @@ def _externalize_initializers_from_safetensors(
                 fallback += 1
             added_initializers.append(_external_initializer(name, TensorProto.FLOAT, dims, data_location, offset, length))
 
+    # Write the shared ConvRot H matrix to the external data file. We re-open
+    # the file in append mode and seek to end before recording the offset,
+    # because Python's "ab" mode initializes the file position to 0 even
+    # though writes go to the end. The H matrix is small (256×256×4 B =
+    # 256 KB at the default group size) so this is cheap.
+    if precision == "w8a8" and _w8a8_H_np is not None and w8a8_h_name:
+        with open(data_path, "ab") as h_data_out:
+            h_data_out.seek(0, os.SEEK_END)
+            h_offset = h_data_out.tell()
+            h_arr = np.ascontiguousarray(_w8a8_H_np, dtype=np.float32)
+            h_data_out.write(memoryview(h_arr).cast("B"))
+            h_length = int(h_arr.nbytes)
+        added_initializers.append(
+            _external_initializer(
+                w8a8_h_name,
+                TensorProto.FLOAT,
+                list(_w8a8_H_np.shape),
+                data_location,
+                h_offset,
+                h_length,
+            )
+        )
+
     del model_proto.graph.initializer[:]
     model_proto.graph.initializer.extend(added_initializers)
 
     rewrite_report = {}
     if precision == "q8map-fp16":
         rewrite_report = _rewrite_fp16_weight_ops(model_proto, set(downcast_to_fp16))
-    elif precision == "w8a16":
+    elif precision == "w8a8":
         quant_report = {
             "quantized": sorted(quantized_to_int8),
             "missing": [],
             "skipped": [],
             "scale_names": scale_names,
-            "zero_point_names": zero_point_names,
-            "axis_by_name": {name: int(w8_axes[name]) for name in quantized_to_int8},
+            "axis_by_name": {name: 0 for name in quantized_to_int8},
+            "rotated_by_name": dict(w8a8_rotated_by_name),
+            "convrot_group_size": int(w8a8_group_size) if w8a8_group_size is not None else 0,
+            "convrot_h_name": w8a8_h_name or "",
         }
-        rewrite_report = _rewrite_w8a16_weight_ops(model_proto, quant_report)
+        rewrite_report = _w8a8_rewrite_dispatch(model_proto, quant_report)
         if not rewrite_report.get("rewritten_nodes"):
-            raise SystemExit("W8A16 quantized weights but rewrote zero MatMul/Gemm nodes")
+            raise SystemExit("W8A8 quantized weights but rewrote zero MatMul/Gemm nodes")
 
     sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model_proto)
     if sequence_rewrite_report["split_to_sequence_rewritten"]:
@@ -1420,6 +1415,11 @@ def _externalize_initializers_from_safetensors(
     onnx.save(model_proto, output_path)
     onnx.checker.check_model(output_path)
     artifact_report = _validate_external_data_artifacts(output_path)
+    w8a8_axes_param = (
+        {name: int(w8_axes[name]) for name in quantized_to_int8}
+        if precision == "w8a8"
+        else None
+    )
     precision_report = _write_low_memory_precision_manifest(
         output_path,
         wrapper,
@@ -1427,7 +1427,10 @@ def _externalize_initializers_from_safetensors(
         downcast_to_fp16,
         quantized_to_int8,
         rewrite_report,
-        {name: int(w8_axes[name]) for name in quantized_to_int8} if precision == "w8a16" else None,
+        w8a8_axes_param,
+        w8a8_rotated_by_name=w8a8_rotated_by_name if precision == "w8a8" else None,
+        w8a8_group_size=w8a8_group_size,
+        w8a8_h_name=w8a8_h_name,
     )
 
     manifest = {
@@ -1611,21 +1614,169 @@ def _rewrite_fp16_weight_ops(model, fp16_initializer_names: set[str]) -> dict:
     return {"rewritten_nodes": rewritten}
 
 
-def _quantize_symmetric_int8_per_channel(arr, axis: int):
+# =============================================================================
+# W8A8 + ConvRot implementation
+# =============================================================================
+#
+# Implements the w8a8 + ConvRot path as a TensorRT custom plugin:
+#
+#   * Offline (weight):  W_rot = W @ H_block^T, then per-output-channel
+#                        symmetric INT8 quantization of W_rot. The rotation
+#                        spreads diffusion-model outliers across channels
+#                        inside each group, so per-channel scales no longer
+#                        get hoisted by a single huge magnitude.
+#
+#   * Online (activation): x_rot = x @ H_block inside the TensorRT
+#                          ConvRotInt8Linear plugin, followed by a per-row
+#                          dynamic INT8 quantizer.
+#
+#   * Compute:           ConvRotInt8Linear runs INT8 GEMM, dequantizes with
+#                        x_scale and W_scale, and adds bias when present.
+#
+# H_block is shared across every rotated site — it is built once via
+# convrot.build_hadamard(group_size) and stored as a single FP32 initializer.
+# This mirrors the ComfyUI-INT8-Fast reference, where the same H is reused
+# across all rotated Linear layers.
+#
+# ConvRot is skipped per-weight when in_features % group_size != 0; the w8a8
+# path still applies, just without the rotation benefit. This matches the
+# reference behavior and keeps the implementation robust to unusual Linear
+# shapes (e.g. head_dim-projection layers).
+
+
+def _detect_max_convrot_group_size() -> int:
+    """Return the default group_size for the fixed TRT ConvRot kernel.
+
+    The CUDA kernel applies the regular Hadamard as H4 Kronecker butterflies,
+    not by staging dense H in shared memory, so the PyTorch-reference group
+    size 256 is safe on Ampere-class GPUs.
+    """
+    return 256
+
+
+def _convrot_default_group_size() -> int:
+    """Resolve the ConvRot group size: env override → auto-detect → safe default."""
+    from convrot import CONVROT_GROUP_SIZE, is_valid_group_size
+
+    override = os.environ.get("HOTSTEP_CONVROT_GROUP_SIZE")
+    if not override:
+        # The fixed kernel no longer picks group size by shared-memory capacity.
+        detected = _detect_max_convrot_group_size()
+        if detected != CONVROT_GROUP_SIZE:
+            print(f"[export_dit] ConvRot group_size auto-detected: {detected} "
+                  f"(override with HOTSTEP_CONVROT_GROUP_SIZE)")
+        return detected
+    try:
+        value = int(override)
+    except ValueError as exc:
+        raise SystemExit(
+            f"HOTSTEP_CONVROT_GROUP_SIZE must be an integer power of 4, got {override!r}"
+        ) from exc
+
+    if not is_valid_group_size(value):
+        raise SystemExit(
+            f"HOTSTEP_CONVROT_GROUP_SIZE must be a power of 4 (4, 16, 64, 256, ...), got {value}"
+        )
+    if value not in {4, 16, 64, 256, 1024}:
+        raise SystemExit(
+            f"HOTSTEP_CONVROT_GROUP_SIZE {value} is not compiled into the TRT plugin; supported values are 4, 16, 64, 256, 1024"
+        )
+    return value
+
+
+def _emit_convrot_h_initializer(model, group_size: int, name: str) -> str:
+    """Add (or reuse) a single FP32 H initializer shared by all rotation sites.
+
+    Returns the initializer name so callers can reference it from their MatMul
+    nodes. Storing H once keeps the graph small (32 layers × 7 linears would
+    otherwise duplicate the same 256×256 matrix 224 times).
+    """
+    import numpy as np
+    from onnx import numpy_helper
+
+    for init in model.graph.initializer:
+        if init.name == name:
+            return name
+    from convrot import build_hadamard
+
+    H = build_hadamard(group_size).astype(np.float32)
+    model.graph.initializer.extend([numpy_helper.from_array(H, name=name)])
+    return name
+
+
+def _quantize_w8a8_weight_array(
+    arr: "np.ndarray",
+    axis: int,
+    group_size: int | None,
+    H: "np.ndarray | None",
+) -> tuple["np.ndarray", "np.ndarray", bool]:
+    """Apply ConvRot (if applicable) + per-axis symmetric INT8 quantization.
+
+    Args:
+        arr: 2D weight array. The ``axis`` parameter identifies which axis
+            holds the OUTPUT channel (the quantization axis). The OTHER axis
+            holds in_features and is the ConvRot rotation axis. Both
+            ``[out, in]`` (axis=0, PyTorch Linear convention) and
+            ``[in, out]`` (axis=1, ONNX MatMul / Gemm transB=1 convention)
+            layouts are supported.
+        axis: Quantization axis (the OUTPUT channel axis in ``arr``).
+        group_size: ConvRot group size, or None to skip rotation.
+        H: Precomputed Hadamard matrix of shape ``[group_size, group_size]``,
+            or None if no rotation.
+
+    Returns:
+        (q_int8, scale_fp32, rotated) where ``q_int8`` is canonical
+        ``[out_features, in_features]`` for the TensorRT plugin,
+        ``scale_fp32`` has one value per output channel, and ``rotated``
+        indicates whether ConvRot was applied.
+    """
     import numpy as np
 
-    arr_f32 = np.asarray(arr, dtype=np.float32)
-    reduce_axes = tuple(i for i in range(arr_f32.ndim) if i != axis)
-    max_abs = np.max(np.abs(arr_f32), axis=reduce_axes)
+    if arr.ndim != 2:
+        raise SystemExit(
+            f"W8A8 quantization currently supports 2D weights only, got {arr.shape}"
+        )
+    if axis not in (0, 1):
+        raise SystemExit(
+            f"W8A8 quantization axis must be 0 or 1, got {axis} for shape {arr.shape}"
+        )
+
+    # Work in canonical [out, in] layout internally so the rotation and
+    # per-output-channel scale logic is the same regardless of storage.
+    if axis == 0:
+        w_canonical = np.ascontiguousarray(arr, dtype=np.float32)
+    else:  # axis == 1, arr is [in, out]
+        w_canonical = np.ascontiguousarray(arr.T, dtype=np.float32)
+
+    rotated = False
+    if group_size is not None and H is not None and w_canonical.shape[1] % group_size == 0:
+        from convrot import rotate_weight
+
+        w_canonical = rotate_weight(w_canonical, H, group_size)
+        rotated = True
+
+    # Per-output-channel (axis 0 of canonical) symmetric INT8 quantization.
+    max_abs = np.max(np.abs(w_canonical), axis=1)
     scale = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
-    scale_shape = [1] * arr_f32.ndim
-    scale_shape[axis] = arr_f32.shape[axis]
-    q = np.rint(arr_f32 / scale.reshape(scale_shape))
-    q = np.clip(q, -127, 127).astype(np.int8)
-    return q, scale.astype(np.float16)
+    q_canonical = np.clip(
+        np.rint(w_canonical / scale.reshape(-1, 1)), -127, 127
+    ).astype(np.int8)
+
+    # The TensorRT plugin has a single layout contract: [out, in].
+    return np.ascontiguousarray(q_canonical), scale, rotated
 
 
-def _collect_w8a16_weight_axes(model, selected_names: set[str]) -> dict[str, int]:
+def _collect_w8a8_weight_axes(model, selected_names: set[str]) -> dict[str, int]:
+    """Collect the per-weight quantization axis (output channel) for each
+    selected initializer. Traces through Cast/Identity/Transpose producers
+    to recover the source axis even when the weight is stored transposed
+    (MatMul) or accessed via Gemm transB=1.
+
+    The axis is the OUTPUT channel axis of the original Linear weight
+    (axis 0 for canonical [out, in] layout, possibly transposed through
+    a Transpose node before the MatMul). We trace through Cast/Identity/
+    Transpose producers to recover the source axis.
+    """
     import onnx
 
     axes: dict[str, int] = {}
@@ -1634,7 +1785,8 @@ def _collect_w8a16_weight_axes(model, selected_names: set[str]) -> dict[str, int
         prev = axes.get(name)
         if prev is not None and prev != axis:
             raise SystemExit(
-                f"cannot assign two W8A16 quantization axes for {name}: {prev} vs {axis} at {node_name}"
+                f"cannot assign two W8A8 quantization axes for {name}: "
+                f"{prev} vs {axis} at {node_name}"
             )
         axes[name] = axis
 
@@ -1644,7 +1796,9 @@ def _collect_w8a16_weight_axes(model, selected_names: set[str]) -> dict[str, int
         node_name = node.name or (node.output[0] if node.output else node.op_type)
         if node.op_type == "MatMul":
             if len(node.input) != 2:
-                raise SystemExit(f"cannot W8A16-rewrite MatMul with unexpected arity: {node_name}")
+                raise SystemExit(
+                    f"cannot W8A8-rewrite MatMul with unexpected arity: {node_name}"
+                )
             traced = _trace_selected_source_axis(model, node.input[1], selected_names, 1)
             if traced is None:
                 continue
@@ -1653,9 +1807,13 @@ def _collect_w8a16_weight_axes(model, selected_names: set[str]) -> dict[str, int
             continue
         if node.op_type == "Gemm":
             if len(node.input) < 2:
-                raise SystemExit(f"cannot W8A16-rewrite Gemm with unexpected arity: {node_name}")
+                raise SystemExit(
+                    f"cannot W8A8-rewrite Gemm with unexpected arity: {node_name}"
+                )
             trans_b = int(_node_attr(onnx, node, "transB", 0))
-            traced = _trace_selected_source_axis(model, node.input[1], selected_names, 0 if trans_b else 1)
+            traced = _trace_selected_source_axis(
+                model, node.input[1], selected_names, 0 if trans_b else 1
+            )
             if traced is None:
                 continue
             weight_name, source_axis = traced
@@ -1663,17 +1821,46 @@ def _collect_w8a16_weight_axes(model, selected_names: set[str]) -> dict[str, int
     return axes
 
 
-def _quantize_w8a16_initializers(model, selected_names: set[str], axes: dict[str, int]) -> dict:
+def _quantize_w8a8_initializers_with_convrot(
+    model,
+    selected_names: set[str],
+    axes: dict[str, int],
+    group_size: int,
+) -> dict:
+    """Replace selected FP32 initializers with INT8 + FP32 scale, applying ConvRot.
+
+    The H initializer is added once (shared across all rotated sites) so the
+    activation rotation subgraph can reference the same constant. Per-weight
+    zero-points are skipped — symmetric quantization uses zero_point=0 by
+    construction, and the ConvRotInt8Linear plugin does not require an
+    explicit zero-point input.
+    """
     import numpy as np
-    from onnx import TensorProto, helper, numpy_helper
+    from onnx import TensorProto, numpy_helper
+
+    from convrot import build_hadamard, is_valid_group_size
+
+    if not is_valid_group_size(group_size):
+        raise SystemExit(
+            f"W8A8 ConvRot group_size must be a power of 4 (4, 16, 64, 256, ...), got {group_size}"
+        )
+    H_np = build_hadamard(group_size).astype(np.float32)
+
+    # Single shared H initializer for activation rotation. Stored as FP32 so
+    # both FP32 and FP16-typed activations can use it without an extra cast
+    # (we always cast activations to FP32 inside the quant subgraph).
+    H_name = "convrot.hadamard"
+    H_already_present = any(init.name == H_name for init in model.graph.initializer)
+    if not H_already_present:
+        model.graph.initializer.extend([numpy_helper.from_array(H_np, name=H_name)])
 
     initializers = {init.name: init for init in model.graph.initializer}
-    quantized = []
-    missing = []
-    skipped = []
+    quantized: list[str] = []
+    missing: list[str] = []
+    skipped: list[str] = []
     scale_names: dict[str, str] = {}
-    zero_point_names: dict[str, str] = {}
     axis_by_name: dict[str, int] = {}
+    rotated_by_name: dict[str, bool] = {}
 
     for name in sorted(selected_names):
         init = initializers.get(name)
@@ -1691,23 +1878,32 @@ def _quantize_w8a16_initializers(model, selected_names: set[str], axes: dict[str
         if axis < 0:
             axis += arr.ndim
         if axis < 0 or axis >= arr.ndim:
-            raise SystemExit(f"W8A16 axis {axis} is out of range for {name} shape {arr.shape}")
-        q, scale = _quantize_symmetric_int8_per_channel(arr, axis)
+            raise SystemExit(
+                f"W8A8 axis {axis} is out of range for {name} shape {arr.shape}"
+            )
+        # ConvRot rotates along in_features. For the canonical Linear layout
+        # [out, in], in_features is axis 1. If the ONNX initializer is stored
+        # transposed ([in, out]), we rotate along axis 0 instead. The
+        # _collect_w8a8_weight_axes trace already returns the axis that
+        # corresponds to the OUTPUT channel of the Linear (i.e. the
+        # quantization axis); the rotation axis is the OTHER one.
+        rotation_axis = 1 - axis if arr.ndim == 2 else None
+        local_group = group_size if (rotation_axis is not None and arr.shape[rotation_axis] % group_size == 0) else None
+        local_H = H_np if local_group is not None else None
+
+        q, scale, rotated = _quantize_w8a8_weight_array(arr, axis, local_group, local_H)
+
         init.CopyFrom(numpy_helper.from_array(q, name=name))
         init.data_type = TensorProto.INT8
 
-        scale_name = f"{name}.w8_scale"
-        zero_name = f"{name}.w8_zero_point"
-        zero = np.zeros(scale.shape, dtype=np.int8)
+        scale_name = f"{name}.w8a8_scale"
         model.graph.initializer.extend(
-            [
-                numpy_helper.from_array(scale, name=scale_name),
-                numpy_helper.from_array(zero, name=zero_name),
-            ]
+            [numpy_helper.from_array(scale.astype(np.float32), name=scale_name)]
         )
         scale_names[name] = scale_name
-        zero_point_names[name] = zero_name
-        axis_by_name[name] = axis
+        # Initializer has been canonicalized for the plugin: [out, in].
+        axis_by_name[name] = 0
+        rotated_by_name[name] = rotated
         quantized.append(name)
 
     return {
@@ -1715,160 +1911,243 @@ def _quantize_w8a16_initializers(model, selected_names: set[str], axes: dict[str
         "missing": missing,
         "skipped": skipped,
         "scale_names": scale_names,
-        "zero_point_names": zero_point_names,
         "axis_by_name": axis_by_name,
+        "rotated_by_name": rotated_by_name,
+        "convrot_group_size": group_size,
+        "convrot_h_name": H_name,
+        "convrot_applied": any(rotated_by_name.values()),
     }
 
 
-def _rewrite_w8a16_weight_ops(model, quant_report: dict) -> dict:
-    """Route selected INT8 weights through DQ-to-FP16 compute islands."""
+def _w8a8_rewrite_dispatch(model, quant_report: dict) -> dict:
+    """Emit the fused ``ConvRotInt8Linear`` custom op for every w8a8 site.
+
+    HOT-Step's w8a8 path is plugin-only: ONNX is the intermediate model
+    format that TensorRT parses and compiles into a serialized engine,
+    and the ConvRotInt8Linear op is registered as a TRT custom plugin
+    (see ``trt_plugins/`` and ``engine/src/plugins/``). The plugin
+    fuses the online activation rotation, per-row INT8 quantization,
+    INT8 × INT8 matmul, dequant, and bias add into a single GPU kernel
+    launch — a direct port of the ComfyUI-INT8-Fast Triton kernel.
+    """
+    return _rewrite_w8a8_weight_ops_with_plugin(model, quant_report)
+
+
+def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
+    """Replace MatMul/Gemm nodes with a single ConvRotInt8Linear custom op.
+
+    This is the only w8a8 path in production: ONNX is the intermediate
+    model format that TensorRT parses and compiles into a serialized
+    engine. The ``ConvRotInt8Linear`` op is registered as a TRT custom
+    plugin (see ``trt_plugins/`` and ``engine/src/plugins/``) that
+    fuses the online activation rotation, per-row INT8 quantization,
+    INT8 × INT8 matmul, dequant, and bias add into a single GPU kernel
+    launch — a direct port of the ComfyUI-INT8-Fast Triton kernel.
+
+    The emitted ONNX node has:
+      * domain: ``hotstep``
+      * op_type: ``ConvRotInt8Linear``
+      * inputs: [x, weight_q, weight_scale, H, (bias)]
+      * outputs: [y]
+      * attributes: group_size, in_features, out_features, has_bias
+
+    See ``trt_plugins/convrot_int8_plugin.py`` for the kernel
+    implementation and the NumPy reference used in unit tests.
+    """
     import onnx
     from onnx import TensorProto, helper
 
-    quantized_names = set(quant_report["quantized"])
-    scale_names = quant_report["scale_names"]
-    zero_point_names = quant_report["zero_point_names"]
-    axis_by_name = quant_report["axis_by_name"]
-    initializer_names = {init.name for init in model.graph.initializer}
-    rewritten = []
-    dq_outputs: dict[str, str] = {}
-    prelude_nodes = []
-    new_nodes = []
-
-    def dq_for_weight(weight_name: str) -> str:
-        existing = dq_outputs.get(weight_name)
-        if existing:
-            return existing
-        dq_name = f"{weight_name}.w8_dequant_fp16"
-        prelude_nodes.append(
-            helper.make_node(
-                "DequantizeLinear",
-                [weight_name, scale_names[weight_name], zero_point_names[weight_name]],
-                [dq_name],
-                name=f"{weight_name}/W8A16Dequantize",
-                axis=axis_by_name[weight_name],
-            )
+    # Lazy import — the plugin module depends on numpy only at import time.
+    try:
+        from trt_plugins import (
+            CONVROT_INT8_LINEAR_OP_NAME as _OP_NAME,
+            CONVROT_INT8_LINEAR_OP_NAMESPACE as _OP_NS,
+            make_convrot_int8_linear_onnx_node as _make_node,
         )
-        dq_outputs[weight_name] = dq_name
-        return dq_name
+    except ImportError as exc:
+        raise SystemExit(
+            "w8a8 plugin path requires the trt_plugins package "
+            f"(tools/onnx-export/trt_plugins/); import failed: {exc}"
+        ) from exc
 
-    for weight_name in sorted(quantized_names):
-        dq_for_weight(weight_name)
+    quantized_names = set(quant_report["quantized"])
+    axis_by_name = quant_report["axis_by_name"]
+    rotated_by_name = quant_report["rotated_by_name"]
+    group_size = quant_report["convrot_group_size"]
+    H_name = quant_report["convrot_h_name"]
 
-    def replace_quantized_source(ref: str) -> str:
-        if ref in quantized_names:
-            return dq_for_weight(ref)
-        return ref
+    # Ensure the custom op domain is registered on the model so onnx.checker
+    # doesn't reject the graph. The opset version matches the rest of the
+    # graph (18).
+    existing_domains = {d.domain for d in model.opset_import}
+    if _OP_NS not in existing_domains:
+        model.opset_import.extend([helper.make_opsetid(_OP_NS, 18)])
+
+    # Build a map: weight_name → in_features (K dim of the matmul).
+    initializer_index = {init.name: init for init in model.graph.initializer}
+    weight_in_features: dict[str, int] = {}
+    for name in quantized_names:
+        init = initializer_index.get(name)
+        if init is None or len(init.dims) != 2:
+            continue
+        axis = axis_by_name[name]
+        in_axis = 1 - axis
+        weight_in_features[name] = int(init.dims[in_axis])
+
+    # Build a producer index so we can detect the ``MatMul → Add(bias)``
+    # pattern (PyTorch's Linear export idiom). When the Add's bias input is
+    # a 1-D initializer matching out_features, we fold it into the custom op
+    # instead of leaving a dangling Add after the MatMul rewrite.
+    producer_by_output: dict[str, object] = {}
+    for n in model.graph.node:
+        for o in n.output:
+            if o:
+                producer_by_output[o] = n
+
+    # Consumers of each MatMul output — used to detect the bias-Add pattern.
+    consumers_of_output: dict[str, list] = {}
+    for n in model.graph.node:
+        for i in n.input:
+            if i:
+                consumers_of_output.setdefault(i, []).append(n)
+
+    rewritten = []
+    new_nodes: list = []
+    consumed_matmul_outputs: set[str] = set()
 
     for node in model.graph.node:
-        if node.op_type not in {"Gemm", "MatMul"}:
-            copied = helper.make_node(
-                node.op_type,
-                [replace_quantized_source(ref) for ref in node.input],
-                list(node.output),
-                name=node.name,
-                domain=node.domain,
-            )
-            copied.attribute.extend(node.attribute)
-            new_nodes.append(copied)
+        # Skip nodes whose output has already been consumed by a previous
+        # custom-op emission (e.g. the Add we folded into the MatMul's
+        # custom op).
+        if node.output and node.output[0] in consumed_matmul_outputs:
             continue
+
+        if node.op_type not in {"Gemm", "MatMul"}:
+            new_nodes.append(node)
+            continue
+
+        node_name = node.name or (node.output[0] if node.output else node.op_type)
+        out = node.output[0] if node.output else f"{node_name}/out"
 
         if node.op_type == "MatMul":
             if len(node.input) != 2 or len(node.output) != 1:
-                raise SystemExit(f"cannot W8A16-rewrite MatMul with unexpected arity: {node.name or node.output}")
+                raise SystemExit(
+                    f"cannot W8A8-plugin-rewrite MatMul with unexpected arity: {node_name}"
+                )
             weight_source = _trace_selected_source(model, node.input[1], quantized_names)
             if weight_source is None:
-                copied = helper.make_node(
-                    node.op_type,
-                    [replace_quantized_source(ref) for ref in node.input],
-                    list(node.output),
-                    name=node.name,
-                    domain=node.domain,
-                )
-                copied.attribute.extend(node.attribute)
-                new_nodes.append(copied)
+                new_nodes.append(node)
                 continue
-            out = node.output[0]
-            matmul_inputs = [replace_quantized_source(ref) for ref in node.input]
-            if matmul_inputs[0] not in initializer_names and _trace_selected_source(model, node.input[0], quantized_names) is None:
-                cast_name = f"{out}_input0_fp16"
-                new_nodes.append(
-                    helper.make_node(
-                        "Cast",
-                        [matmul_inputs[0]],
-                        [cast_name],
-                        name=f"{node.name or out}/CastInput0ToFP16",
-                        to=TensorProto.FLOAT16,
-                    )
-                )
-                matmul_inputs[0] = cast_name
-            fp16_out = f"{out}_fp16"
-            new_nodes.append(helper.make_node("MatMul", matmul_inputs, [fp16_out], name=node.name))
-            new_nodes.append(
-                helper.make_node(
-                    "Cast",
-                    [fp16_out],
-                    [out],
-                    name=f"{node.name or out}/CastOutputToFP32",
-                    to=TensorProto.FLOAT,
-                )
-            )
-            rewritten.append({"op_type": "MatMul", "node": node.name, "weights": [weight_source]})
-            continue
+            x_name = node.input[0]
+            bias_name = ""
+            has_bias = False
 
-        if node.op_type == "Gemm":
+            # Detect a trailing ``Add(matmul_out, bias)`` whose bias is a 1-D
+            # initializer with matching out_features. PyTorch dynamo emits
+            # Linear as MatMul + Add(bias) rather than a Gemm, so this is the
+            # common path for the DiT graph. We fold the Add into the custom
+            # op's bias input.
+            matmul_out = node.output[0]
+            matmul_consumers = consumers_of_output.get(matmul_out, [])
+            for consumer in matmul_consumers if len(matmul_consumers) == 1 else []:
+                if consumer.op_type != "Add" or len(consumer.input) != 2:
+                    continue
+                # One of the Add inputs is our MatMul output; the other must
+                # be a 1-D initializer (the bias).
+                other_input = (consumer.input[1] if consumer.input[0] == matmul_out
+                               else consumer.input[0])
+                bias_init = initializer_index.get(other_input)
+                if bias_init is None or len(bias_init.dims) != 1:
+                    continue
+                # out_features is the OTHER dim of the weight; check the bias
+                # length matches.
+                weight_axis = axis_by_name[weight_source]
+                expected_out_features = int(initializer_index[weight_source].dims[weight_axis])
+                if bias_init.dims[0] != expected_out_features:
+                    continue
+                # Fold: bias_name = other_input, has_bias = True, out = Add output
+                bias_name = other_input
+                has_bias = True
+                out = consumer.output[0]
+                consumed_matmul_outputs.add(consumer.output[0])
+                break
+        else:  # Gemm
             if len(node.input) < 2 or len(node.output) != 1:
-                raise SystemExit(f"cannot W8A16-rewrite Gemm with unexpected arity: {node.name or node.output}")
+                raise SystemExit(
+                    f"cannot W8A8-plugin-rewrite Gemm with unexpected arity: {node_name}"
+                )
             weight_source = _trace_selected_source(model, node.input[1], quantized_names)
             if weight_source is None:
-                copied = helper.make_node(
-                    node.op_type,
-                    [replace_quantized_source(ref) for ref in node.input],
-                    list(node.output),
-                    name=node.name,
-                    domain=node.domain,
-                )
-                copied.attribute.extend(node.attribute)
-                new_nodes.append(copied)
+                new_nodes.append(node)
                 continue
             alpha = float(_node_attr(onnx, node, "alpha", 1.0))
             beta = float(_node_attr(onnx, node, "beta", 1.0))
             trans_a = int(_node_attr(onnx, node, "transA", 0))
-            trans_b = int(_node_attr(onnx, node, "transB", 0))
             if alpha != 1.0 or beta != 1.0:
-                raise SystemExit(f"cannot W8A16-rewrite Gemm with alpha/beta != 1: {node.name or node.output}")
-
-            out = node.output[0]
-            a_name = replace_quantized_source(node.input[0])
-            b_name = replace_quantized_source(node.input[1])
-            c_name = node.input[2] if len(node.input) >= 3 and node.input[2] else ""
-            a_fp16 = f"{out}_a_fp16"
-            new_nodes.append(
-                helper.make_node("Cast", [a_name], [a_fp16], name=f"{node.name or out}/CastAToFP16", to=TensorProto.FLOAT16)
-            )
-            matmul_a = a_fp16
+                raise SystemExit(
+                    f"cannot W8A8-plugin-rewrite Gemm with alpha/beta != 1: {node_name}"
+                )
             if trans_a:
-                matmul_a = f"{out}_a_fp16_t"
-                new_nodes.append(helper.make_node("Transpose", [a_fp16], [matmul_a], name=f"{node.name or out}/TransposeA"))
-            matmul_b = b_name
-            if trans_b:
-                matmul_b = f"{out}_b_fp16_t"
-                new_nodes.append(helper.make_node("Transpose", [b_name], [matmul_b], name=f"{node.name or out}/TransposeB"))
-            fp16_out = f"{out}_fp16"
-            fp32_out = out if not c_name else f"{out}_fp32"
-            new_nodes.append(helper.make_node("MatMul", [matmul_a, matmul_b], [fp16_out], name=node.name))
-            new_nodes.append(
-                helper.make_node("Cast", [fp16_out], [fp32_out], name=f"{node.name or out}/CastOutputToFP32", to=TensorProto.FLOAT)
+                raise SystemExit(
+                    f"cannot W8A8-plugin-rewrite Gemm with transA != 0: {node_name}"
+                )
+            x_name = node.input[0]
+            bias_name = node.input[2] if len(node.input) >= 3 and node.input[2] else ""
+            has_bias = bool(bias_name)
+
+        in_features = weight_in_features.get(weight_source)
+        if in_features is None:
+            raise SystemExit(
+                f"W8A8 weight {weight_source} has no recorded in_features for {node_name}"
             )
-            if c_name:
-                new_nodes.append(helper.make_node("Add", [fp32_out, c_name], [out], name=f"{node.name or out}/AddBias"))
-            rewritten.append({"op_type": "Gemm", "node": node.name, "weights": [weight_source], "bias": c_name or None})
-            continue
+        # out_features is the OTHER dim of the weight.
+        weight_init = initializer_index[weight_source]
+        weight_axis = axis_by_name[weight_source]
+        out_features = int(weight_init.dims[weight_axis])
+
+        # The plugin only applies ConvRot when the weight was rotated offline.
+        # When ConvRot is skipped (in_features % group_size != 0), we still
+        # emit the custom op but pass group_size=0 as a sentinel — the plugin
+        # interprets this as "no rotation". (The H initializer is still
+        # referenced for graph-shape consistency but is a no-op at runtime.)
+        do_convrot = bool(rotated_by_name.get(weight_source, False)) and in_features % group_size == 0
+        plugin_group_size = int(group_size) if do_convrot else 0
+
+        custom_node = _make_node(
+            helper_module=helper,
+            tensor_proto_module=TensorProto,
+            x_name=x_name,
+            weight_q_name=weight_source,
+            weight_scale_name=quant_report["scale_names"][weight_source],
+            H_name=H_name,
+            bias_name=bias_name,
+            output_name=out,
+            node_name=f"{node_name}/ConvRotInt8Linear",
+            group_size=plugin_group_size,
+            in_features=in_features,
+            out_features=out_features,
+            has_bias=has_bias,
+        )
+        new_nodes.append(custom_node)
+        rewritten.append({
+            "op_type": node.op_type,
+            "node": node.name,
+            "weights": [weight_source],
+            "plugin": _OP_NAME,
+            "convrot_applied": do_convrot,
+        })
 
     del model.graph.node[:]
-    model.graph.node.extend(prelude_nodes)
     model.graph.node.extend(new_nodes)
-    return {"rewritten_nodes": rewritten, "dequantize_node_count": len(dq_outputs)}
+    return {
+        "rewritten_nodes": rewritten,
+        "plugin_op": _OP_NAME,
+        "plugin_namespace": _OP_NS,
+        "convrot_rotated_weights": sum(1 for v in rotated_by_name.values() if v),
+        "convrot_group_size": group_size,
+        "convrot_h_name": H_name,
+    }
+
 
 
 def _save_model_external(model, output_path: str) -> None:
@@ -1942,45 +2221,56 @@ def apply_precision_policy_to_onnx(output_path: str, wrapper: nn.Module, precisi
             report["rewrite"] = rewrite_report
         write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
         return report
-    if precision == "w8a16":
+
+    if precision == "w8a8":
+        # W8A8 + ConvRot: true INT8×INT8 matmul with per-row activation
+        # quantization and per-output-channel weight quantization. The weight
+        # is rotated offline by a regular Hadamard matrix (ConvRot) before
+        # quantization; the matching activation rotation is emitted as an
+        # ONNX subgraph so the runtime applies it online before the dynamic
+        # per-row INT8 quantizer. See convrot.py and the w8a8 helpers above
+        # for the full design.
         if not fp16_names:
-            raise SystemExit("hardcoded DiT W8A16 allowlist matched zero exported parameters")
+            raise SystemExit("hardcoded DiT W8A8 allowlist matched zero exported parameters")
         if unmatched_patterns:
             raise SystemExit(
-                "hardcoded DiT W8A16 allowlist pattern(s) matched zero exported parameters: "
+                "hardcoded DiT W8A8 allowlist pattern(s) matched zero exported parameters: "
                 + ", ".join(unmatched_patterns)
             )
 
+        group_size = _convrot_default_group_size()
         model = onnx.load(output_path)
         initializers = {init.name: init for init in model.graph.initializer}
         selected_initializer_names = {name for name in fp16_names if name in initializers}
         missing = sorted(set(fp16_names) - selected_initializer_names)
         if missing:
             raise SystemExit(
-                "hardcoded DiT W8A16 allowlist matched parameters missing from ONNX initializers: "
+                "hardcoded DiT W8A8 allowlist matched parameters missing from ONNX initializers: "
                 + ", ".join(missing[:12])
                 + (" ..." if len(missing) > 12 else "")
             )
-        axes = _collect_w8a16_weight_axes(model, selected_initializer_names)
-        quant_report = _quantize_w8a16_initializers(model, selected_initializer_names, axes)
+        axes = _collect_w8a8_weight_axes(model, selected_initializer_names)
+        quant_report = _quantize_w8a8_initializers_with_convrot(
+            model, selected_initializer_names, axes, group_size
+        )
         if quant_report["missing"]:
             raise SystemExit(
-                "hardcoded DiT W8A16 allowlist matched parameters missing from ONNX initializers: "
+                "hardcoded DiT W8A8 allowlist matched parameters missing from ONNX initializers: "
                 + ", ".join(quant_report["missing"][:12])
                 + (" ..." if len(quant_report["missing"]) > 12 else "")
             )
         if quant_report["skipped"]:
             raise SystemExit(
-                "hardcoded DiT W8A16 allowlist matched parameters that were not MatMul/Gemm weights: "
+                "hardcoded DiT W8A8 allowlist matched parameters that were not MatMul/Gemm weights: "
                 + ", ".join(quant_report["skipped"][:12])
                 + (" ..." if len(quant_report["skipped"]) > 12 else "")
             )
         if not quant_report["quantized"]:
-            raise SystemExit("hardcoded DiT W8A16 allowlist matched parameters but no ONNX initializers were quantized")
+            raise SystemExit("hardcoded DiT W8A8 allowlist matched parameters but no ONNX initializers were quantized")
 
-        rewrite_report = _rewrite_w8a16_weight_ops(model, quant_report)
+        rewrite_report = _w8a8_rewrite_dispatch(model, quant_report)
         if not rewrite_report["rewritten_nodes"]:
-            raise SystemExit("W8A16 quantized weights but rewrote zero MatMul/Gemm nodes")
+            raise SystemExit("W8A8 quantized weights but rewrote zero MatMul/Gemm nodes")
         sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model)
         if sequence_rewrite_report["split_to_sequence_rewritten"]:
             rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
@@ -1997,20 +2287,35 @@ def apply_precision_policy_to_onnx(output_path: str, wrapper: nn.Module, precisi
             "matched_allowlist": fp16_names,
             "downcast_to_fp16": [],
             "quantized_to_int8": quant_report["quantized"],
-            "dequantized_to_fp16": quant_report["quantized"],
-            "w8a16_axis_by_name": quant_report["axis_by_name"],
             "preserved_fp32": preserved_names,
             "missing_initializers": [],
             "rewrite": rewrite_report,
-            "weight_only_quantization": {
+            "weight_activation_quantization": {
                 "weight_dtype": "int8",
-                "activation_dtype": "fp16",
-                "scale_dtype": "fp16",
-                "zero_point_dtype": "int8",
-                "granularity": "per-output-channel",
+                "activation_dtype": "int8",
+                "compute_dtype": "fp32",
+                "weight_scale_dtype": "fp32",
+                "weight_scale_granularity": "per-output-channel",
+                "activation_scale_dtype": "fp32",
+                "activation_scale_granularity": "per-row",
                 "scheme": "symmetric",
                 "q_range": [-127, 127],
+                "matmul": "ConvRotInt8Linear",
             },
+            "convrot": {
+                "enabled": quant_report["convrot_applied"],
+                "group_size": group_size,
+                "hadamard_initializer": quant_report["convrot_h_name"],
+                "rotated_weights": [
+                    name for name in quant_report["quantized"]
+                    if quant_report["rotated_by_name"].get(name, False)
+                ],
+                "skipped_weights": [
+                    name for name in quant_report["quantized"]
+                    if not quant_report["rotated_by_name"].get(name, False)
+                ],
+            },
+            "w8a8_axis_by_name": quant_report["axis_by_name"],
             **common_report,
         }
         write_json(Path(output_path).with_suffix(".precision-manifest.json"), report)
@@ -2194,10 +2499,12 @@ def load_dit_model(
         print(f"[export_dit] Warning: {len(unexpected)} unexpected keys")
     
     # Supported handoff policies keep the PyTorch export in FP32. q8map-fp16
-    # and w8a16 transform selected ONNX initializers after export according to
+    # and w8a8 transform selected ONNX initializers after export according to
     # the hardcoded Q8_0-equivalent map.
-    if precision not in {"q8map-fp16", "w8a16", "fp32"}:
-        raise ValueError(f"Unknown precision: {precision}. Use 'q8map-fp16', 'w8a16', or 'fp32'.")
+    if precision not in {"q8map-fp16", "w8a8", "fp32"}:
+        raise ValueError(
+            f"Unknown precision: {precision}. Use 'q8map-fp16', 'w8a8', or 'fp32'."
+        )
     if not low_memory_export:
         dit_model = dit_model.to(device=device, dtype=torch.float32)
     
@@ -2229,7 +2536,7 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
     """Export the DiT forward pass to ONNX."""
     device = next(dit_model.parameters()).device
     
-    if precision not in {"q8map-fp16", "w8a16", "fp32"}:
+    if precision not in {"q8map-fp16", "w8a8", "fp32"}:
         raise SystemExit(f"unknown precision policy: {precision}")
 
     # The hardcoded policy is applied to ONNX initializers after FP32 export.
@@ -2613,7 +2920,7 @@ def verify_onnx(onnx_path: str, dit_model, config, precision: str = "q8map-fp16"
     
     device = next(dit_model.parameters()).device
     
-    if precision not in {"q8map-fp16", "w8a16", "fp32"}:
+    if precision not in {"q8map-fp16", "w8a8", "fp32"}:
         raise SystemExit(f"unknown precision policy: {precision}")
 
     tensor_dtype = torch.float32
@@ -2670,8 +2977,8 @@ def main():
     parser.add_argument("--opset", type=int, default=18,
                         help="ONNX opset version (default: 18)")
     parser.add_argument("--precision", default="q8map-fp16",
-                        choices=["q8map-fp16", "w8a16", "fp32"],
-                        help="Precision recipe (default: q8map-fp16)")
+                        choices=["q8map-fp16", "w8a8", "fp32"],
+                        help="Precision recipe (default: q8map-fp16). 'w8a8' = INT8 weights + INT8 activations with ConvRot rotation.")
     parser.add_argument("--verify", action="store_true",
                         help="Verify ONNX output matches PyTorch")
     parser.add_argument("--device", default="cpu",
@@ -2682,9 +2989,17 @@ def main():
                         help="Use the legacy in-memory export path")
     parser.add_argument("--stream-chunk-mb", type=int, default=16,
                         help="Chunk size in MB for low-memory tensor streaming (default: 16)")
+    parser.add_argument("--convrot-group-size", type=int, default=None,
+                        help="ConvRot Hadamard group size for w8a8 (default: 256). "
+                             "Must be a power of 4 (4, 16, 64, 256, 1024). "
+                             "Overrides the HOTSTEP_CONVROT_GROUP_SIZE env var.")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-export even if the output ONNX already exists")
     args = parser.parse_args()
     if args.low_memory_export and args.verify:
         raise SystemExit("--verify runs PyTorch and ONNX inference and is not compatible with --low-memory-export")
+    if args.convrot_group_size is not None:
+        os.environ["HOTSTEP_CONVROT_GROUP_SIZE"] = str(args.convrot_group_size)
     
     # Default output path
     if args.output is None:
@@ -2695,6 +3010,11 @@ def main():
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    
+    # Skip if output already exists (resumable builds)
+    if not args.force and os.path.isfile(args.output):
+        print(f"[export_dit] Output already exists: {args.output} (use --force to re-export)")
+        return
     
     # Load model
     dit_model, config = load_dit_model(

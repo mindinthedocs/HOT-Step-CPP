@@ -10,12 +10,19 @@ import { ChevronDown, Check } from 'lucide-react';
 /** Detect model format from the raw model name/path.
  *  ONNX detection: .onnx extension OR known ONNX directory name patterns
  *  (the C++ registry registers ONNX subdirectories by directory name).
- *  TRT detection: TRT-bundle directory names (acestep-v15-2b-<variant>),
- *  the format the build-job API produces and the engine /props trt array reports. */
+ *  TRT detection: TRT-bundle directory names. Two patterns are recognized:
+ *    - ``trt-<sourceModel>-<precision>``      (current scheme; e.g. trt-acestep-v15-xl-sft-w8a8)
+ *    - ``acestep-v15-2b-<sourceModel>``        (legacy scheme; e.g. acestep-v15-2b-acestep-v15-xl-sft)
+ *  The legacy ``2b`` tag was misleading (XL is 4B, not 2B) and collided with
+ *  the LM size namespace, so new builds use the ``trt-`` prefix. Legacy
+ *  bundles keep loading after the rename. */
 export function getModelFormat(name: string): 'gguf' | 'safetensors' | 'onnx' | 'trt' {
-  // TRT bundles: built by the trt-bundle CLI, named acestep-v15-2b-<variant>
-  // (q8map-fp16 / w8a16 / fp32). Detected before the acestep-* safetensors
-  // fall-through so a built bundle gets the TRT badge, not ST.
+  // TRT bundles: current scheme `trt-<sourceModel>-<precision>`.
+  // Detected before the acestep-* safetensors fall-through so a built bundle
+  // gets the TRT badge, not ST.
+  if (/^trt-acestep-v15-/i.test(name)) return 'trt';
+  // Legacy TRT bundles: `acestep-v15-2b-<variant>`. Kept for backward compat
+  // so existing bundles built before the rename keep loading.
   if (/^acestep-v15-2b-/i.test(name)) return 'trt';
   if (/\.onnx$/i.test(name)) return 'onnx';
   if (/\.gguf$/i.test(name)) return 'gguf';

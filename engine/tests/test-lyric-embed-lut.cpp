@@ -60,7 +60,7 @@ static double cosine(const float * a, const float * b, size_t n) {
 
 int main(int argc, char ** argv) {
     const char * bin_path  = (argc > 1) ? argv[1]
-        : "../models/trt-bundles/acestep-v15-2b-q8map-fp16/embed_tokens.bin";
+        : "../models/trt-bundles/trt-acestep-v15-sft-q8map-fp16/embed_tokens.bin";
     const char * gguf_path = (argc > 2) ? argv[2]
         : "../models/Qwen3-Embedding-0.6B-Q8_0.gguf";
 

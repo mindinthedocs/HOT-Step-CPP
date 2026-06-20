@@ -39,7 +39,11 @@ struct TrtEngineMetadataCheck {
 };
 
 static const int TRT_ARTIFACT_NATIVE_PROFILE_MAX_BATCH = 2;
-static const int TRT_ARTIFACT_NATIVE_PROFILE_MAX_T = 8192;
+// max_T = 3000 = 120s × 25Hz (2-minute test profile for 6GB cards).
+// The DiT internally patchifies T→T/2 (12.5Hz), so the max internal sequence
+// length is 1500 tokens. For 10-minute songs (max_T=15000) use the
+// "full-10min" Python profile + rebuild — requires ≥8GB VRAM.
+static const int TRT_ARTIFACT_NATIVE_PROFILE_MAX_T = 3000;
 static const int TRT_ARTIFACT_NATIVE_PROFILE_MAX_ENC_S = 2048;
 
 static inline void trt_artifact_set_error(std::string * err, const std::string & msg) {
@@ -274,7 +278,7 @@ static inline bool trt_artifact_validate_precision_manifest(const std::string & 
         yyjson_doc_free(doc);
         return false;
     }
-    if (check.policy != "q8map-fp16" && check.policy != "w8a16" && check.policy != "fp32") {
+    if (check.policy != "q8map-fp16" && check.policy != "w8a8" && check.policy != "fp32") {
         yyjson_doc_free(doc);
         trt_artifact_set_error(err, "unsupported DiT precision policy: " + check.policy);
         return false;
@@ -341,7 +345,14 @@ static inline bool trt_artifact_validate_precision_manifest(const std::string & 
             yyjson_doc_free(doc);
             return false;
         }
-    } else if (check.policy == "w8a16") {
+    } else if (check.policy == "w8a8") {
+        // w8a8 + ConvRot: INT8 weights AND INT8 activations, fused by the
+        // ConvRotInt8Linear TRT plugin. Every matched matrix weight is
+        // quantized to INT8 with per-output-channel symmetric scale, and
+        // the rewrite emits a single ConvRotInt8Linear custom-op node per
+        // MatMul/Gemm site. The manifest must record convrot metadata
+        // (group_size, hadamard_initializer) so downstream consumers
+        // can verify the rotation group size.
         if (check.unmatched_pattern_count != 0) {
             yyjson_doc_free(doc);
             trt_artifact_set_error(err, "precision manifest reports unmatched allowlist patterns");
@@ -349,12 +360,12 @@ static inline bool trt_artifact_validate_precision_manifest(const std::string & 
         }
         if (check.matched_allowlist_count == 0 || check.quantized_to_int8_count == 0) {
             yyjson_doc_free(doc);
-            trt_artifact_set_error(err, "w8a16 precision manifest matched or quantized zero tensors");
+            trt_artifact_set_error(err, "w8a8 precision manifest matched or quantized zero tensors");
             return false;
         }
         if (check.downcast_to_fp16_count != 0) {
             yyjson_doc_free(doc);
-            trt_artifact_set_error(err, "w8a16 precision manifest unexpectedly contains downcast tensors");
+            trt_artifact_set_error(err, "w8a8 precision manifest unexpectedly contains downcast tensors");
             return false;
         }
         if (matched_set.size() != quantized_set.size() ||
@@ -367,6 +378,33 @@ static inline bool trt_artifact_validate_precision_manifest(const std::string & 
             if (quantized_set.find(name) == quantized_set.end()) {
                 yyjson_doc_free(doc);
                 trt_artifact_set_error(err, "precision manifest INT8 quantized set does not match allowlist set");
+                return false;
+            }
+        }
+        // convrot metadata block (group_size, hadamard_initializer name)
+        yyjson_val * convrot = yyjson_obj_get(root, "convrot");
+        if (!convrot || !yyjson_is_obj(convrot)) {
+            yyjson_doc_free(doc);
+            trt_artifact_set_error(err, "w8a8 precision manifest is missing the convrot metadata block");
+            return false;
+        }
+        yyjson_val * convrot_enabled = yyjson_obj_get(convrot, "enabled");
+        if (!convrot_enabled || !yyjson_is_bool(convrot_enabled)) {
+            yyjson_doc_free(doc);
+            trt_artifact_set_error(err, "w8a8 precision manifest convrot.enabled must be a boolean");
+            return false;
+        }
+        if (yyjson_get_bool(convrot_enabled)) {
+            yyjson_val * gs = yyjson_obj_get(convrot, "group_size");
+            if (!gs || !yyjson_is_num(gs)) {
+                yyjson_doc_free(doc);
+                trt_artifact_set_error(err, "w8a8 precision manifest convrot.group_size must be a number when ConvRot is enabled");
+                return false;
+            }
+            yyjson_val * h_name = yyjson_obj_get(convrot, "hadamard_initializer");
+            if (!h_name || !yyjson_is_str(h_name) || yyjson_get_len(h_name) == 0) {
+                yyjson_doc_free(doc);
+                trt_artifact_set_error(err, "w8a8 precision manifest convrot.hadamard_initializer must be a non-empty string when ConvRot is enabled");
                 return false;
             }
         }
@@ -648,10 +686,22 @@ static inline bool trt_artifact_validate_engine_metadata(const std::string & met
         trt_artifact_set_error(err, "engine metadata does not describe a strongly typed, graph-precision build");
         return false;
     }
-    if (!strip_plan || !refit_identical) {
+    // HOT-Step DiT engines embed weights directly in the serialized plan
+    // (no kSTRIP_PLAN) and are built with kREFIT_IDENTICAL so the runtime
+    // can later refit weights with zero inference penalty. The Python
+    // builder (build-trt-engine.py) and the Python validator
+    // (acestep_trt_common.validate_engine_metadata) enforce the same
+    // contract: strip_plan == false && refit_identical == true.
+    if (strip_plan) {
         if (primary_doc) yyjson_doc_free(primary_doc);
         yyjson_doc_free(doc);
-        trt_artifact_set_error(err, "engine metadata is missing strip-plan/refit-identical guarantees");
+        trt_artifact_set_error(err, "engine metadata reports a stripped plan; HOT-Step DiT engines must embed weights (strip_plan=false)");
+        return false;
+    }
+    if (!refit_identical) {
+        if (primary_doc) yyjson_doc_free(primary_doc);
+        yyjson_doc_free(doc);
+        trt_artifact_set_error(err, "engine metadata is missing the refit-identical guarantee (refit_identical=true required)");
         return false;
     }
     yyjson_val * shapes = yyjson_obj_get(root, "profile_shapes");
@@ -757,7 +807,7 @@ static inline bool trt_artifact_write_native_engine_metadata(const std::string &
             "  \"global_fp16_builder_flag\": false,\n"
             "  \"global_bf16_builder_flag\": false,\n"
             "  \"workspace_gb\": 4.0,\n"
-            "  \"strip_plan\": true,\n"
+            "  \"strip_plan\": false,\n"
             "  \"refit_identical\": true,\n"
             "  \"weight_streaming\": %s,\n"
             "  \"profile_shapes\": {\n"

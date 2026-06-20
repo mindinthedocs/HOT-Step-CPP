@@ -36,10 +36,10 @@ def _resolve_variant(variant: str) -> str:
 
 def _plan_from_args(args: argparse.Namespace) -> list[Step]:
     return build_plan(
-        _resolve_variant(args.variant), Path(args.output_dir),
-        Path(args.dit_dir), Path(args.text_encoder_dir),
+        _resolve_variant(args.variant), Path(args.output_dir).resolve(),
+        Path(args.dit_dir).resolve(), Path(args.text_encoder_dir).resolve(),
         source_model=args.source_model,
-        gguf_path=Path(args.gguf) if args.gguf else None,
+        gguf_path=Path(args.gguf).resolve() if args.gguf else None,
     )
 
 
@@ -91,7 +91,7 @@ def _cmd_info(args: argparse.Namespace) -> int:
 
 def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--variant", default=REGISTRY["dit"].default_precision,
-                   help="DiT precision recipe (q8map-fp16 | w8a16 | fp32)")
+                   help="DiT precision recipe (q8map-fp16 | w8a8 | fp32)")
     p.add_argument("--output-dir", required=True, help="Bundle output directory")
     p.add_argument("--dit-dir", required=True, help="DiT source safetensors directory")
     p.add_argument("--text-encoder-dir", required=True, help="Qwen3 text encoder source directory")

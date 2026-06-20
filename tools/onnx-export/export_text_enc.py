@@ -256,6 +256,8 @@ def main():
     parser.add_argument("--fp16", action="store_true",
                         help="Export the ONNX graph in FP16 (native half weights, "
                              "the strongly-typed TRT 11 encoder precision for sm_75)")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-export even if the output ONNX already exists")
     parser.add_argument("--low-memory-export", dest="low_memory_export", action="store_true", default=True,
                         help="Use low CPU memory loading and skip ONNX constant folding (default)")
     parser.add_argument("--no-low-memory-export", dest="low_memory_export", action="store_false",
@@ -270,6 +272,19 @@ def main():
     
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     output_dir = os.path.dirname(args.output)
+    
+    # Skip if output already exists (resumable builds).
+    # Check both the ONNX shell and the external data file: a crash mid-export
+    # can leave the shell written but the data file absent or truncated, which
+    # would cause a silent corrupt-model skip on the next run.
+    if not args.force:
+        onnx_path = Path(args.output)
+        data_path = Path(args.output + ".data")
+        shell_ok = onnx_path.is_file()
+        data_ok = (not data_path.exists()) or (data_path.stat().st_size > 0)
+        if shell_ok and data_ok:
+            print(f"[export_text_enc] Output already exists: {args.output} (use --force to re-export)")
+            return
     
     # Load model
     export_dtype = torch.float16 if args.fp16 else torch.float32

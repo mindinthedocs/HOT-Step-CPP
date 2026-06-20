@@ -61,12 +61,15 @@ ENCODER_PROFILES: dict[str, dict[str, dict[str, tuple[int, ...]]]] = {
         "opt": {
             "text_hidden": (1, 128, 1024),
             "lyric_embed": (1, 256, 1024),
-            "timbre_feats": (1, 1, 64),
+            "timbre_feats": (1, 512, 64),
         },
         "max": {
+            # timbre_feats max matches DiT max_T (8192 frames @ 25fps ≈ 327s)
+            # so the reference audio can be as long as the song itself —
+            # the common case in song covers.
             "text_hidden": (1, 512, 1024),
             "lyric_embed": (1, 1024, 1024),
-            "timbre_feats": (1, 512, 64),
+            "timbre_feats": (1, 8192, 64),
         },
     },
 }
@@ -142,6 +145,25 @@ def collect_weight_names(network) -> list[str]:
     return names
 
 
+def _existing_encoder_engine_complete(out_dir: Path, stem: str) -> tuple[Path, Path, Path] | None:
+    """Return (engine_path, metadata_path, layers_path) if a complete encoder
+    build is already on disk; else None.
+
+    The encoder builder writes a fixed-name engine + metadata + layers next to
+    each other in --out-dir. All three must be present and non-empty to skip:
+    a zero-byte engine means a previous build was interrupted and would
+    silently produce a corrupt-model skip on the next run.
+    """
+    engine_path = out_dir / f"{stem}.engine"
+    metadata_path = out_dir / f"{stem}.engine.metadata.json"
+    layers_path = out_dir / f"{stem}.layers.json"
+    if not (engine_path.is_file() and metadata_path.is_file() and layers_path.is_file()):
+        return None
+    if engine_path.stat().st_size == 0 or metadata_path.stat().st_size == 0:
+        return None
+    return engine_path, metadata_path, layers_path
+
+
 def build_engine(args) -> tuple[Path, Path, Path]:
     onnx_path = Path(args.onnx)
     if not onnx_path.is_file():
@@ -149,6 +171,25 @@ def build_engine(args) -> tuple[Path, Path, Path]:
     module = args.module
     if module not in ENCODER_PROFILES:
         raise SystemExit(f"Unknown encoder module {module!r}; choices: {sorted(ENCODER_PROFILES)}")
+
+    out_dir = Path(args.out_dir)
+    stem = args.engine_stem or ("text_encoder" if module == "text-enc" else "cond_encoder")
+
+    # Resumable build: skip the (multi-minute) TRT compilation when a complete
+    # engine + metadata + layers triple is already on disk. The orchestrator
+    # (trt_bundle_manager) checks Step.outputs at its level; this in-script
+    # gate makes the script safe to invoke directly without recompiling.
+    # --force overrides so a user can rebuild after a corrupt engine.
+    if not args.force:
+        existing = _existing_encoder_engine_complete(out_dir, stem)
+        if existing is not None:
+            engine_path, metadata_path, layers_path = existing
+            print(f"[build_encoder_trt] Skipping: existing {module} engine found:")
+            print(f"[build_encoder_trt]   engine:   {engine_path} ({engine_path.stat().st_size:,} bytes)")
+            print(f"[build_encoder_trt]   metadata: {metadata_path}")
+            print(f"[build_encoder_trt]   layers:   {layers_path}")
+            print(f"[build_encoder_trt] Use --force to rebuild.")
+            return engine_path, metadata_path, layers_path
 
     trt = import_or_die("tensorrt", "TensorRT 11")
     check_trt_major(trt)
@@ -175,9 +216,7 @@ def build_engine(args) -> tuple[Path, Path, Path]:
     if serialized is None:
         raise SystemExit("TensorRT failed to build a serialized engine.")
 
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.engine_stem or ("text_encoder" if module == "text-enc" else "cond_encoder")
     engine_path = out_dir / f"{stem}.engine"
     metadata_path = out_dir / f"{stem}.engine.metadata.json"
     layers_path = out_dir / f"{stem}.layers.json"
@@ -253,6 +292,9 @@ def main() -> int:
     parser.add_argument("--workspace-gb", type=float, default=2.0)
     parser.add_argument("--builder-optimization-level", type=int, default=3,
                         choices=range(0, 6), metavar="{0..5}")
+    parser.add_argument("--force", action="store_true", default=False,
+                        help="Rebuild even if a complete engine + metadata + "
+                             "layers triple already exists on disk (default: skip).")
     args = parser.parse_args()
 
     engine_path, metadata_path, layers_path = build_engine(args)

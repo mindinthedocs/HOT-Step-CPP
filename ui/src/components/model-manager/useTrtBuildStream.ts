@@ -67,8 +67,14 @@ export function useTrtBuildStream(opts?: UseTrtBuildStreamOptions) {
   /** Start a build and begin streaming its progress. Surfaces 409/errors to the caller. */
   const startBuild = useCallback(async (variant: string, precision?: string) => {
     const { jobId } = await trtBundleApi.build(variant, precision);
+    // Bundle directory naming mirrors the server's TrtBundleService.bundleNameFor:
+    // ``trt-<sourceModel>-<precision>``. The legacy ``acestep-v15-2b-<variant>``
+    // scheme was dropped because the hardcoded ``2b`` was misleading (XL is 4B,
+    // not 2B) and collided with the LM size namespace. The legacy pattern is
+    // still recognized by ModelSelect.tsx / modelLabels.ts for existing bundles.
+    const p = precision ?? 'q8map-fp16';
     setJob({
-      jobId, variant, bundleName: `acestep-v15-2b-${variant}`,
+      jobId, variant, bundleName: `trt-${variant}-${p}`,
       status: 'running', progress: 0, step: 'starting', lines: [],
     });
     setActiveJobId(jobId);

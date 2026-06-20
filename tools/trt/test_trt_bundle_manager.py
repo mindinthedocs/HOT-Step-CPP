@@ -40,7 +40,7 @@ class RegistryTests(unittest.TestCase):
 
     def test_dit_precision_recipes(self) -> None:
         dit = tbm.REGISTRY["dit"]
-        self.assertEqual(dit.precision_options, ("q8map-fp16", "w8a16", "fp32"))
+        self.assertEqual(dit.precision_options, ("q8map-fp16", "w8a8", "fp32"))
         self.assertEqual(dit.default_precision, "q8map-fp16")
 
     def test_encoders_are_fp16(self) -> None:
@@ -113,6 +113,20 @@ class PlanOrderTests(unittest.TestCase):
         cmd = steps["export-text_enc"].command
         assert cmd is not None
         self.assertNotIn("--dit-dir", cmd)
+        self.assertIn("--fp16", cmd)
+
+    def test_cond_enc_export_passes_fp16(self) -> None:
+        # cond_enc must be exported as FP16: build_encoder_trt.py builds a
+        # strongly-typed engine, so the ONNX graph dtypes propagate to the
+        # engine IO tensors. The C++ cond-enc runtime (engine/src/cond-enc-trt.h)
+        # validates text_hidden/lyric_embed/timbre_feats as kHALF inputs and
+        # enc_hidden as a kHALF output — an FP32 ONNX would fail that contract
+        # at runtime with "text_hidden has unexpected mode/dtype".
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            steps = {s.name: s for s in _plan(Path(d))}
+        cmd = steps["export-cond_enc"].command
+        assert cmd is not None
         self.assertIn("--fp16", cmd)
 
     def test_dit_engine_in_outputs(self) -> None:

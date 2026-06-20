@@ -33,7 +33,7 @@ export const ModelsDropdown: React.FC = () => {
         const names = r.bundles.flatMap((b) => {
           const out: string[] = [];
           if (b.engines['q8map-fp16'] && b.bundleNames?.['q8map-fp16']) out.push(b.bundleNames['q8map-fp16']);
-          if (b.engines.w8a16 && b.bundleNames?.w8a16) out.push(b.bundleNames.w8a16);
+          if (b.engines.w8a8 && b.bundleNames?.w8a8) out.push(b.bundleNames.w8a8);
           return out;
         });
         setTrtBundles(names);

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import os
 import sys
 import threading
 import time
@@ -16,7 +16,6 @@ from acestep_trt_common import (
     TRT_VERSION_REQUIRED_MAJOR,
     TRT_PROFILES,
     check_trt_major,
-    default_engine_stem,
     profile_shapes,
     validate_dit_precision_manifest,
     validate_engine_metadata,
@@ -183,57 +182,54 @@ def attach_progress_monitor(trt, config) -> None:
         print(f"[TRT Build] Could not attach progress monitor: {exc}")
 
 
-def write_runtime_aliases(
-    args,
-    onnx_path: Path,
-    engine_path: Path,
-    layers_path: Path,
-    metadata_path: Path,
-    metadata_payload: dict,
-) -> tuple[Path, Path] | None:
-    if not args.runtime_alias:
-        return None
+def _existing_dit_engine_complete(onnx_path: Path, precision_policy: str) -> bool:
+    """Return True when a previously-completed DiT build is still on disk.
 
-    alias_engine = onnx_path.with_suffix(".engine")
-    alias_metadata = onnx_path.with_suffix(".engine.metadata.json")
-    alias_base = alias_metadata.parent
-    if alias_engine.resolve() != engine_path.resolve():
-        shutil.copyfile(engine_path, alias_engine)
-
-    write_json(
-        alias_metadata,
-        {
-            "runtime_engine_alias": relative_path(alias_engine, alias_base),
-            "primary_engine": relative_path(engine_path, alias_base),
-            "primary_layers": relative_path(layers_path, alias_base),
-            "primary_metadata": relative_path(metadata_path, alias_base),
-            "onnx": relative_path(onnx_path, alias_base),
-            "note": "HOT-Step runtime looks for this alias next to the DiT ONNX.",
-            "profile": metadata_payload["profile"],
-            "precision_policy": metadata_payload["precision_policy"],
-            "precision_manifest": precision_manifest_summary_for_base(
-                metadata_payload["precision_manifest"], onnx_path, alias_base),
-            "tensorrt_version": metadata_payload["tensorrt_version"],
-            "strongly_typed_network": metadata_payload["strongly_typed_network"],
-            "global_fp16_builder_flag": metadata_payload["global_fp16_builder_flag"],
-            "global_bf16_builder_flag": metadata_payload["global_bf16_builder_flag"],
-            "workspace_gb": metadata_payload["workspace_gb"],
-            "builder_optimization_level": metadata_payload["builder_optimization_level"],
-            "strip_plan": metadata_payload["strip_plan"],
-            "refit_identical": metadata_payload["refit_identical"],
-            "weight_streaming": metadata_payload["weight_streaming"],
-            "profile_shapes": metadata_payload["profile_shapes"],
-        },
-    )
-    return alias_engine, alias_metadata
+    The build writes the engine directly next to the ONNX as
+    ``<onnx-stem>.engine`` + ``<onnx-stem>.engine.metadata.json``.
+    Both must be present and non-empty to skip; a zero-byte engine means
+    a previous build was interrupted and would silently produce a corrupt-
+    model skip on the next run.
+    """
+    engine_path = onnx_path.with_suffix(".engine")
+    metadata_path = onnx_path.with_suffix(".engine.metadata.json")
+    if not (engine_path.is_file() and metadata_path.is_file()):
+        return False
+    if engine_path.stat().st_size == 0 or metadata_path.stat().st_size == 0:
+        return False
+    # Sanity-check the metadata's precision_policy matches what we'd build.
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        return payload.get("precision_policy") == precision_policy
+    except Exception:
+        return False
 
 
-def build_engine(args) -> tuple[Path, Path, Path, tuple[Path, Path] | None]:
+def build_engine(args) -> tuple[Path, Path, Path]:
     onnx_path = Path(args.onnx)
     if not onnx_path.is_file():
         raise SystemExit(f"ONNX file not found: {onnx_path}")
-    if args.precision_policy not in {"q8map-fp16", "w8a16", "fp32"}:
+    if args.precision_policy not in {"q8map-fp16", "w8a8", "fp32"}:
         raise SystemExit(f"Unsupported precision policy: {args.precision_policy}")
+
+    # The engine, metadata, and layers are written directly next to the ONNX
+    # file as <onnx-stem>.engine, <onnx-stem>.engine.metadata.json, and
+    # <onnx-stem>.layers.json. This is the single source of truth — no
+    # engines/ subdirectory, no version-stemmed filename, no runtime alias,
+    # no copy/link. The C++ runtime derives the engine path the same way
+    # (onnx_path with .onnx → .engine) and reads it directly.
+    engine_path   = onnx_path.with_suffix(".engine")
+    metadata_path = onnx_path.with_suffix(".engine.metadata.json")
+    layers_path   = onnx_path.with_suffix(".layers.json")
+
+    # Resumable build: if a complete engine + metadata already exist on disk,
+    # skip the (potentially multi-hour) TRT compilation. --force overrides.
+    if not args.force and _existing_dit_engine_complete(onnx_path, args.precision_policy):
+        print(f"[TRT Build] Skipping: existing DiT engine found: {engine_path}")
+        print(f"[TRT Build]   metadata: {metadata_path}")
+        print(f"[TRT Build] Use --force to rebuild.")
+        return engine_path, layers_path, metadata_path
+
     precision_manifest_summary = validate_dit_precision_manifest(onnx_path, args.precision_policy)
     if args.strip_plan:
         print("[TRT Build] WARNING: --strip-plan is deprecated and ignored. Engines now embed weights.")
@@ -242,6 +238,30 @@ def build_engine(args) -> tuple[Path, Path, Path, tuple[Path, Path] | None]:
 
     trt = import_or_die("tensorrt", "TensorRT 11")
     check_trt_major(trt)
+
+    # Register HOT-Step custom ops (ConvRotInt8Linear) with TRT's plugin
+    # registry before parsing the ONNX graph. w8a8 engines are built from
+    # ONNX graphs that use the ``hotstep::ConvRotInt8Linear`` custom op;
+    # without this registration the ONNX parser fails at the first
+    # custom-op node. q8map-fp16 and fp32 engines don't use the plugin.
+    if args.precision_policy == "w8a8":
+        try:
+            from trt_plugins import register_plugins, is_registered, CONVROT_INT8_LINEAR_OP_NAME
+        except ImportError as exc:
+            raise SystemExit(
+                f"w8a8 engine build requires the trt_plugins package "
+                f"(tools/onnx-export/trt_plugins/); import failed: {exc}"
+            ) from exc
+        if not is_registered():
+            ok = register_plugins()
+            if not ok:
+                raise SystemExit(
+                    "trt_plugins.register_plugins() failed — the hotstep_plugins "
+                    "C++ shared library (.dll/.so) could not be loaded. "
+                    "Build it first (engine/buildcuda.cmd) and ensure it's on "
+                    "PATH or in engine/build/ or engine/buildcuda/."
+                )
+        print(f"[TRT Build] Registered HOT-Step plugin: {CONVROT_INT8_LINEAR_OP_NAME}")
 
     logger = trt.Logger(trt.Logger.VERBOSE)
     builder = trt.Builder(logger)
@@ -265,8 +285,12 @@ def build_engine(args) -> tuple[Path, Path, Path, tuple[Path, Path] | None]:
     attach_progress_monitor(trt, config)
 
     # ── Persistent timing cache ───────────────────────────────────────────────
-    out_dir = Path(args.out_dir)
-    cache_path = Path(args.timing_cache) if args.timing_cache else out_dir / "trt_timing.cache"
+    # Default cache location: next to the ONNX file as <onnx-stem>.timing.cache.
+    # This keeps all build artifacts co-located with the source ONNX.
+    if args.timing_cache:
+        cache_path = Path(args.timing_cache)
+    else:
+        cache_path = onnx_path.with_suffix(".timing.cache")
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     if cache_path.is_file():
         cache_data = cache_path.read_bytes()
@@ -309,11 +333,10 @@ def build_engine(args) -> tuple[Path, Path, Path, tuple[Path, Path] | None]:
     if serialized is None:
         raise SystemExit("TensorRT failed to build a serialized engine.")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.engine_stem or default_engine_stem(args.profile, args.precision_policy, trt_version_string(trt))
-    engine_path = out_dir / f"{stem}.engine"
-    layers_path = out_dir / f"{stem}.layers.json"
-    metadata_path = out_dir / f"{stem}.metadata.json"
+    # Write engine, layers, and metadata directly next to the ONNX file.
+    # engine_path / metadata_path / layers_path were already derived at the
+    # top of build_engine() from onnx_path.with_suffix(".engine") etc.
+    engine_path.parent.mkdir(parents=True, exist_ok=True)
     metadata_base = metadata_path.parent
 
     engine_path.write_bytes(bytes(serialized))
@@ -338,7 +361,6 @@ def build_engine(args) -> tuple[Path, Path, Path, tuple[Path, Path] | None]:
     metadata_payload = {
         "onnx": relative_path(onnx_path, metadata_base),
         "engine": relative_path(engine_path, metadata_base),
-        "runtime_engine_alias": relative_path(onnx_path.with_suffix(".engine"), metadata_base) if args.runtime_alias else "",
         "profile": args.profile,
         "precision_policy": args.precision_policy,
         "precision_manifest": precision_manifest_summary_for_base(precision_manifest_summary, onnx_path, metadata_base),
@@ -357,20 +379,17 @@ def build_engine(args) -> tuple[Path, Path, Path, tuple[Path, Path] | None]:
     write_json(metadata_path, metadata_payload)
     validate_engine_metadata(metadata_path, args.precision_policy, TRT_VERSION_REQUIRED_MAJOR)
 
-    runtime_alias = write_runtime_aliases(args, onnx_path, engine_path, layers_path, metadata_path, metadata_payload)
-    if runtime_alias:
-        validate_engine_metadata(runtime_alias[1], args.precision_policy, TRT_VERSION_REQUIRED_MAJOR)
-    return engine_path, layers_path, metadata_path, runtime_alias
+    return engine_path, layers_path, metadata_path
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--onnx", required=True)
     parser.add_argument("--profile", default="default", choices=sorted(TRT_PROFILES.keys()))
-    parser.add_argument("--out-dir", default="engines")
-    parser.add_argument("--precision-policy", choices=["q8map-fp16", "w8a16", "fp32"], default="q8map-fp16")
-    parser.add_argument("--workspace-gb", type=float, default=1.0)
-    parser.add_argument("--builder-optimization-level", type=int, default=0, choices=range(0, 6), metavar="{0..5}")
+    parser.add_argument("--precision-policy", choices=["q8map-fp16", "w8a8", "fp32"], default="q8map-fp16")
+    parser.add_argument("--workspace-gb", type=float, default=2,
+                        help="Workspace size in GB (default: 4.6). w8a8 DiT builds need ~5GB.")
+    parser.add_argument("--builder-optimization-level", type=int, default=5, choices=range(0, 6), metavar="{0..5}")
     parser.add_argument("--strip-plan", action="store_true", default=False,
                         help="(Deprecated, ignored) Engines now always embed weights.")
     parser.add_argument("--no-strip-plan", action="store_false", dest="strip_plan")
@@ -378,27 +397,21 @@ def main() -> int:
     parser.add_argument("--no-refit-identical", action="store_false", dest="refit_identical")
     parser.set_defaults(weight_streaming=True)
     parser.add_argument("--weight-streaming", action="store_true", dest="weight_streaming",
-                        help="Build with kWEIGHT_STREAMING to avoid OOM during engine compilation (default). "
-                             "At runtime, budget is set to full engine size so all weights are in VRAM.")
+                        help="Build with kWEIGHT_STREAMING to avoid OOM during engine compilation (default).")
     parser.add_argument("--no-weight-streaming", action="store_false", dest="weight_streaming",
                         help="Build without TensorRT weight streaming (may OOM on large models).")
     parser.add_argument("--timing-cache", default="",
                         help="Path to persistent TRT timing cache file. "
-                             "Default: <out-dir>/trt_timing.cache. "
+                             "Default: <onnx-stem>.timing.cache next to the ONNX. "
                              "Shared across builds on the same GPU/driver.")
-    parser.add_argument("--engine-stem", default="")
-    parser.add_argument("--runtime-alias", action="store_true", default=True,
-                        help="Also write <onnx-stem>.engine for the C++ runtime transparent lookup.")
-    parser.add_argument("--no-runtime-alias", action="store_false", dest="runtime_alias")
+    parser.add_argument("--force", action="store_true", default=False,
+                        help="Rebuild even if the engine + metadata already exist on disk (default: skip).")
     args = parser.parse_args()
 
-    engine_path, layers_path, metadata_path, runtime_alias = build_engine(args)
+    engine_path, layers_path, metadata_path = build_engine(args)
     print(f"engine: {engine_path}")
     print(f"layers: {layers_path}")
     print(f"metadata: {metadata_path}")
-    if runtime_alias:
-        print(f"runtime_engine_alias: {runtime_alias[0]}")
-        print(f"runtime_alias_metadata: {runtime_alias[1]}")
     return 0
 
 

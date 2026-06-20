@@ -54,15 +54,75 @@ def safetensors_is_bf16(model_path: Path) -> bool:
     return False
 
 
-def ensure_f32_dit(src_dir: Path, staging_dir: Path) -> Path:
-    """Return a DiT source dir whose ``model.safetensors`` is F32.
+def _shard_paths(src_dir: Path) -> list[Path] | None:
+    """Return sorted list of sharded safetensors paths, or None if unsharded."""
+    index_path = src_dir / "model.safetensors.index.json"
+    if index_path.is_file():
+        import json
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        shard_names = sorted(set(index["weight_map"].values()))
+        return [src_dir / name for name in shard_names]
+    return None
 
-    If ``src_dir`` already holds F32 weights, it is returned unchanged. If the
-    weights are BF16, they are converted into ``staging_dir`` (with the config
-    and modeling files copied alongside) and ``staging_dir`` is returned. The
-    conversion is skipped when the staging weights already exist.
+
+def _convert_shard_bf16_to_f32(src_shard: Path, dst_shard: Path) -> int:
+    """Convert a single BF16 safetensors shard to F32. Returns tensor count."""
+    with safe_open(str(src_shard), framework="pt") as f:
+        metadata = f.metadata() or {}
+        tensors = {k: f.get_tensor(k).to(torch.float32).contiguous() for k in f.keys()}
+    save_file(tensors, str(dst_shard), metadata=metadata)
+    return len(tensors)
+
+
+def ensure_f32_dit(src_dir: Path, staging_dir: Path) -> Path:
+    """Return a DiT source dir whose safetensors are F32.
+
+    Handles both single-file (``model.safetensors``) and sharded
+    (``model-NNNNN-of-MMMMM.safetensors`` + ``model.safetensors.index.json``)
+    layouts. If ``src_dir`` already holds F32 weights, it is returned unchanged.
+    If the weights are BF16, they are converted into ``staging_dir`` (with the
+    config and modeling files copied alongside) and ``staging_dir`` is returned.
+    The conversion is skipped when the staging weights already exist.
     """
 
+    # Sharded model: model-00001-of-00004.safetensors + index JSON
+    shard_paths = _shard_paths(src_dir)
+    if shard_paths is not None:
+        # Check dtype from the first shard
+        if not safetensors_is_bf16(shard_paths[0]):
+            return src_dir
+
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        all_exist = all((staging_dir / p.name).is_file() for p in shard_paths)
+        if not all_exist:
+            total = 0
+            for i, src_shard in enumerate(shard_paths):
+                dst_shard = staging_dir / src_shard.name
+                if dst_shard.is_file():
+                    continue
+                n = _convert_shard_bf16_to_f32(src_shard, dst_shard)
+                total += n
+                print(f"[prepare-dit] BF16->F32 shard {i+1}/{len(shard_paths)}: "
+                      f"{src_shard.name} ({n} tensors)")
+            print(f"[prepare-dit] BF16->F32 total {total} tensors across {len(shard_paths)} shards")
+
+        # Copy the index JSON so downstream code can find the shards
+        src_index = src_dir / "model.safetensors.index.json"
+        dst_index = staging_dir / "model.safetensors.index.json"
+        if src_index.is_file() and not dst_index.is_file():
+            shutil.copy2(src_index, dst_index)
+            print(f"[prepare-dit] copied model.safetensors.index.json")
+
+        for name in _DIT_AUX_FILES:
+            src = src_dir / name
+            dst = staging_dir / name
+            if src.is_file() and not dst.is_file():
+                shutil.copy2(src, dst)
+                print(f"[prepare-dit] copied {name}")
+        return staging_dir
+
+    # Single-file model: model.safetensors
     model = src_dir / "model.safetensors"
     if not model.is_file():
         raise FileNotFoundError(f"DiT source missing model.safetensors: {model}")

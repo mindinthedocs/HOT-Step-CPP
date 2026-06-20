@@ -42,7 +42,7 @@ ort-trt-engines/
 **Usage:**
 ```powershell
 & .venv\Scripts\python.exe tools\onnx-export\build-ort-trt-engines.py `
-    --bundle-dir models\acestep-v15-xl-sftturbo50-dit-trt11-w8a16 `
+    --bundle-dir models\acestep-v15-xl-sftturbo50-dit-trt11-w8a8 `
     --modules text,cond,vae
 ```
 
@@ -139,11 +139,19 @@ latency, speedup ratio, and numerical accuracy.
   allowlist to FP16, and inserts Cast nodes so a strongly typed TensorRT build
   honors the graph policy. The DiT builder does not set a blanket FP16/BF16
   builder flag.
-- DiT `w8a16` uses the same hardcoded matrix-weight allowlist, quantizes those
-  ONNX initializers to symmetric INT8 per output channel, and inserts
-  DequantizeLinear/Cast nodes so TensorRT sees INT8 weight storage feeding FP16
-  MatMul/Gemm islands with FP32 graph I/O. This is native ONNX Q/DQ weight-only
-  quantization, not a TensorRT-LLM engine path.
+- DiT `w8a8` is the recommended INT8 path. It quantizes
+  the same matrix-weight allowlist to symmetric INT8 with per-output-channel
+  FP32 scales AND emits a single `ConvRotInt8Linear` custom-op node per
+  MatMul/Gemm site, fused by the HOT-Step TRT plugin (see
+  `tools/onnx-export/trt_plugins/` and `engine/src/plugins/`). The plugin
+  fuses online activation rotation, per-row dynamic INT8 quantization,
+  INT8 × INT8 matmul, dequant, and bias add into one GPU kernel launch —
+  a direct port of the ComfyUI-INT8-Fast Triton kernel. ConvRot (regular
+  Hadamard rotation, group size 256 by default) is applied offline to
+  weights and online to activations so per-row INT8 quantization survives
+  diffusion-model outliers. Set `HOTSTEP_CONVROT_GROUP_SIZE` or pass
+  `--convrot-group-size` to override the group size (must be a power of 4).
+  See `convrot.py` and the w8a8 helpers in `export_dit.py` for details.
 - DiT `fp32` export leaves all DiT weights FP32 for validation.
 - The VAE is a simple 1D convolutional network (no attention layers), so ONNX
   export is straightforward — no trace-safe patches needed.

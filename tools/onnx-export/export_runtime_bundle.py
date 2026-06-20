@@ -148,8 +148,8 @@ def validate_bundle(output_dir: Path,
     if include_vae:
         required.append(("VAE decoder ONNX", output_dir / "vae_decoder.onnx"))
     if build_engine:
-        required.append(("DiT TensorRT runtime alias", output_dir / "dit.engine"))
-        required.append(("DiT TensorRT runtime metadata", output_dir / "dit.engine.metadata.json"))
+        required.append(("DiT TensorRT engine", output_dir / "dit.engine"))
+        required.append(("DiT TensorRT engine metadata", output_dir / "dit.engine.metadata.json"))
     if build_ort_engines:
         root = ort_engine_dir if ort_engine_dir else output_dir / ORT_TRT_ENGINE_ROOT_NAME
         required.append(("ORT TensorRT engine root metadata", root / "ort-trt-engines.metadata.json"))
@@ -205,6 +205,50 @@ def validate_bundle(output_dir: Path,
     print(f"[bundle] validated runtime artifact directory: {output_dir}")
 
 
+def _exports_complete(output_dir: Path, include_fsq: bool, include_vae: bool) -> bool:
+    """Return True when all ONNX exports and sidecars are present on disk.
+
+    Checked independently of engine builds so that a failed TRT build does not
+    force re-exporting the (already-correct) ONNX files.
+    """
+    required = [
+        output_dir / "dit.onnx",
+        output_dir / "dit.metadata.json",
+        output_dir / "dit.precision-manifest.json",
+        output_dir / "dit.onnx.refit_manifest.json",
+        output_dir / "config.json",
+        output_dir / "silence_latent.pt",
+        output_dir / "null_condition_emb.bin",
+        output_dir / "text_encoder.onnx",
+        output_dir / "embed_tokens.bin",
+        output_dir / "cond_encoder.onnx",
+        output_dir / "vocab.json",
+        output_dir / "merges.txt",
+    ]
+    if include_fsq:
+        required.append(output_dir / FSQ_SIDECAR_NAME)
+    if include_vae:
+        required.append(output_dir / "vae_decoder.onnx")
+    return all(p.is_file() for p in required)
+
+
+def _dit_engine_complete(output_dir: Path) -> bool:
+    """Return True when the DiT TRT engine is present and non-empty.
+
+    build-trt-engine.py writes dit.engine directly next to dit.onnx (single
+    source of truth — no engines/ subdir, no alias). A zero-byte engine means
+    a previous build was interrupted.
+    """
+    engine = output_dir / "dit.engine"
+    return engine.is_file() and engine.stat().st_size > 0
+
+
+def _ort_engines_complete(output_dir: Path, ort_engine_dir: Path | None) -> bool:
+    """Return True when the ORT-TRT engine cache root metadata exists."""
+    root = ort_engine_dir if ort_engine_dir else output_dir / ORT_TRT_ENGINE_ROOT_NAME
+    return (root / "ort-trt-engines.metadata.json").is_file()
+
+
 def try_reuse_existing_bundle(output_dir: Path,
                               include_fsq: bool,
                               include_vae: bool,
@@ -230,7 +274,7 @@ def main() -> None:
     parser.add_argument("--text-encoder-dir", required=True, help="Qwen3 text encoder source directory")
     parser.add_argument("--vae-path", default=None, help="Optional VAE source checkpoint directory")
     parser.add_argument("--output-dir", required=True, help="Runtime artifact output directory")
-    parser.add_argument("--precision", choices=["q8map-fp16", "w8a16", "fp32"], default="q8map-fp16")
+    parser.add_argument("--precision", choices=["q8map-fp16", "w8a8", "fp32"], default="q8map-fp16")
     parser.add_argument("--profile", default="pj-ode-320", help="TensorRT build profile")
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--device", default="cpu", help="Device for DiT/text/condition export")
@@ -257,6 +301,7 @@ def main() -> None:
     include_fsq = not args.skip_fsq
     include_vae = vae_path is not None and not args.skip_vae
 
+    # Fast path: everything already done (idempotent re-run of a complete build).
     if try_reuse_existing_bundle(output_dir, include_fsq, include_vae, args.build_engine,
                                  args.build_ort_engines, ort_engine_dir, args.precision):
         return
@@ -268,83 +313,105 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    copy_sidecar(dit_dir / "config.json", output_dir / "config.json", "config.json")
-    copy_sidecar(dit_dir / "silence_latent.pt", output_dir / "silence_latent.pt", "silence_latent.pt")
-    copy_sidecar(text_dir / "vocab.json", output_dir / "vocab.json", "vocab.json")
-    copy_sidecar(text_dir / "merges.txt", output_dir / "merges.txt", "merges.txt")
+    # ── ONNX export stage ────────────────────────────────────────────────────
+    # Each export script has its own --force / skip-if-exists guard, but we
+    # also check here at the orchestration level so we can skip the entire
+    # export block (including sidecars) without spawning any subprocesses.
+    if not _exports_complete(output_dir, include_fsq, include_vae):
+        copy_sidecar(dit_dir / "config.json", output_dir / "config.json", "config.json")
+        copy_sidecar(dit_dir / "silence_latent.pt", output_dir / "silence_latent.pt", "silence_latent.pt")
+        copy_sidecar(text_dir / "vocab.json", output_dir / "vocab.json", "vocab.json")
+        copy_sidecar(text_dir / "merges.txt", output_dir / "merges.txt", "merges.txt")
+
+        dit_onnx = output_dir / "dit.onnx"
+        text_onnx = output_dir / "text_encoder.onnx"
+        cond_onnx = output_dir / "cond_encoder.onnx"
+
+        run_tool([
+            sys.executable,
+            str(SCRIPT_DIR / "export_dit.py"),
+            "--model-dir", str(dit_dir),
+            "--output", str(dit_onnx),
+            "--opset", str(args.opset),
+            "--precision", args.precision,
+            "--device", args.device,
+            *(["--verify"] if args.verify else []),
+        ])
+
+        run_tool([
+            sys.executable,
+            str(SCRIPT_DIR / "export_text_enc.py"),
+            "--model-dir", str(text_dir),
+            "--output", str(text_onnx),
+            "--dit-dir", str(dit_dir),
+            "--opset", str(args.opset),
+            "--device", args.device,
+            *(["--verify"] if args.verify else []),
+        ])
+
+        run_tool([
+            sys.executable,
+            str(SCRIPT_DIR / "export_cond_enc.py"),
+            "--model-dir", str(dit_dir),
+            "--output", str(cond_onnx),
+            "--opset", str(args.opset),
+            "--device", args.device,
+            *(["--verify"] if args.verify else []),
+        ])
+
+        if include_fsq:
+            run_tool([
+                sys.executable,
+                str(SCRIPT_DIR / "export_fsq_sidecar.py"),
+                "--model-dir", str(dit_dir),
+                "--output-dir", str(output_dir),
+            ])
+
+        if include_vae:
+            run_tool([
+                sys.executable,
+                str(SCRIPT_DIR / "export_vae.py"),
+                "--vae-path", str(vae_path),
+                "--output", str(output_dir / "vae_decoder.onnx"),
+                "--opset", str(args.opset),
+            ])
+    else:
+        print("[bundle] ONNX exports already present — skipping export stage")
 
     dit_onnx = output_dir / "dit.onnx"
     text_onnx = output_dir / "text_encoder.onnx"
     cond_onnx = output_dir / "cond_encoder.onnx"
 
-    run_tool([
-        sys.executable,
-        str(SCRIPT_DIR / "export_dit.py"),
-        "--model-dir", str(dit_dir),
-        "--output", str(dit_onnx),
-        "--opset", str(args.opset),
-        "--precision", args.precision,
-        "--device", args.device,
-        *(["--verify"] if args.verify else []),
-    ])
-
-    run_tool([
-        sys.executable,
-        str(SCRIPT_DIR / "export_text_enc.py"),
-        "--model-dir", str(text_dir),
-        "--output", str(text_onnx),
-        "--dit-dir", str(dit_dir),
-        "--opset", str(args.opset),
-        "--device", args.device,
-        *(["--verify"] if args.verify else []),
-    ])
-
-    run_tool([
-        sys.executable,
-        str(SCRIPT_DIR / "export_cond_enc.py"),
-        "--model-dir", str(dit_dir),
-        "--output", str(cond_onnx),
-        "--opset", str(args.opset),
-        "--device", args.device,
-        *(["--verify"] if args.verify else []),
-    ])
-
-    if include_fsq:
-        run_tool([
-            sys.executable,
-            str(SCRIPT_DIR / "export_fsq_sidecar.py"),
-            "--model-dir", str(dit_dir),
-            "--output-dir", str(output_dir),
-        ])
-
-    if include_vae:
-        run_tool([
-            sys.executable,
-            str(SCRIPT_DIR / "export_vae.py"),
-            "--vae-path", str(vae_path),
-            "--output", str(output_dir / "vae_decoder.onnx"),
-            "--opset", str(args.opset),
-        ])
-
+    # ── DiT TRT engine build ─────────────────────────────────────────────────
+    # build-trt-engine.py writes dit.engine directly next to dit.onnx.
     if args.build_engine:
-        run_tool([
-            sys.executable,
-            str(SCRIPT_DIR / "build-trt-engine.py"),
-            "--onnx", str(dit_onnx),
-            "--out-dir", str(output_dir / "engines"),
-            "--profile", args.profile,
-            "--precision-policy", args.precision,
-        ])
+        if not _dit_engine_complete(output_dir):
+            run_tool([
+                sys.executable,
+                str(SCRIPT_DIR / "build-trt-engine.py"),
+                "--onnx", str(dit_onnx),
+                "--profile", args.profile,
+                "--precision-policy", args.precision,
+            ])
+        else:
+            print("[bundle] DiT TRT engine already present — skipping build-trt-engine")
 
+    # ── ORT-TRT encoder/VAE engine builds ───────────────────────────────────
+    # Skip when the engine-root metadata file exists (written as the last action
+    # of build-ort-trt-engines.py, so its presence means the whole build
+    # completed successfully).
     if args.build_ort_engines:
-        ort_modules = args.ort_modules if args.ort_modules else ("text,cond,vae" if include_vae else "text,cond")
-        run_tool([
-            sys.executable,
-            str(SCRIPT_DIR / "build-ort-trt-engines.py"),
-            "--bundle-dir", str(output_dir),
-            "--modules", ort_modules,
-            *(["--out-dir", str(ort_engine_dir)] if ort_engine_dir else []),
-        ])
+        if not _ort_engines_complete(output_dir, ort_engine_dir):
+            ort_modules = args.ort_modules if args.ort_modules else ("text,cond,vae" if include_vae else "text,cond")
+            run_tool([
+                sys.executable,
+                str(SCRIPT_DIR / "build-ort-trt-engines.py"),
+                "--bundle-dir", str(output_dir),
+                "--modules", ort_modules,
+                *(["--out-dir", str(ort_engine_dir)] if ort_engine_dir else []),
+            ])
+        else:
+            print("[bundle] ORT-TRT engine caches already present — skipping build-ort-trt-engines")
 
     validate_bundle(output_dir, include_fsq, include_vae, args.build_engine,
                     args.build_ort_engines, ort_engine_dir, args.precision)

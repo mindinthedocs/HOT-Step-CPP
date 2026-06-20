@@ -33,6 +33,14 @@
 #include "NvOnnxParser.h"
 #include "yyjson.h"
 
+// dlopen / LoadLibrary for the HOT-Step plugin .so — included AFTER TRT headers
+// to avoid macro conflicts (ERROR, NO_ERROR, DELETE, etc.) from windows.h.
+#if defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <dlfcn.h>
+#endif
+
 #if NV_TENSORRT_MAJOR != 11
 #error "HOT_STEP_TRT requires TensorRT 11.x headers"
 #endif
@@ -395,9 +403,203 @@ inline bool dit_trt_build(
 
 // ── Engine load + base weight refit ─────────────────────────────────────────
 
-// Load a pre-built TRT engine and cache base weights via the ONNX refitter.
-// The ONNX path is needed for the refitter to populate base_weights for
-// adapter revert and to ensure the engine weights match the source ONNX.
+// Load the HOT-Step custom plugin library (libhotstep_plugins.so) so the
+// ConvRotInt8Linear op is registered with TRT's plugin registry before any
+// w8a8 engine is deserialized. The plugin .so is built by CMakeLists.txt
+// (target: hotstep_plugins) and installed next to the engine binary.
+//
+// dlopen is idempotent: calling this multiple times is a no-op after the
+// first successful load. The library stays resident for the process
+// lifetime (we don't dlclose it) because TRT's plugin registry holds raw
+// pointers into the .so.
+//
+// Returns true on success or if the plugin .so is already loaded. Returns
+// false (and prints a diagnostic) if the .so cannot be found or the
+// hotstep_register_plugins entry point fails.
+inline bool dit_trt_load_hotstep_plugins() {
+#if defined(_WIN32)
+    static HMODULE g_plugin_handle = nullptr;
+    if (g_plugin_handle) return true;
+
+    // hotstep_plugins.dll depends on nvinfer_11.dll and cudart64_*.dll.
+    // A bare LoadLibraryA("hotstep_plugins.dll") only searches the exe
+    // directory, system dirs, and PATH — it won't find TRT DLLs in
+    // %TENSORRT_ROOT%/bin/. Use AddDllDirectory to temporarily add the
+    // TRT bin/ directory to the DLL search order, following the same
+    // pattern as lm-trtllm.h.
+    HMODULE h = nullptr;
+
+    // Try loading with the TRT bin/ directory added to the search path.
+    const char* trtRootEnv = std::getenv("TENSORRT_ROOT");
+    if (trtRootEnv && trtRootEnv[0] != '\0') {
+        std::string trtBinDir = std::string(trtRootEnv) + "\\bin";
+
+        // Convert to wide string for AddDllDirectory
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, trtBinDir.c_str(), -1, nullptr, 0);
+        std::wstring wTrtBinDir(wlen, 0);
+        MultiByteToWideChar(CP_UTF8, 0, trtBinDir.c_str(), -1, &wTrtBinDir[0], wlen);
+
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        DLL_DIRECTORY_COOKIE cookie = AddDllDirectory(wTrtBinDir.c_str());
+        if (cookie) {
+            fprintf(stderr, "[DiT-TRT] Added DLL dir for plugin: %s\n", trtBinDir.c_str());
+        }
+
+        h = LoadLibraryExA("hotstep_plugins.dll", NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+
+        if (cookie) RemoveDllDirectory(cookie);
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
+
+    // Fallback: try bare LoadLibraryExA (searches exe dir + default dirs)
+    if (!h) {
+        h = LoadLibraryExA("hotstep_plugins.dll", NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
+
+    if (!h) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "[DiT-TRT] WARNING: Cannot load hotstep_plugins.dll (error %lu). "
+                        "w8a8 engines will not work.\n", err);
+        return false;
+    }
+    g_plugin_handle = h;
+    auto reg = reinterpret_cast<int(*)()>(GetProcAddress(h, "hotstep_register_plugins"));
+    if (reg && reg() == 0) return true;
+    fprintf(stderr, "[DiT-TRT] WARNING: hotstep_plugins.dll loaded but "
+                    "hotstep_register_plugins() failed; w8a8 engines will not work.\n");
+    return false;
+#else
+    static void* g_plugin_handle = nullptr;
+    if (g_plugin_handle) return true;
+    // dlopen searches $ORIGIN (set via RPATH) and the system LD_LIBRARY_PATH.
+    void* h = dlopen("libhotstep_plugins.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) {
+        // Try the .dylib name on macOS.
+        h = dlopen("libhotstep_plugins.dylib", RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (!h) {
+        // Not fatal — q8map-fp16 and fp32 engines don't need the plugin.
+        // w8a8 engines will fail at deserializeCudaEngine with a clear
+        // "plugin not found" error.
+        return false;
+    }
+    g_plugin_handle = h;
+    auto reg = reinterpret_cast<int(*)()>(dlsym(h, "hotstep_register_plugins"));
+    if (reg && reg() == 0) return true;
+    fprintf(stderr, "[DiT-TRT] WARNING: libhotstep_plugins.so loaded but "
+                    "hotstep_register_plugins() failed; w8a8 engines will not work.\n");
+    return false;
+#endif
+}
+
+// Log free/total VRAM on the current device for OOM diagnostics.
+inline void dit_trt_log_vram(const char * label) {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+        fprintf(stderr, "[DiT-TRT] VRAM(%s): free=%.1f MB / total=%.1f MB\n",
+                label ? label : "",
+                (double)free_bytes / (1ull << 20),
+                (double)total_bytes / (1ull << 20));
+    }
+}
+
+// Read the engine metadata sidecar and return whether the engine has embedded
+// weights (strip_plan == false). When true, the runtime MUST skip the
+// parser-refit + base_weights cache at load time because:
+//   1. The weights are already in the engine — refitFromFile just overwrites
+//      them with identical values, wasting CPU RAM (ONNX is parsed into host
+//      memory) and creating a transient VRAM spike during refitCudaEngine().
+//   2. The base_weights cache (a std::unordered_map copying every BF16/HALF
+//      weight from the refitter into host memory) is only needed for adapter
+//      revert. We build it lazily on the first adapter apply instead.
+//
+// On any read/parse error, returns false (conservative: fall back to the old
+// refit-at-load behavior).
+inline bool dit_trt_engine_has_embedded_weights(const char * engine_path) {
+    if (!engine_path) return false;
+    std::string metadata_path = std::string(engine_path) + ".metadata.json";
+    FILE * mf = fopen(metadata_path.c_str(), "rb");
+    if (!mf) return false;
+    fseek(mf, 0, SEEK_END);
+    long mlen = ftell(mf);
+    fseek(mf, 0, SEEK_SET);
+    if (mlen <= 0) { fclose(mf); return false; }
+    std::vector<char> mbuf((size_t)mlen + 1);
+    size_t mrd = fread(mbuf.data(), 1, (size_t)mlen, mf);
+    fclose(mf);
+    if (mrd != (size_t)mlen) return false;
+    mbuf[(size_t)mlen] = '\0';
+    yyjson_doc * doc = yyjson_read(mbuf.data(), (size_t)mlen, 0);
+    if (!doc) return false;
+    yyjson_val * root = yyjson_doc_get_root(doc);
+    bool strip_plan = true;  // conservative default
+    bool ok = false;
+    if (root && yyjson_is_obj(root)) {
+        yyjson_val * sp = yyjson_obj_get(root, "strip_plan");
+        if (sp && yyjson_is_bool(sp)) {
+            strip_plan = yyjson_get_bool(sp);
+            ok = true;
+        }
+    }
+    yyjson_doc_free(doc);
+    if (!ok) return false;
+    return !strip_plan;  // embedded weights iff strip_plan == false
+}
+
+// Lazily build the base_weights cache by reading directly from the engine via
+// a refitter (no ONNX file needed). Used by dit_trt_refit_adapter the first
+// time an adapter is applied, so we can later revert via dit_trt_refit_base.
+//
+// Returns true on success (or if cache already populated). Returns false if
+// the refitter cannot enumerate weights — in that case adapter revert will
+// not be possible (but forward still works, since the engine is intact).
+inline bool dit_trt_ensure_base_weights_cached(DitTrt * ctx) {
+    if (!ctx || !ctx->engine) return false;
+    if (!ctx->base_weights.empty()) return true;
+
+    auto refitter = nvinfer1::createInferRefitter(*ctx->engine, ctx->logger);
+    if (!refitter) {
+        fprintf(stderr, "[DiT-TRT] ensure_base_weights: failed to create refitter\n");
+        return false;
+    }
+
+    int32_t num_weights = refitter->getAllWeights(0, nullptr);
+    if (num_weights <= 0) {
+        delete refitter;
+        fprintf(stderr, "[DiT-TRT] ensure_base_weights: refitter reports no weights\n");
+        return false;
+    }
+
+    std::vector<const char*> names((size_t)num_weights);
+    refitter->getAllWeights(num_weights, names.data());
+    for (int32_t i = 0; i < num_weights; i++) {
+        auto w = refitter->getNamedWeights(names[i]);
+        if ((w.type == nvinfer1::DataType::kBF16 || w.type == nvinfer1::DataType::kHALF) && w.count > 0) {
+            const uint16_t* data = static_cast<const uint16_t*>(w.values);
+            ctx->base_weights[names[i]] = std::vector<uint16_t>(data, data + w.count);
+        }
+    }
+    delete refitter;
+    fprintf(stderr, "[DiT-TRT] Lazily cached %zu base weight tensors for adapter revert\n",
+            ctx->base_weights.size());
+    return true;
+}
+
+// Load a pre-built TRT engine.
+//
+// The engine was built with kREFIT_IDENTICAL + embedded weights
+// (strip_plan == false). The runtime deserializes the engine directly into
+// VRAM and skips the parser-refit / base_weights cache at load time:
+//   - parser-refit (refitFromFile + refitCudaEngine) would re-read the ONNX,
+//     stage all weights in host memory, and overwrite the engine's already-
+//     embedded weights with identical values — a transient VRAM spike that
+//     can OOM on small cards (e.g. 4B DiT-XL w8a8 on 6GB).
+//   - base_weights cache is only needed for adapter revert; built lazily by
+//     dit_trt_ensure_base_weights_cached() on the first adapter apply.
+//
+// The legacy path (parser-refit at load) is retained as a fallback for any
+// engine that ships with strip_plan == true (no longer produced by the build
+// script, but older bundles may exist on disk).
 inline bool dit_trt_load(
     DitTrt*     ctx,
     const char* engine_path,
@@ -409,18 +611,74 @@ inline bool dit_trt_load(
     ctx->onnx_path = onnx_path;
     dit_trt_log_version("load");
 
+    // Load the HOT-Step plugin library so w8a8 engines can find the
+    // ConvRotInt8Linear op in TRT's plugin registry. Safe to call for
+    // q8map-fp16 / fp32 engines too (the .so just won't be used).
+    dit_trt_load_hotstep_plugins();
+    dit_trt_log_vram("before deserialize");
+
     // Read engine file
     FILE* f = fopen(engine_path, "rb");
     if (!f) {
         fprintf(stderr, "[DiT-TRT] Cannot open engine %s\n", engine_path);
         return false;
     }
-    fseek(f, 0, SEEK_END);
-    size_t engine_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::vector<char> engine_data(engine_size);
-    fread(engine_data.data(), 1, engine_size, f);
+    // Use 64-bit file positioning: the DiT engine is 4GB+ and plain ftell()
+    // returns long (32-bit on Windows MSVC), which overflows to -1 for files
+    // >2GB. That -1 cast to size_t becomes SIZE_MAX (18446744073709551615),
+    // causing a catastrophic allocation attempt. _ftelli64 (Windows) and
+    // ftello (Unix) use 64-bit offsets.
+#if defined(_WIN32)
+    _fseeki64(f, 0, SEEK_END);
+    int64_t engine_size_i64 = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_END);
+    int64_t engine_size_i64 = (int64_t)ftello(f);
+    fseeko(f, 0, SEEK_SET);
+#endif
+    if (engine_size_i64 <= 0) {
+        fclose(f);
+        fprintf(stderr, "[DiT-TRT] FATAL: cannot determine engine file size (ftell returned %lld): %s\n",
+                (long long)engine_size_i64, engine_path);
+        return false;
+    }
+    size_t engine_size = (size_t)engine_size_i64;
+    fprintf(stderr, "[DiT-TRT] Engine file size: %zu bytes (%.2f GB)\n",
+            engine_size, (double)engine_size / (1ull << 30));
+    fflush(stderr);
+
+    // Allocate host buffer for the engine file. A 4GB+ contiguous allocation
+    // can throw std::bad_alloc on Windows when the process address space is
+    // fragmented (e.g. after loading+freeing the text-enc and cond-enc
+    // engines, which together consumed ~2.4GB of contiguous host memory).
+    // Without this try/catch the uncaught exception terminates the process
+    // silently — no error message, no log line, just a crash. Catch it and
+    // report a clear actionable error instead.
+    std::vector<char> engine_data;
+    try {
+        engine_data.resize(engine_size);
+    } catch (const std::bad_alloc & exc) {
+        fclose(f);
+        fprintf(stderr,
+                "[DiT-TRT] FATAL: cannot allocate %zu bytes (%.2f GB) of host memory "
+                "to read engine file. %s\n"
+                "[DiT-TRT] This usually means process address space is fragmented after "
+                "loading text-enc/cond-enc engines. Try one of:\n"
+                "[DiT-TRT]   - rebuild the DiT engine with a smaller max_T profile\n"
+                "[DiT-TRT]   - increase Windows pagefile / system RAM\n"
+                "[DiT-TRT]   - close other memory-heavy processes before generation\n",
+                engine_size, (double)engine_size / (1ull << 30), exc.what());
+        return false;
+    }
+    size_t rd = fread(engine_data.data(), 1, engine_size, f);
     fclose(f);
+    if (rd != engine_size) {
+        fprintf(stderr, "[DiT-TRT] Short read on engine file (%zu/%zu bytes)\n", rd, engine_size);
+        return false;
+    }
+    fprintf(stderr, "[DiT-TRT] Engine file read into host buffer (%zu bytes)\n", rd);
+    fflush(stderr);
 
     // Deserialize
     ctx->runtime = nvinfer1::createInferRuntime(ctx->logger);
@@ -429,62 +687,117 @@ inline bool dit_trt_load(
         return false;
     }
 
+    // Tell TRT it can spill temp data to a temp dir during deserialize if it
+    // needs to. This helps on small-VRAM cards where the engine's compiled
+    // plan + kernel cache don't all fit alongside the streamable-weight pool.
+    // The dir is best-effort: if it doesn't exist or isn't writable, TRT
+    // silently falls back to in-memory operation.
+    if (const char * tmp = std::getenv("HOTSTEP_TRT_TEMP_DIR")) {
+        std::string tmps(tmp);
+        if (!tmps.empty()) {
+            ctx->runtime->setTemporaryDirectory(tmps.c_str());
+            fprintf(stderr, "[DiT-TRT] TRT temp dir: %s\n", tmps.c_str());
+        }
+    }
+
+    fprintf(stderr, "[DiT-TRT] Deserializing engine (%zu bytes)...\n", engine_size);
+    fflush(stderr);
     ctx->engine = ctx->runtime->deserializeCudaEngine(
         engine_data.data(), engine_size);
     if (!ctx->engine) {
         fprintf(stderr, "[DiT-TRT] Failed to deserialize engine\n");
+        dit_trt_log_vram("after failed deserialize");
         return false;
     }
 
     fprintf(stderr, "[DiT-TRT] First deserialize: engine loaded (%zu bytes)\n", engine_size);
+    dit_trt_log_vram("after deserialize");
 
-    // Refit with base weights from ONNX
-    auto refitter = nvinfer1::createInferRefitter(*ctx->engine, ctx->logger);
-    if (!refitter) {
-        fprintf(stderr, "[DiT-TRT] Failed to create refitter\n");
-        return false;
-    }
+    // Free the host-side engine file buffer now. TRT has copied what it needs
+    // into its own internal structures (streamable weights stay in a TRT-managed
+    // host pool; the plan and kernels are in VRAM). Holding engine_data on the
+    // host side just wastes ~4GB of system RAM for the engine's lifetime.
+    engine_data.clear();
+    engine_data.shrink_to_fit();
 
-    // Use parser refitter to auto-load weights from ONNX
-    // TensorRT parser refitter takes the ONNX path; graph/weights must match.
-    auto parser_refitter = nvonnxparser::createParserRefitter(*refitter, ctx->logger);
-    if (!parser_refitter->refitFromFile(onnx_path)) {
-        fprintf(stderr, "[DiT-TRT] Parser refit from ONNX failed\n");
-        delete parser_refitter;
-        delete refitter;
-        return false;
-    }
+    // ── Refit decision ────────────────────────────────────────────────────
+    //
+    // The current build (build-trt-engine.py) produces embedded-weight engines
+    // (strip_plan == false) — the ONNX weights are baked into the engine file
+    // at build time and are already in VRAM after deserializeCudaEngine. The
+    // parser-refit (refitFromFile + refitCudaEngine) would re-read the ONNX,
+    // stage all weights in host memory, and overwrite the engine's already-
+    // embedded weights with identical values. This:
+    //   - Wastes CPU RAM (the ONNX is parsed into host memory)
+    //   - Creates a transient VRAM spike during refitCudaEngine() that can
+    //     OOM on small cards (e.g. 4B DiT-XL w8a8 ~4GB on a 6GB card)
+    //   - Buys us nothing: the engine weights are already correct.
+    //
+    // The base_weights cache (for adapter revert) is also skipped at load time
+    // and built lazily by dit_trt_ensure_base_weights_cached() on the first
+    // adapter apply — that reads directly from the engine via a refitter
+    // (no ONNX file needed).
+    //
+    // The legacy path (parser-refit at load) is retained as a fallback for
+    // any engine that ships with strip_plan == true (no longer produced by
+    // the build script, but older bundles may exist on disk).
+    bool embedded_weights = dit_trt_engine_has_embedded_weights(engine_path);
+    fprintf(stderr, "[DiT-TRT] Engine %s embedded weights (strip_plan=%s)\n",
+            embedded_weights ? "has" : "has NOT",
+            embedded_weights ? "false" : "true");
 
-    if (!refitter->refitCudaEngine()) {
-        fprintf(stderr, "[DiT-TRT] Engine refit failed\n");
-        delete parser_refitter;
-        delete refitter;
-        return false;
-    }
-
-    // Cache base weights for later adapter revert
-    // Cache refittable weights for adapter merges/reverts.
-    int32_t num_weights = refitter->getAllWeights(0, nullptr);
-    if (num_weights > 0) {
-        std::vector<const char*> names(num_weights);
-        refitter->getAllWeights(num_weights, names.data());
-
-        for (int32_t i = 0; i < num_weights; i++) {
-            auto w = refitter->getNamedWeights(names[i]);
-            if ((w.type == nvinfer1::DataType::kBF16 || w.type == nvinfer1::DataType::kHALF) && w.count > 0) {
-                const uint16_t* data = static_cast<const uint16_t*>(w.values);
-                ctx->base_weights[names[i]] =
-                    std::vector<uint16_t>(data, data + w.count);
-            }
+    if (embedded_weights) {
+        fprintf(stderr, "[DiT-TRT] Skipping parser-refit + base_weights cache "
+                        "(embedded weights; cache built lazily on first adapter apply)\n");
+    } else {
+        // Legacy path: stripped-plan engine needs refit from ONNX to populate
+        // weights. Also populates base_weights cache for adapter revert.
+        fprintf(stderr, "[DiT-TRT] WARNING: engine has no embedded weights — "
+                        "falling back to parser-refit at load (legacy path)\n");
+        auto refitter = nvinfer1::createInferRefitter(*ctx->engine, ctx->logger);
+        if (!refitter) {
+            fprintf(stderr, "[DiT-TRT] Failed to create refitter\n");
+            return false;
         }
-        fprintf(stderr, "[DiT-TRT] Cached %zu base weight tensors for refit\n",
-                ctx->base_weights.size());
+        auto parser_refitter = nvonnxparser::createParserRefitter(*refitter, ctx->logger);
+        if (!parser_refitter->refitFromFile(onnx_path)) {
+            fprintf(stderr, "[DiT-TRT] Parser refit from ONNX failed\n");
+            delete parser_refitter;
+            delete refitter;
+            return false;
+        }
+        if (!refitter->refitCudaEngine()) {
+            fprintf(stderr, "[DiT-TRT] Engine refit failed\n");
+            delete parser_refitter;
+            delete refitter;
+            return false;
+        }
+        // Cache refittable weights for adapter merges/reverts.
+        int32_t num_weights = refitter->getAllWeights(0, nullptr);
+        if (num_weights > 0) {
+            std::vector<const char*> names(num_weights);
+            refitter->getAllWeights(num_weights, names.data());
+            for (int32_t i = 0; i < num_weights; i++) {
+                auto w = refitter->getNamedWeights(names[i]);
+                if ((w.type == nvinfer1::DataType::kBF16 || w.type == nvinfer1::DataType::kHALF) && w.count > 0) {
+                    const uint16_t* data = static_cast<const uint16_t*>(w.values);
+                    ctx->base_weights[names[i]] =
+                        std::vector<uint16_t>(data, data + w.count);
+                }
+            }
+            fprintf(stderr, "[DiT-TRT] Cached %zu base weight tensors for refit\n",
+                    ctx->base_weights.size());
+        }
+        delete parser_refitter;
+        delete refitter;
+        dit_trt_log_vram("after legacy refit");
     }
 
     // Load refit manifest sidecar (weights_transposed list).
     // Generated by export_dit.py — records which weights dynamo stored
     // in transposed [in,out] orientation (vs torch [out,in]). LoRA deltas
     // arrive in torch orientation and must be transposed for these.
+    // Loaded regardless of embedded_weights — adapter apply needs this map.
     {
         std::string manifest_path = std::string(onnx_path) + ".refit_manifest.json";
         FILE* fmap = fopen(manifest_path.c_str(), "rb");
@@ -519,25 +832,59 @@ inline bool dit_trt_load(
         }
     }
 
-    delete parser_refitter;
-    delete refitter;
-
-    // Weight streaming: set budget = full streamable size so all weights are
-    // resident in VRAM.  kWEIGHT_STREAMING is enabled at build time to avoid
-    // OOM during engine compilation; at runtime we want everything in memory.
+    // Weight streaming budget.
+    //
+    // The engine is built with kWEIGHT_STREAMING, so weights can either be
+    // pinned in VRAM (budget = full) or streamed on demand from host memory
+    // (budget < full). The previous default was budget = full, which OOMs on
+    // small cards (e.g. 4B DiT-XL w8a8 ~4GB on a 6GB card has no room for
+    // activations + CUDA context after pinning all weights).
+    //
+    // New default: budget = 0 (TRT "auto"). TRT 11 interprets budget=0 as
+    // "pick a budget based on current free VRAM" — it will leave room for
+    // activations and only pin what fits, streaming the rest. This trades a
+    // small amount of inference speed (weights stream over PCIe on demand)
+    // for actually fitting on the card.
+    //
+    // Override via env var:
+    //   HOTSTEP_DIT_WEIGHT_STREAMING_BUDGET_MB=<n>  → pin <n> MB of weights
+    //   HOTSTEP_DIT_WEIGHT_STREAMING_BUDGET_MB=full → pin all weights (old behavior)
+    //   HOTSTEP_DIT_WEIGHT_STREAMING_BUDGET_MB=auto → TRT auto (new default)
     ctx->streamable_weights_bytes = ctx->engine->getStreamableWeightsSize();
     if (ctx->streamable_weights_bytes > 0) {
-        // Budget = full size → all weights pinned in VRAM, no on-demand streaming.
-        if (!ctx->engine->setWeightStreamingBudgetV2(ctx->streamable_weights_bytes)) {
-            fprintf(stderr, "[DiT-TRT] WARNING: failed to set full weight-streaming budget\n");
+        int64_t budget_bytes = 0;  // 0 = TRT auto (leaves room for activations)
+        const char * env_budget = std::getenv("HOTSTEP_DIT_WEIGHT_STREAMING_BUDGET_MB");
+        if (env_budget && env_budget[0] != '\0') {
+            std::string s(env_budget);
+            if (s == "full") {
+                budget_bytes = ctx->streamable_weights_bytes;
+            } else if (s == "auto") {
+                budget_bytes = 0;
+            } else {
+                try {
+                    long long mb = std::stoll(s);
+                    if (mb > 0) budget_bytes = mb * (1ll << 20);
+                } catch (...) {
+                    fprintf(stderr, "[DiT-TRT] WARNING: bad HOTSTEP_DIT_WEIGHT_STREAMING_BUDGET_MB=%s, using auto\n", env_budget);
+                    budget_bytes = 0;
+                }
+            }
+        }
+        fprintf(stderr,
+                "[DiT-TRT] Weight streaming: budget=%lld bytes (%.0f MB), streamable=%lld bytes (%.0f MB) [%s]\n",
+                (long long)budget_bytes, (double)budget_bytes / (1ull << 20),
+                (long long)ctx->streamable_weights_bytes, (double)ctx->streamable_weights_bytes / (1ull << 20),
+                env_budget ? env_budget : "auto");
+        if (!ctx->engine->setWeightStreamingBudgetV2(budget_bytes)) {
+            fprintf(stderr, "[DiT-TRT] WARNING: failed to set weight-streaming budget\n");
         } else {
             ctx->weight_streaming_budget_bytes = ctx->engine->getWeightStreamingBudgetV2();
-            fprintf(stderr,
-                    "[DiT-TRT] Weight streaming: budget=%lld bytes (full, all weights in VRAM), streamable=%lld bytes\n",
+            fprintf(stderr, "[DiT-TRT] Weight streaming: actual budget=%lld bytes (%.0f MB)\n",
                     (long long)ctx->weight_streaming_budget_bytes,
-                    (long long)ctx->streamable_weights_bytes);
+                    (double)ctx->weight_streaming_budget_bytes / (1ull << 20));
         }
     }
+    dit_trt_log_vram("after weight-streaming budget");
 
     // Create execution context
     ctx->context = ctx->engine->createExecutionContext();
@@ -632,6 +979,18 @@ inline int64_t dit_trt_refit_adapter(
 ) {
     std::lock_guard<std::mutex> lock(ctx->refit_mutex);
     auto t0 = std::chrono::steady_clock::now();
+
+    // Lazily build the base_weights cache on first adapter apply. When the
+    // engine has embedded weights (the common case), dit_trt_load skipped
+    // the parser-refit and did not populate this cache. We read base weights
+    // directly from the engine via a refitter (no ONNX file needed) so the
+    // adapter revert path (dit_trt_refit_base) can later restore them.
+    if (ctx->base_weights.empty()) {
+        if (!dit_trt_ensure_base_weights_cached(ctx)) {
+            fprintf(stderr, "[DiT-TRT] Cannot apply adapter: failed to build base_weights cache\n");
+            return -1;
+        }
+    }
 
     auto refitter = nvinfer1::createInferRefitter(*ctx->engine, ctx->logger);
     if (!refitter) {

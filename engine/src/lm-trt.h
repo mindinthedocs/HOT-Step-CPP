@@ -346,9 +346,22 @@ inline bool lm_trt_load(
         fprintf(stderr, "[LM-TRT] Cannot open engine %s\n", engine_path);
         return false;
     }
-    fseek(f, 0, SEEK_END);
-    size_t engine_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    // 64-bit file positioning (LM engine can be >2GB on large LM models).
+#if defined(_WIN32)
+    _fseeki64(f, 0, SEEK_END);
+    int64_t engine_size_i64 = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+#else
+    fseeko(f, 0, SEEK_END);
+    int64_t engine_size_i64 = (int64_t)ftello(f);
+    fseeko(f, 0, SEEK_SET);
+#endif
+    if (engine_size_i64 <= 0) {
+        fclose(f);
+        fprintf(stderr, "[LM-TRT] FATAL: cannot determine engine file size: %s\n", engine_path);
+        return false;
+    }
+    size_t engine_size = (size_t)engine_size_i64;
     std::vector<char> engine_data(engine_size);
     fread(engine_data.data(), 1, engine_size, f);
     fclose(f);

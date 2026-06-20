@@ -251,7 +251,7 @@ class CondEncoderWrapperFixed(nn.Module):
         return enc_hidden
 
 
-def load_model(model_dir: str, device: str = "cuda", dtype=None):
+def load_model(model_dir: str, device: str = "cpu", dtype=None):
     dtype = (torch.float16 if os.environ.get("COND_ENC_FP16") == "1" else torch.float32) if dtype is None else dtype
     model_dir = Path(model_dir)
     
@@ -560,9 +560,21 @@ def main():
                         help="Output ONNX file (default: models/onnx/cond_encoder.onnx)")
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--verify", action="store_true")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="cpu",
+                        help="Device for model loading (cpu or cuda). ONNX tracing works on CPU.")
     parser.add_argument("--timbre-cls", choices=["auto", "on", "off"], default="auto",
                         help="Whether to prepend timbre special_token; auto follows source modeling file")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-export even if the output ONNX already exists")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Export the ONNX graph in FP16 (native half weights). "
+                             "Required when building the strongly-typed FP16 TRT 11 "
+                             "cond-enc engine (build_encoder_trt.py --module cond-enc), "
+                             "because the C++ cond-enc runtime validates that "
+                             "text_hidden/lyric_embed/timbre_feats are kHALF inputs "
+                             "and enc_hidden is a kHALF output. Without --fp16 the "
+                             "ONNX traces as FP32 and the engine inherits FP32 IO "
+                             "dtypes, failing the runtime contract.")
     args = parser.parse_args()
     
     if args.output is None:
@@ -573,8 +585,29 @@ def main():
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     output_dir = os.path.dirname(args.output)
     
+    # Skip if output already exists (resumable builds).
+    # Check both the ONNX shell and the external data file: a crash mid-export
+    # can leave the shell written but the data file absent or truncated, which
+    # would cause a silent corrupt-model skip on the next run.
+    if not args.force:
+        onnx_path = Path(args.output)
+        data_path = Path(args.output + ".data")
+        # Complete when: shell exists AND (no data file expected  OR  data file is non-empty).
+        # A zero-byte data file means the export was interrupted — do not skip.
+        shell_ok = onnx_path.is_file()
+        data_ok = (not data_path.exists()) or (data_path.stat().st_size > 0)
+        if shell_ok and data_ok:
+            print(f"[export_cond_enc] Output already exists: {args.output} (use --force to re-export)")
+            return
+    
     # Load model
-    cond_encoder, config = load_model(args.model_dir, device=args.device)
+    # The cond-enc TRT runtime (engine/src/cond-enc-trt.h) validates that
+    # text_hidden/lyric_embed/timbre_feats are kHALF inputs and enc_hidden
+    # is a kHALF output. build_encoder_trt.py builds a strongly-typed engine,
+    # so the ONNX graph must be FP16 — pass dtype=torch.float16 to load_model
+    # so PyTorch traces with half-precision weights and dummy inputs.
+    export_dtype = torch.float16 if args.fp16 else torch.float32
+    cond_encoder, config = load_model(args.model_dir, device=args.device, dtype=export_dtype)
     if args.timbre_cls == "auto":
         use_timbre_cls = model_uses_timbre_cls(args.model_dir)
     else:

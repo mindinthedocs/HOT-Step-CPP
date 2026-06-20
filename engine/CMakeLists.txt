@@ -368,6 +368,58 @@ if(TRT_ENABLED)
     target_include_directories(acestep-core PUBLIC "${_TRT_INC_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(acestep-core PUBLIC "${_TRT_NVINFER_LIB}" "${_TRT_NVONNXPARSER_LIB}" CUDA::cudart)
     message(STATUS "[TRT] DiT TRT acceleration: ENABLED")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # HOT-Step custom TRT plugin library (libhotstep_plugins.so / hotstep_plugins.dll)
+    #
+    # Builds the ConvRotInt8Linear IPluginV3 plugin that fuses the w8a8 +
+    # ConvRot path (online activation rotation + per-row INT8 quant + INT8 × INT8
+    # matmul + dequant + bias) into a single TRT layer.
+    #
+    # The plugin .so is loaded by the engine runtime (dit-trt.h:
+    # dit_trt_load_engine) via dlopen/LoadLibrary before any w8a8 engine is
+    # deserialized. The static REGISTER_TENSORRT_PLUGIN macro in the .cpp
+    # file registers the creator with TRT's plugin registry under the
+    # "hotstep" namespace.
+    #
+    # Build-time-only dependency: the plugin .so is NOT linked into
+    # acestep-core (it has its own TRT/CUDA symbols that would conflict
+    # with the engine's). It's loaded purely via dlopen.
+    # ─────────────────────────────────────────────────────────────────────────
+    enable_language(CUDA)
+    add_library(hotstep_plugins SHARED
+        src/plugins/convrot_int8_linear_plugin.cpp
+        src/plugins/convrot_int8_linear_kernel.cu
+    )
+    target_compile_definitions(hotstep_plugins PRIVATE HOT_STEP_TRT)
+    # On Windows, export hotstep_register_plugins via __declspec(dllexport)
+    # (defined in the plugin .cpp via HOTSTEP_PLUGIN_EXPORT). On Linux/macOS
+    # the default visibility is sufficient.
+    if(WIN32)
+        # Required for MSVC: resolve CUDA device code symbols from .cu objects
+        # into the DLL. Without this the linker fails with unresolved externals.
+        set_target_properties(hotstep_plugins PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    endif()
+    target_include_directories(hotstep_plugins PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${_TRT_INC_DIR}"
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    target_link_libraries(hotstep_plugins PRIVATE
+        "${_TRT_NVINFER_LIB}"
+        CUDA::cudart
+    )
+    # cuBLASLt is used for the INT8 GEMM in production builds.
+    if(TARGET CUDA::cublasLt)
+        target_link_libraries(hotstep_plugins PRIVATE CUDA::cublasLt)
+    endif()
+    # Install the shared library next to the engine binary so dlopen/LoadLibrary
+    # finds it via $ORIGIN (Linux/macOS) or same-directory search (Windows).
+    set_target_properties(hotstep_plugins PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
+    message(STATUS "[TRT] HOT-Step plugin library: $<TARGET_FILE_NAME:hotstep_plugins> (ConvRotInt8Linear)")
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -473,6 +525,46 @@ if(CUDAToolkit_FOUND)
         target_link_libraries(test-trt-bundle-manifest PRIVATE CUDA::cudart_static)
     else()
         target_link_libraries(test-trt-bundle-manifest PRIVATE CUDA::cudart)
+    endif()
+endif()
+
+# test-convrot-int8-plugin: unit test for the ConvRotInt8Linear TRT plugin.
+# Verifies the CUDA kernel math against NumPy reference test vectors and the
+# plugin creator's registration with TRT's plugin registry. Only built when
+# TRT is enabled (the plugin library must be on LD_LIBRARY_PATH / next to the
+# exe at runtime so the static REGISTER_TENSORRT_PLUGIN can register the creator).
+if(TRT_ENABLED)
+    add_executable(test-convrot-int8-plugin tests/test-convrot-int8-plugin.cpp)
+    target_compile_definitions(test-convrot-int8-plugin PRIVATE HOT_STEP_TRT)
+    target_include_directories(test-convrot-int8-plugin PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${_TRT_INC_DIR}"
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    target_link_libraries(test-convrot-int8-plugin PRIVATE
+        hotstep_plugins
+        "${_TRT_NVINFER_LIB}"
+        CUDA::cudart
+    )
+    # On Windows, copy the plugin DLL and TRT runtime DLLs next to the test
+    # executable so they can be found at runtime.
+    if(WIN32)
+        add_custom_command(TARGET test-convrot-int8-plugin POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:hotstep_plugins>"
+                "$<TARGET_FILE_DIR:test-convrot-int8-plugin>"
+            COMMENT "Copying hotstep_plugins DLL for test"
+        )
+        foreach(_trt_dll nvinfer_11.dll nvinfer.dll nvonnxparser_11.dll nvonnxparser.dll)
+            if(EXISTS "${_TRT_BIN_DIR}/${_trt_dll}")
+                add_custom_command(TARGET test-convrot-int8-plugin POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${_TRT_BIN_DIR}/${_trt_dll}"
+                        "$<TARGET_FILE_DIR:test-convrot-int8-plugin>/${_trt_dll}"
+                    COMMENT "Copying ${_trt_dll} for test"
+                )
+            endif()
+        endforeach()
     endif()
 endif()
 
@@ -654,6 +746,31 @@ if(SUPERSEP_ENABLED AND UNIX AND NOT APPLE)
             COMMENT "Copying ${_solib}"
         )
     endforeach()
+endif()
+
+# Copy TRT runtime DLLs + hotstep_plugins DLL next to ace-server on Windows.
+# TRT DLLs live in ${TRT_ROOT}/bin/; the plugin DLL is a build artifact.
+# Without this, LoadLibrary("hotstep_plugins.dll") in dit-trt.h fails because
+# Windows can't resolve transitive DLL deps (nvinfer_11.dll, cudart64_*.dll).
+if(TRT_ENABLED AND WIN32)
+    # Copy TRT runtime DLLs from the SDK bin/ directory
+    foreach(_trt_dll nvinfer_11.dll nvinfer.dll nvonnxparser_11.dll nvonnxparser.dll)
+        if(EXISTS "${_TRT_BIN_DIR}/${_trt_dll}")
+            add_custom_command(TARGET ace-server POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_TRT_BIN_DIR}/${_trt_dll}"
+                    "$<TARGET_FILE_DIR:ace-server>/${_trt_dll}"
+                COMMENT "Copying ${_trt_dll} for ace-server"
+            )
+        endif()
+    endforeach()
+    # Copy the hotstep_plugins DLL (built by the hotstep_plugins target)
+    add_custom_command(TARGET ace-server POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:hotstep_plugins>"
+            "$<TARGET_FILE_DIR:ace-server>/"
+        COMMENT "Copying hotstep_plugins DLL for ace-server"
+    )
 endif()
 
 add_executable(ace-understand tools/ace-understand.cpp)

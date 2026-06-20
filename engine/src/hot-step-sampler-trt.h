@@ -6,7 +6,7 @@
 // is identical — only the model forward pass changes.
 //
 // Data layout: host FP32 [B, T, C] <-> FP32 TRT graph I/O.
-// q8map-fp16 and w8a16 lower selected matrix weights inside the ONNX graph;
+// q8map-fp16 and w8a8 lower selected matrix weights inside the ONNX graph;
 // neither changes the DiT engine's external input/output tensor dtypes.
 // Masks, RoPE, position IDs are computed inside the ONNX graph (not here).
 

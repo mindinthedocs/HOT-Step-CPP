@@ -11,9 +11,15 @@ export function formatDitModel(filename: string): string {
   if (filename === 'dit_fp8.onnx') return 'DiT XL FP8 (TensorRT)';
   if (filename === 'dit_bf16.onnx') return 'DiT XL BF16 (TensorRT)';
 
-  // TRT bundles: acestep-v15-2b-<variant> -> "TRT 2B q8map-fp16"
-  const trtMatch = filename.match(/^acestep-v15-2b-(.+)$/);
-  if (trtMatch) return `TRT 2B ${trtMatch[1]}`;
+  // TRT bundles: two patterns are recognized.
+  //   Current scheme: ``trt-<sourceModel>-<precision>``  -> "TRT <sourceModel> <precision>"
+  //   Legacy scheme:  ``acestep-v15-2b-<variant>``        -> "TRT 2B <variant>" (kept for
+  //   existing bundles; the 2B tag was misleading since XL is 4B not 2B, but we
+  //   preserve the legacy label so users can identify pre-rename bundles).
+  const trtNewMatch = filename.match(/^trt-(acestep-v15-.+)-((?:q8map-fp16|w8a8|fp32))$/);
+  if (trtNewMatch) return `TRT ${trtNewMatch[1]} ${trtNewMatch[2]}`;
+  const trtLegacyMatch = filename.match(/^acestep-v15-2b-(.+)$/);
+  if (trtLegacyMatch) return `TRT (legacy 2B) ${trtLegacyMatch[1]}`;
 
   const name = filename.replace(/\.gguf$/i, '');
 

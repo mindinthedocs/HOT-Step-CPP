@@ -124,7 +124,6 @@ def build_dit(args, input_root: Path, src: Path, dst: Path) -> None:
         sys.executable,
         SCRIPT_DIR / "build-trt-engine.py",
         "--onnx", dit_onnx,
-        "--out-dir", dst / "engines",
         "--profile", args.profile,
         "--precision-policy", args.precision,
         "--workspace-gb", args.dit_workspace_gb,
@@ -217,7 +216,7 @@ def main() -> None:
                         help="Comma-separated selection: dit,embedding,lm,vae,all")
     parser.add_argument("--name-prefix", default=None,
                         help="Bundle name prefix (default: input root folder name)")
-    parser.add_argument("--precision", choices=["q8map-fp16", "w8a16", "fp32"], default="w8a16")
+    parser.add_argument("--precision", choices=["q8map-fp16", "w8a8", "fp32"], default="w8a8")
     parser.add_argument("--profile", default="pj-ode-320")
     parser.add_argument("--opset", default="18")
     parser.add_argument("--device", default="cpu")

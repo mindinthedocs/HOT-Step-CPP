@@ -2,7 +2,7 @@
 //
 // Operator surface for building TRT bundles (partner §7):
 //  - DiT component checkbox (LM / VAE / Embedded greyed "coming soon")
-//  - variant dropdown (q8map-fp16 / w8a16 / fp32)
+//  - variant dropdown (q8map-fp16 / w8a8 / fp32)
 //  - Build / Rebuild button -> POST /api/trt-bundles/build
 //  - build progress bar driven by the build SSE (TrtBuildProgressBar)
 //  - error + Retry state (409 single-GPU lock surfaced here too)
@@ -17,7 +17,7 @@ import { useTrtBuildStream } from './useTrtBuildStream';
 import { TrtBuildProgressBar } from './TrtBuildProgressBar';
 import { SystemDependencies } from './SystemDependencies';
 
-const PRECISION_OPTIONS = ['q8map-fp16', 'w8a16'] as const;
+const PRECISION_OPTIONS = ['q8map-fp16', 'w8a8'] as const;
 const TAB_ITEMS = [
   { id: 'dit', label: 'DiT', disabled: false },
   { id: 'lm', label: 'LM', disabled: true },
@@ -120,19 +120,19 @@ export const TrtBackendSection: React.FC<{ onBundlesChanged?: () => void }> = ({
 
   useEffect(() => {
     const cap = deps?.gpuCapability;
-    if (precision === 'w8a16' && cap != null && cap < 7.5) {
+    if (precision === 'w8a8' && cap != null && cap < 7.5) {
       setPrecision('q8map-fp16');
     }
   }, [deps?.gpuCapability, precision]);
 
   const inventoryRow = bundles.find((bundle) => bundle.variant === variant);
   const hasSafetensors = inventoryRow?.safetensorsComplete ?? false;
-  const bundleBuilt = precision === 'w8a16'
-    ? (inventoryRow?.engines.w8a16 ?? false)
+  const bundleBuilt = precision === 'w8a8'
+    ? (inventoryRow?.engines.w8a8 ?? false)
     : (inventoryRow?.engines['q8map-fp16'] ?? false);
   const buildVerb = bundleBuilt ? 'Rebuild Engine' : (hasSafetensors ? 'Build Engine' : 'Download and build');
   const BuildIcon = bundleBuilt ? RefreshCw : Hammer;
-  const w8a16Disabled = (deps?.gpuCapability ?? 99) < 7.5;
+  const w8a8Disabled = (deps?.gpuCapability ?? 99) < 7.5;
   const buildDisabled = isBuilding || !variant || (deps?.freeDiskSpaceGb ?? 3) <= 2;
   const activeTab = 'dit';
 
@@ -219,7 +219,7 @@ export const TrtBackendSection: React.FC<{ onBundlesChanged?: () => void }> = ({
                        outline-none transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {PRECISION_OPTIONS.map((option) => (
-              <option key={option} value={option} disabled={option === 'w8a16' && w8a16Disabled}>
+              <option key={option} value={option} disabled={option === 'w8a8' && w8a8Disabled}>
                 {option}
               </option>
             ))}

@@ -221,7 +221,7 @@ export const SystemDependencies: React.FC<{
       },
       {
         title: 'GPU Arch',
-        detail: 'Compute capability required for w8a16: sm_75+',
+        detail: 'Compute capability required for w8a8: sm_75+',
         pill: <Pill tone={gpuTone} label={gpuLabel} />,
       },
       {
