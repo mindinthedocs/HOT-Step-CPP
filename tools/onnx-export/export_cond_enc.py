@@ -181,46 +181,92 @@ class CondEncoderWrapperFixed(nn.Module):
         self.timbre_layers = cond_encoder.timbre_encoder.layers
         self.timbre_config = cond_encoder.timbre_encoder.config
     
+    def _build_sliding_window_mask(self, S, window=128, device=None, dtype=None):
+        """Build a [1, 1, S, S] additive bias mask matching the GGML timbre/lyric
+        sliding-window mask in cond-enc.h:342-356 / 367-379.
+
+        Value convention: 0.0 = attend, -inf = mask out. The HF Qwen3 attention
+        layer treats this as an additive bias applied to the attention scores
+        before softmax — positions with -inf contribute zero weight after
+        softmax, exactly matching the GGML flash_attn_ext mask semantics.
+
+        Bidirectional sliding window: position (i, j) is unmasked iff |i - j| <= window.
+        When S <= window + 1 the mask is effectively all-zeros (full attention),
+        matching the GGML short-sequence short-circuit.
+        """
+        if device is None:
+            device = torch.device("cpu")
+        if dtype is None:
+            dtype = torch.float32
+        positions = torch.arange(S, device=device, dtype=torch.float32)
+        # |i - j| matrix [S, S]
+        diff = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
+        # 0.0 for attend, -inf for mask — matches ggml_fp32_to_fp16(0.0f / -INFINITY)
+        mask = torch.where(diff <= float(window),
+                           torch.zeros((), device=device, dtype=dtype),
+                           torch.full((), float("-inf"), device=device, dtype=dtype))
+        return mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+
     def _timbre_forward_simple(self, timbre_feats):
         """Run the timbre encoder without unpack_timbre_embeddings.
-        
+
         timbre_feats: [B, S_ref, 64]
         Returns: [B, 1, hidden_size] — CLS token output when enabled,
                  otherwise the first timbre frame output.
+
+        Mask handling: the GGML reference path (cond-enc.h:300-303) passes a
+        bidirectional sliding-window mask (window=128) on even timbre layers
+        (layer_type=0) and NULL (full bidirectional) on odd layers. The
+        previous TRT export passed ``None`` on EVERY layer, which disabled
+        the sliding window entirely and made the FP16 attention numerically
+        unstable on long references — saturating to ±Inf/NaN and triggering
+        the cond-enc-trt.h sanitizer that zeroes those rows. The zeroed
+        timbre token is then byte-for-byte identical to "no timbre reference",
+        which is the root cause of the timbre-reference bug on long clips.
+
+        We now build the [1, 1, S_timbre, S_timbre] additive bias mask once
+        and pass it on even layers, ``None`` on odd layers — matching the
+        GGML path bit-for-bit (modulo FP16 rounding).
         """
         B = timbre_feats.shape[0]
-        
+
         # Project: [B, S_ref, 64] → [B, S_ref, hidden_size]
         inputs_embeds = self.timbre_embed_tokens(timbre_feats)
-        
+
         if self.use_timbre_cls:
             cls_token = self.timbre_special_token.expand(B, 1, -1)
             inputs_embeds = torch.cat([cls_token, inputs_embeds], dim=1)
-        
+
         S = inputs_embeds.shape[1]
-        
+
         # Position IDs and RoPE
         cache_position = torch.arange(0, S, device=inputs_embeds.device)
         position_ids = cache_position.unsqueeze(0)
         position_embeddings = self.timbre_rotary_emb(inputs_embeds, position_ids)
-        
-        # Build attention mask (full bidirectional, no padding)
-        # Using None for SDPA = no mask = full attention
+
+        # Sliding-window mask (window=128) matching cond-enc.h:367-379.
+        # Built once, reused on even layers; None on odd layers (full attention).
+        slide_mask = self._build_sliding_window_mask(
+            S, window=128,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+
         hidden_states = inputs_embeds
-        
-        for layer in self.timbre_layers:
+        for i, layer in enumerate(self.timbre_layers):
+            layer_mask = slide_mask if (i % 2 == 0) else None
             layer_outputs = layer(
                 hidden_states,
                 position_embeddings,
-                None,  # attention_mask=None → full bidirectional
+                layer_mask,
                 position_ids,
             )
             hidden_states = layer_outputs[0]
-        
+
         hidden_states = self.timbre_norm(hidden_states)
-        
+
         timbre_emb = hidden_states[:, 0:1, :]  # [B, 1, hidden_size]
-        
+
         return timbre_emb
     
     def forward(self, text_hidden, lyric_embed, timbre_feats):

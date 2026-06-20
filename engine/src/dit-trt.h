@@ -78,12 +78,15 @@ struct DitTrt {
     nvinfer1::IExecutionContext*   context  = nullptr;
 
     // I/O tensor indices (resolved once at load time)
-    // Inputs:  input_latents[B,T,192], enc_hidden[B,S,2048], t[B], t_r[B]
+    // Inputs:  input_latents[B,T,192], enc_hidden[B,S,2048], t[B], t_r[B],
+    //          attention_mask[B,T] (int64), encoder_attention_mask[B,S] (int64)
     // Outputs: velocity[B,T,64]
     int idx_input_latents = -1;
     int idx_enc_hidden    = -1;
     int idx_t             = -1;
     int idx_t_r           = -1;
+    int idx_attention_mask         = -1;  // int64 [B,T] — self-attn padding
+    int idx_encoder_attention_mask = -1;  // int64 [B,S] — cross-attn padding
     int idx_velocity      = -1;
     nvinfer1::DataType dtype_input_latents = nvinfer1::DataType::kFLOAT;
     nvinfer1::DataType dtype_enc_hidden    = nvinfer1::DataType::kFLOAT;
@@ -316,6 +319,36 @@ inline bool dit_trt_build(
             nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims{1, {1}}, "opt") ||
         !set_profile_dims("t_r",
             nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims{1, {2}}, "max")) {
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
+
+    // attention_mask: [B, T] int64 — self-attn padding mask.
+    // Tied to the same T range as input_latents.
+    if (!set_profile_dims("attention_mask",
+            nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims2(1, 64), "min") ||
+        !set_profile_dims("attention_mask",
+            nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims2(1, 2048), "opt") ||
+        !set_profile_dims("attention_mask",
+            nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims2(2, 8192), "max")) {
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+        return false;
+    }
+
+    // encoder_attention_mask: [B, S] int64 — cross-attn padding mask.
+    // Tied to the same S range as enc_hidden.
+    if (!set_profile_dims("encoder_attention_mask",
+            nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims2(1, 64), "min") ||
+        !set_profile_dims("encoder_attention_mask",
+            nvinfer1::OptProfileSelector::kOPT, nvinfer1::Dims2(1, 512), "opt") ||
+        !set_profile_dims("encoder_attention_mask",
+            nvinfer1::OptProfileSelector::kMAX, nvinfer1::Dims2(2, 2048), "max")) {
         delete config;
         delete parser;
         delete network;
@@ -922,6 +955,12 @@ inline bool dit_trt_load(
         }
         else if (std::string(name) == "t")          ctx->idx_t = i;
         else if (std::string(name) == "t_r")        ctx->idx_t_r = i;
+        else if (std::string(name) == "attention_mask") {
+            ctx->idx_attention_mask = i;
+        }
+        else if (std::string(name) == "encoder_attention_mask") {
+            ctx->idx_encoder_attention_mask = i;
+        }
         else if (std::string(name) == "velocity") {
             ctx->idx_velocity = i;
             ctx->dtype_velocity = dtype;
@@ -931,6 +970,23 @@ inline bool dit_trt_load(
     if (ctx->idx_input_latents < 0 || ctx->idx_enc_hidden < 0 ||
         ctx->idx_t < 0 || ctx->idx_t_r < 0 || ctx->idx_velocity < 0) {
         fprintf(stderr, "[DiT-TRT] Missing I/O tensors!\n");
+        return false;
+    }
+
+    // The attention_mask and encoder_attention_mask inputs were added in a
+    // later revision (timbre-reference fix). Engines built before the fix
+    // don't have these bindings — refuse to load so the user re-builds the
+    // engine from the updated ONNX. Silently continuing would re-introduce
+    // the timbre-dilution bug.
+    if (ctx->idx_attention_mask < 0 || ctx->idx_encoder_attention_mask < 0) {
+        fprintf(stderr,
+                "[DiT-TRT] FATAL: engine is missing attention_mask / encoder_attention_mask\n"
+                "[DiT-TRT]        bindings. This engine was built from an older ONNX export\n"
+                "[DiT-TRT]        that did not pass attention masks into the DiT graph, which\n"
+                "[DiT-TRT]        causes the cross-attention to attend to null_cond_vec\n"
+                "[DiT-TRT]        padding and silently ignore the timbre reference.\n"
+                "[DiT-TRT]        Re-export the ONNX with the patched export_dit.py and\n"
+                "[DiT-TRT]        rebuild the TRT engine with build-trt-engine.py.\n");
         return false;
     }
 
@@ -1078,19 +1134,23 @@ inline int64_t dit_trt_refit_base(DitTrt* ctx) {
 // Run one DiT forward pass (one diffusion timestep).
 // All pointers are GPU device memory.
 //
-// input_latents: [N, T, 192] fp16
-// enc_hidden:    [N, S, 2048] fp16
-// t:             [N] fp32
-// t_r:           [N] fp32
-// velocity_out:  [N, T, 64] fp16 (output)
+// input_latents:           [N, T, 192] fp16
+// enc_hidden:              [N, S, 2048] fp16
+// t:                       [N] fp32
+// t_r:                     [N] fp32
+// attention_mask:          [N, T] int64 — self-attn padding (1=attend, 0=pad)
+// encoder_attention_mask:  [N, S] int64 — cross-attn padding (1=attend, 0=pad)
+// velocity_out:            [N, T, 64] fp16 (output)
 inline bool dit_trt_forward(
     DitTrt*     ctx,
-    const void* input_latents,  // GPU, fp16 [N, T, 192]
-    const void* enc_hidden,     // GPU, fp16 [N, S, 2048]
-    const float* t,             // GPU, fp32 [N]
-    const float* t_r,           // GPU, fp32 [N]
+    const void* input_latents,                // GPU, fp16 [N, T, 192]
+    const void* enc_hidden,                   // GPU, fp16 [N, S, 2048]
+    const float* t,                           // GPU, fp32 [N]
+    const float* t_r,                         // GPU, fp32 [N]
     int N, int T, int S,
-    void* velocity_out,         // GPU, fp16 [N, T, 64]
+    const void* attention_mask,               // GPU, int64 [N, T]
+    const void* encoder_attention_mask,       // GPU, int64 [N, S]
+    void* velocity_out,                       // GPU, fp16 [N, T, 64]
     cudaStream_t stream = nullptr
 ) {
     if (!ctx || !ctx->engine || !ctx->context) {
@@ -1105,11 +1165,15 @@ inline bool dit_trt_forward(
     const char* t_name             = ctx->engine->getIOTensorName(ctx->idx_t);
     const char* t_r_name           = ctx->engine->getIOTensorName(ctx->idx_t_r);
     const char* velocity_name      = ctx->engine->getIOTensorName(ctx->idx_velocity);
+    const char* attention_mask_name         = ctx->engine->getIOTensorName(ctx->idx_attention_mask);
+    const char* encoder_attention_mask_name = ctx->engine->getIOTensorName(ctx->idx_encoder_attention_mask);
 
     if (!context->setInputShape(input_latents_name, nvinfer1::Dims3(N, T, 192)) ||
         !context->setInputShape(enc_hidden_name,    nvinfer1::Dims3(N, S, 2048)) ||
         !context->setInputShape(t_name,             nvinfer1::Dims{1, {N}}) ||
-        !context->setInputShape(t_r_name,           nvinfer1::Dims{1, {N}})) {
+        !context->setInputShape(t_r_name,           nvinfer1::Dims{1, {N}}) ||
+        !context->setInputShape(attention_mask_name,         nvinfer1::Dims2(N, T)) ||
+        !context->setInputShape(encoder_attention_mask_name, nvinfer1::Dims2(N, S))) {
         fprintf(stderr, "[DiT-TRT] FATAL: failed to set input shapes (N=%d T=%d S=%d)\n",
                 N, T, S);
         return false;
@@ -1120,6 +1184,8 @@ inline bool dit_trt_forward(
         !context->setTensorAddress(enc_hidden_name,    const_cast<void*>(enc_hidden)) ||
         !context->setTensorAddress(t_name,             const_cast<void*>(static_cast<const void*>(t))) ||
         !context->setTensorAddress(t_r_name,           const_cast<void*>(static_cast<const void*>(t_r))) ||
+        !context->setTensorAddress(attention_mask_name,         const_cast<void*>(attention_mask)) ||
+        !context->setTensorAddress(encoder_attention_mask_name, const_cast<void*>(encoder_attention_mask)) ||
         !context->setTensorAddress(velocity_name,      velocity_out)) {
         fprintf(stderr, "[DiT-TRT] FATAL: failed to bind tensor addresses\n");
         return false;

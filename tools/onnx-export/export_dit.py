@@ -137,55 +137,68 @@ class DiTForwardWrapper(nn.Module):
     """
     Wrapper around AceStepDiTModel.forward() that simplifies the interface
     for ONNX export.
-    
-    ONNX inputs (4 total):
-        input_latents:  [B, T, 192]  — pre-concatenated [context_latents, xt]
-        enc_hidden:     [B, S, 2048] — encoder hidden states
-        t:              [B]          fp32 — current timestep
-        t_r:            [B]          fp32 — reference timestep
-    
+
+    ONNX inputs (6 total):
+        input_latents:           [B, T, 192]  — pre-concatenated [context_latents, xt]
+        enc_hidden:              [B, S, 2048] — encoder hidden states
+        t:                       [B]          fp32 — current timestep
+        t_r:                     [B]          fp32 — reference timestep
+        attention_mask:          [B, T]       int64 — self-attn padding mask (1=attend, 0=pad)
+        encoder_attention_mask:  [B, S]       int64 — cross-attn padding mask (1=attend, 0=pad)
+
     ONNX output:
-        velocity:       [B, T, 64]   — predicted flow velocity
-    
-    Masks and position IDs are computed internally from T and S.
+        velocity:                [B, T, 64]   — predicted flow velocity
+
+    The two int64 masks are passed straight through to the underlying DiT model
+    as ``attention_mask`` and ``encoder_attention_mask``. The model converts
+    them to 4D additive biases internally and applies its trained sliding-window
+    pattern on even self-attention layers (layer_type=0). Position IDs and
+    RoPE are still computed internally from T and S.
+
+    Without these masks the DiT cross-attends to the ``null_cond_vec`` padding
+    that the C++ pipeline packs into ``enc_hidden`` for batched CFG / multi-
+    request generation, diluting the timbre token (and lyric/text tokens) and
+    effectively ignoring the reference audio. Passing the masks lets the model
+    mask out padding positions the same way the GGML path does via its
+    ``ca_mask`` graph input.
     """
-    
+
     def __init__(self, dit_model, precision="q8map-fp16"):
         super().__init__()
         self.dit = dit_model
         self.config = dit_model.config
         self.precision = precision
-    
-    def forward(self, input_latents, enc_hidden, t, t_r):
+
+    def forward(self, input_latents, enc_hidden, t, t_r,
+                attention_mask, encoder_attention_mask):
         """
         Args:
-            input_latents: [B, T, 192] — concatenated context + noise latents
-            enc_hidden:    [B, S, 2048] — encoder hidden states  
-            t:             [B] — timestep
-            t_r:           [B] — reference timestep
+            input_latents:           [B, T, 192] — concatenated context + noise latents
+            enc_hidden:              [B, S, 2048] — encoder hidden states
+            t:                       [B] — timestep
+            t_r:                     [B] — reference timestep
+            attention_mask:          [B, T] int64 — self-attn padding mask (1=real, 0=pad)
+            encoder_attention_mask:  [B, S] int64 — cross-attn padding mask (1=real, 0=pad)
         Returns:
-            velocity:      [B, T, 64] — predicted velocity
+            velocity:                [B, T, 64] — predicted velocity
         """
-        B = input_latents.shape[0]
-        T = input_latents.shape[1]
-        
         # Split input_latents into context (128 dim) and noise (64 dim)
         context_latents = input_latents[:, :, :128]
         hidden_states = input_latents[:, :, 128:]
-        
+
         outputs = self.dit(
             hidden_states=hidden_states,
             timestep=t,
             timestep_r=t_r,
-            attention_mask=None,
+            attention_mask=attention_mask,
             encoder_hidden_states=enc_hidden,
-            encoder_attention_mask=None,
+            encoder_attention_mask=encoder_attention_mask,
             context_latents=context_latents,
             use_cache=False,
             past_key_values=None,
             output_attentions=False,
         )
-        
+
         # outputs[0] is the velocity prediction [B, T, 64]
         velocity = outputs[0]
         return velocity
@@ -2296,10 +2309,20 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
     dummy_enc_hidden = torch.randn(B, S, 2048, device=device, dtype=tensor_dtype)
     dummy_t = torch.tensor([0.5], device=device, dtype=torch.float32)  # always fp32
     dummy_t_r = torch.tensor([0.5], device=device, dtype=torch.float32)  # always fp32
+    # Padding masks for self-/cross-attention. All ones during tracing — the
+    # model expands these to 4D additive biases and applies its trained
+    # sliding-window pattern on even layers. At runtime the C++ host fills
+    # 0 for padded positions so cross-attention ignores null_cond_vec tail
+    # padding in enc_hidden (the timbre-dilution bug) and self-attention
+    # ignores any latent padding beyond real_S[b].
+    dummy_attention_mask = torch.ones(B, T, device=device, dtype=torch.long)
+    dummy_encoder_attention_mask = torch.ones(B, S, device=device, dtype=torch.long)
     
     print(f"[export_dit] Tracing with shapes: input_latents={list(dummy_input_latents.shape)}, "
-          f"enc_hidden={list(dummy_enc_hidden.shape)}, t={list(dummy_t.shape)}")
-    print(f"[export_dit] Input dtype: {tensor_dtype}, t/t_r dtype: fp32")
+          f"enc_hidden={list(dummy_enc_hidden.shape)}, t={list(dummy_t.shape)}, "
+          f"attention_mask={list(dummy_attention_mask.shape)}, "
+          f"encoder_attention_mask={list(dummy_encoder_attention_mask.shape)}")
+    print(f"[export_dit] Input dtype: {tensor_dtype}, t/t_r dtype: fp32, masks dtype: int64")
     
     print("[export_dit] Skipping PyTorch forward preflight for low-memory export")
     
@@ -2308,7 +2331,10 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
     t0 = time.time()
     
     # Dynamo requires dynamic_shapes (not dynamic_axes)
-    # Each input gets a dict mapping dim index → Dim object
+    # Each input gets a dict mapping dim index → Dim object.
+    # attention_mask shares the same seq_len Dim as input_latents (axis 1 == T),
+    # and encoder_attention_mask shares enc_seq_len with enc_hidden (axis 1 == S).
+    # Tying the Dims guarantees the runtime shapes agree, which TRT requires.
     batch = torch.export.Dim("batch", min=1, max=4)
     seq_len = torch.export.Dim("seq_len", min=64, max=8192)
     enc_seq_len = torch.export.Dim("enc_seq_len", min=64, max=2048)
@@ -2318,14 +2344,18 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
         "enc_hidden":    {0: batch, 1: enc_seq_len},
         "t":             {0: batch},
         "t_r":           {0: batch},
+        "attention_mask":         {0: batch, 1: seq_len},
+        "encoder_attention_mask": {0: batch, 1: enc_seq_len},
     }
     
     onnx_program = torch.onnx.export(
         wrapper,
-        (dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r),
+        (dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r,
+         dummy_attention_mask, dummy_encoder_attention_mask),
         None,
         opset_version=opset,
-        input_names=["input_latents", "enc_hidden", "t", "t_r"],
+        input_names=["input_latents", "enc_hidden", "t", "t_r",
+                     "attention_mask", "encoder_attention_mask"],
         output_names=["velocity"],
         dynamic_shapes=dynamic_shapes,
         export_params=False,

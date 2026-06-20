@@ -471,6 +471,12 @@ def profile_shapes(profile_name: str) -> dict:
             "enc_hidden": (n, enc_s, DIT_DEFAULTS["encoder_hidden_size"]),
             "t": (n,),
             "t_r": (n,),
+            # Self-/cross-attention padding masks (int64). Tied to the same
+            # T / S dims as input_latents / enc_hidden. Without these the DiT
+            # cross-attends to null_cond_vec padding and dilutes the timbre
+            # token — see export_dit.py:DiTForwardWrapper docstring.
+            "attention_mask": (n, t),
+            "encoder_attention_mask": (n, enc_s),
             "velocity": (n, t, DIT_DEFAULTS["out_channels"]),
         }
 

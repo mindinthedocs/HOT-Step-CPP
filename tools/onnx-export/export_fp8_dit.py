@@ -31,13 +31,17 @@ def generate_calibration_data(num_samples=16, seq_len=512, enc_seq_len=256):
     """Generate random calibration data matching DiT ONNX input signatures.
 
     Input names and shapes (from export_dit.py DiTForwardWrapper):
-        input_latents:  [B, T, 192]   — concatenated context + noise latents
-        enc_hidden:     [B, S, 2048]  — encoder hidden states
-        t:              [B]           — timestep (fp32)
-        t_r:            [B]           — reference timestep (fp32)
+        input_latents:           [B, T, 192]   — concatenated context + noise latents
+        enc_hidden:              [B, S, 2048]  — encoder hidden states
+        t:                       [B]           — timestep (fp32)
+        t_r:                     [B]           — reference timestep (fp32)
+        attention_mask:          [B, T]        — self-attn padding mask (int64)
+        encoder_attention_mask:  [B, S]        — cross-attn padding mask (int64)
 
     modelopt expects Dict[str, np.ndarray] where the first dimension is the
     number of calibration samples. Each sample is fed as batch=1 inference.
+    Masks are all-ones during calibration (no padding) — the model expands
+    them to 4D additive biases internally.
     """
     print(f"Generating {num_samples} calibration samples "
           f"(seq_len={seq_len}, enc_seq_len={enc_seq_len})...")
@@ -51,6 +55,10 @@ def generate_calibration_data(num_samples=16, seq_len=512, enc_seq_len=256):
         "t": np.random.uniform(0.0, 1.0, size=(num_samples,)).astype(np.float32),
         # [num_samples]
         "t_r": np.random.uniform(0.0, 1.0, size=(num_samples,)).astype(np.float32),
+        # [num_samples, T] int64 — all-ones (attend to all positions)
+        "attention_mask": np.ones((num_samples, seq_len), dtype=np.int64),
+        # [num_samples, S] int64 — all-ones
+        "encoder_attention_mask": np.ones((num_samples, enc_seq_len), dtype=np.int64),
     }
 
 

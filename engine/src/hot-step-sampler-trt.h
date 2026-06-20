@@ -296,6 +296,52 @@ static int dit_trt_generate(DitTrt *              trt,
         }
     }
 
+    // ── Build attention masks (int64) ──────────────────────────────────
+    // attention_mask[B, T]         — self-attn padding (1=real, 0=pad beyond real_S[b])
+    // encoder_attention_mask[B, S] — cross-attn padding (1=real, 0=pad beyond real_enc_S[b])
+    //
+    // The TRT DiT engine feeds these to the model's attention_mask /
+    // encoder_attention_mask args. The model converts them to 4D additive
+    // biases and applies its trained sliding-window pattern on even layers.
+    // Without these masks the DiT cross-attends to the null_cond_vec padding
+    // in enc_hidden — diluting the timbre token at S_lyric and effectively
+    // ignoring the reference audio. This is the timbre-reference bug.
+    //
+    // The uncond (CFG) slot uses the SAME encoder mask as its cond slot,
+    // matching hot-step-sampler.h:244 (ca_data memcpy from cond to uncond).
+    // For the uncond slot, positions [0, real_enc_S[b]) hold null_cond_vec
+    // (not the real conditioning), but we still mask out positions beyond
+    // real_enc_S[b] so the model sees the same attention pattern it was
+    // trained with.
+    //
+    // The encoder mask is rebuilt + re-uploaded when (a) a cover switch
+    // happens (real_enc_S_switch != real_enc_S) or (b) CFG cutoff shrinks
+    // N_graph from 2N to N. The build_attn_mask lambda is reused in both
+    // rebuild sites with the appropriate real_arr pointer.
+    auto build_attn_mask = [&](std::vector<int64_t> & buf, int n_graph, int seq,
+                                const int * real_arr) {
+        buf.assign((size_t) n_graph * seq, 1);
+        if (!real_arr) return;
+        for (int b = 0; b < N; b++) {
+            int rs = real_arr[b];
+            if (rs < 0) rs = 0;
+            if (rs > seq) rs = seq;
+            for (int t = rs; t < seq; t++) {
+                buf[(size_t) b * seq + t] = 0;
+            }
+            if (batch_cfg && n_graph > N) {
+                memcpy(&buf[(size_t) N * seq + (size_t) b * seq],
+                       &buf[(size_t) b * seq],
+                       (size_t) seq * sizeof(int64_t));
+            }
+        }
+    };
+
+    std::vector<int64_t> attn_mask_buf;          // [N_graph, T] — rebuilt on CFG cutoff
+    std::vector<int64_t> enc_attn_mask_buf;      // [N_graph, enc_S] — rebuilt on cover switch + CFG cutoff
+    build_attn_mask(attn_mask_buf, N_graph, T, real_S);
+    build_attn_mask(enc_attn_mask_buf, N_graph, enc_S, real_enc_S);
+
     // Data layout depends on engine I/O dtype:
     //   IO_BF16: host FP32 → bf16 staging → GPU (standard dynamo export)
     //   IO_FP16: host FP32 → fp16 staging → GPU (hypothetical)
@@ -318,12 +364,16 @@ static int dit_trt_generate(DitTrt *              trt,
     // GPU device memory
     void *d_input = nullptr, *d_enc = nullptr, *d_vel = nullptr;
     float *d_t = nullptr, *d_t_r = nullptr;
+    void *d_attn_mask = nullptr;          // int64 [N_graph, T]
+    void *d_enc_attn_mask = nullptr;      // int64 [N_graph, enc_S]
     auto release_io_buffers = [&]() {
         if (d_input) { cudaFree(d_input); d_input = nullptr; }
         if (d_enc)   { cudaFree(d_enc);   d_enc = nullptr; }
         if (d_vel)   { cudaFree(d_vel);   d_vel = nullptr; }
         if (d_t)     { cudaFree(d_t);     d_t = nullptr; }
         if (d_t_r)   { cudaFree(d_t_r);   d_t_r = nullptr; }
+        if (d_attn_mask)     { cudaFree(d_attn_mask);     d_attn_mask = nullptr; }
+        if (d_enc_attn_mask) { cudaFree(d_enc_attn_mask); d_enc_attn_mask = nullptr; }
     };
 
     cudaMalloc(&d_input, input_elems * io_elem_bytes);
@@ -331,12 +381,28 @@ static int dit_trt_generate(DitTrt *              trt,
     cudaMalloc(&d_vel,   vel_elems * io_elem_bytes);
     cudaMalloc((void**)&d_t,     N_graph * sizeof(float));
     cudaMalloc((void**)&d_t_r,   N_graph * sizeof(float));
+    // Attention masks are always int64 regardless of engine I/O dtype — the
+    // ONNX graph traces them as torch.long → ONNX INT64 → TRT INT64.
+    cudaMalloc(&d_attn_mask,     (size_t) N_graph * T     * sizeof(int64_t));
+    cudaMalloc(&d_enc_attn_mask, (size_t) N_graph * enc_S * sizeof(int64_t));
 
-    if (!d_input || !d_enc || !d_vel || !d_t || !d_t_r) {
+    if (!d_input || !d_enc || !d_vel || !d_t || !d_t_r ||
+        !d_attn_mask || !d_enc_attn_mask) {
         fprintf(stderr, "[DiT-TRT] FATAL: cudaMalloc failed\n");
         release_io_buffers();
         return -1;
     }
+
+    // Upload masks once — they don't change across diffusion steps except:
+    //   - enc_attn_mask is rebuilt + re-uploaded after a cover switch
+    //     (enc_switch path) because real_enc_S_switch differs from real_enc_S.
+    //   - both masks are rebuilt + re-uploaded at CFG cutoff (N_graph 2N → N).
+    cudaMemcpyAsync(d_attn_mask, attn_mask_buf.data(),
+                    (size_t) N_graph * T * sizeof(int64_t),
+                    cudaMemcpyHostToDevice, trt->stream);
+    cudaMemcpyAsync(d_enc_attn_mask, enc_attn_mask_buf.data(),
+                    (size_t) N_graph * enc_S * sizeof(int64_t),
+                    cudaMemcpyHostToDevice, trt->stream);
 
     // Pre-upload encoder hidden states
     if (io_is_fp32) {
@@ -410,9 +476,13 @@ static int dit_trt_generate(DitTrt *              trt,
                        cudaMemcpyHostToDevice, trt->stream);
         }
 
-        // Run TRT forward on dedicated stream
+        // Run TRT forward on dedicated stream. Pass attention masks —
+        // d_attn_mask and d_enc_attn_mask were allocated/uploaded above
+        // and (for the encoder mask) re-uploaded after a cover switch.
         bool ok = dit_trt_forward(trt, d_input, d_enc, d_t, d_t_r,
-                                   n_batch, T, enc_S, d_vel, trt->stream);
+                                   n_batch, T, enc_S,
+                                   d_attn_mask, d_enc_attn_mask,
+                                   d_vel, trt->stream);
         if (!ok) {
             fprintf(stderr, "[DiT-TRT] Forward pass failed!\n");
             return false;
@@ -588,6 +658,14 @@ static int dit_trt_generate(DitTrt *              trt,
                 }
                 if (enc_switch) {
                     memcpy(enc_buf.data(), enc_switch, H_enc * enc_S * N * sizeof(float));
+                    // The switched encoder has its own per-batch real lengths
+                    // (real_enc_S_switch). Rebuild and re-upload the cross-attn
+                    // mask at the current N_graph (which may have shrunk to N
+                    // if a CFG cutoff happened before the cover switch).
+                    build_attn_mask(enc_attn_mask_buf, N_graph, enc_S, real_enc_S_switch);
+                    cudaMemcpyAsync(d_enc_attn_mask, enc_attn_mask_buf.data(),
+                                    (size_t) N_graph * enc_S * sizeof(int64_t),
+                                    cudaMemcpyHostToDevice, trt->stream);
                 }
                 fprintf(stderr, "[DiT-TRT] Cover: switched at step %d/%d\n", step_idx, num_steps);
             }
@@ -613,6 +691,7 @@ static int dit_trt_generate(DitTrt *              trt,
                 // Resize GPU buffers for N (half size)
                 cudaFree(d_input); cudaFree(d_enc); cudaFree(d_vel);
                 cudaFree(d_t); cudaFree(d_t_r);
+                cudaFree(d_attn_mask); cudaFree(d_enc_attn_mask);
 
                 size_t new_input_elems = (size_t)N * T * in_ch;
                 size_t new_enc_elems   = (size_t)N * enc_S * H_enc;
@@ -623,6 +702,8 @@ static int dit_trt_generate(DitTrt *              trt,
                 cudaMalloc(&d_vel,   new_vel_elems * io_elem_bytes);
                 cudaMalloc((void**)&d_t,   N * sizeof(float));
                 cudaMalloc((void**)&d_t_r, N * sizeof(float));
+                cudaMalloc(&d_attn_mask,     (size_t) N * T     * sizeof(int64_t));
+                cudaMalloc(&d_enc_attn_mask, (size_t) N * enc_S * sizeof(int64_t));
 
                 input_buf.resize(in_ch * T * N);
                 for (int b = 0; b < N; b++) {
@@ -634,6 +715,22 @@ static int dit_trt_generate(DitTrt *              trt,
                 }
                 enc_buf.resize(H_enc * enc_S * N);
                 memcpy(enc_buf.data(), enc_hidden_data, H_enc * enc_S * N * sizeof(float));
+
+                // Rebuild masks at N (drop the uncond slots). Self-attn mask
+                // is the same cond-slot slice; encoder mask depends on whether
+                // we already switched to the cover encoder.
+                build_attn_mask(attn_mask_buf, N, T, real_S);
+                if (switched_cover_fl) {
+                    build_attn_mask(enc_attn_mask_buf, N, enc_S, real_enc_S_switch);
+                } else {
+                    build_attn_mask(enc_attn_mask_buf, N, enc_S, real_enc_S);
+                }
+                cudaMemcpyAsync(d_attn_mask, attn_mask_buf.data(),
+                                (size_t) N * T * sizeof(int64_t),
+                                cudaMemcpyHostToDevice, trt->stream);
+                cudaMemcpyAsync(d_enc_attn_mask, enc_attn_mask_buf.data(),
+                                (size_t) N * enc_S * sizeof(int64_t),
+                                cudaMemcpyHostToDevice, trt->stream);
 
                 if (!io_is_fp32) {
                     h_input_staged.resize(new_input_elems);
@@ -694,6 +791,12 @@ static int dit_trt_generate(DitTrt *              trt,
                 }
                 if (enc_switch) {
                     memcpy(enc_buf.data(), enc_switch, H_enc * enc_S * N * sizeof(float));
+                    // Rebuild and re-upload cross-attn mask for the switched
+                    // encoder at the current N_graph.
+                    build_attn_mask(enc_attn_mask_buf, N_graph, enc_S, real_enc_S_switch);
+                    cudaMemcpyAsync(d_enc_attn_mask, enc_attn_mask_buf.data(),
+                                    (size_t) N_graph * enc_S * sizeof(int64_t),
+                                    cudaMemcpyHostToDevice, trt->stream);
                 }
                 fprintf(stderr, "[DiT-TRT] Cover: switched at step %d/%d\n", step, num_steps);
             }
