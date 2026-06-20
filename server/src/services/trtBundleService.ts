@@ -245,7 +245,7 @@ class TrtBundleService extends EventEmitter {
       this.killPidTree(pid);
     }
 
-    this.cleanupPartialBundle(job.bundleDir);
+    //this.cleanupPartialBundle(job.bundleDir);
     this.settleJob(job, {
       status: 'cancelled',
       step: 'cancelled',
@@ -412,7 +412,7 @@ class TrtBundleService extends EventEmitter {
 
       if (isForcedKill) {
         // Same partial-bundle cleanup as the cancel path: a forced kill leaves a half-written bundle.
-        this.cleanupPartialBundle(job.bundleDir);
+        //this.cleanupPartialBundle(job.bundleDir);
         this.settleJob(job, {
           status: 'failed',
           step: 'failed',
