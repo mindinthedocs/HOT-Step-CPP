@@ -643,7 +643,18 @@ static int ops_encode_text_trt(const AceSynth *             ctx,
                                int &                        H_text,
                                int &                        H_cond) {
     const bool use_trt_text = ctx->use_trt_text_enc;   // standalone Qwen3-emb bundle
-    const bool use_trt_cond = ctx->use_trt_bundle;     // DiT bundle
+    // [TEST PATCH] Force GGML cond encoder from the GGUF DiT instead of TRT.
+    const bool use_trt_cond = false;
+    if (ctx->use_trt_bundle) {
+        // Derive GGUF path from text encoder directory (same models folder).
+        std::string te_path = ctx->params.text_encoder_path ? ctx->params.text_encoder_path : "";
+        auto slash = te_path.find_last_of("/\\");
+        std::string gguf_path = (slash != std::string::npos ? te_path.substr(0, slash + 1) : "") +
+                                "acestep-v15-xl-sftturbo50-Q8_0.gguf";
+        const_cast<AceSynth*>(ctx)->cond_enc_key.path = gguf_path;
+        fprintf(stderr, "[TEST] Forced GGML cond enc: %s\n", gguf_path.c_str());
+    }
+    // const bool use_trt_cond = ctx->use_trt_bundle;  // (original)
 
     H_text = 1024;  // Qwen3-Embedding text-encoder hidden size
     H_cond = 2048;  // condition-encoder hidden size
