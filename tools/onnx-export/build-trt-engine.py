@@ -273,14 +273,15 @@ def build_engine(args) -> tuple[Path, Path, Path]:
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
     if hasattr(config, "builder_optimization_level"):
         config.builder_optimization_level = args.builder_optimization_level
-    elif args.builder_optimization_level != 3:
-        raise SystemExit("TensorRT Python API does not expose builder_optimization_level.")
     if args.workspace_gb > 0:
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace_gb * (1024**3)))
     refit_identical_enabled = require_builder_flag(trt, config, "REFIT_IDENTICAL")
     weight_streaming_enabled = False
     if args.weight_streaming:
         weight_streaming_enabled = require_builder_flag(trt, config, "WEIGHT_STREAMING")
+        
+    if hasattr(trt.BuilderFlag, "TF32"):
+        config.clear_flag(trt.BuilderFlag.TF32)
 
     attach_progress_monitor(trt, config)
 
