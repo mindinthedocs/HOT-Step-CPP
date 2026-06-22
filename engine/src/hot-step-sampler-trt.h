@@ -233,9 +233,10 @@ static int dit_trt_generate(DitTrt *              trt,
         return -1;
     }
     bool use_apg_native = (guidance_plugin && guidance_plugin->name == "apg");
-    fprintf(stderr, "[DiT-TRT] Guidance: %s (%s)%s\n",
+    fprintf(stderr, "[DiT-TRT] Guidance: %s (%s)%s%s\n",
             guidance_plugin->display_name.c_str(), guidance_plugin->name.c_str(),
-            use_apg_native ? " [native APG]" : "");
+            use_apg_native ? " [native APG]" : "",
+            guidance_plugin->has_post_step ? " [post_step]" : "");
 
     // ── Host buffers ────────────────────────────────────────────────────
     std::vector<float> xt(noise, noise + n_total);
@@ -243,6 +244,10 @@ static int dit_trt_generate(DitTrt *              trt,
     std::vector<float> vt_cond, vt_uncond;
     APGWorkspace apg_ws;
     std::vector<APGMomentumBuffer> apg_mbufs;
+    std::vector<float> vt_pre_solver;  // snapshot of vt before solver step (for DCW)
+                                       // Multi-eval solvers overwrite vt via model_fn,
+                                       // so the original velocity must be preserved
+                                       // separately for the post-solver DCW call.
 
     if (do_cfg) {
         vt_cond.resize(n_total);
@@ -293,6 +298,43 @@ static int dit_trt_generate(DitTrt *              trt,
                 memcpy(null_enc_buf.data() + b * enc_S * H_enc,
                        null_enc_single.data(), enc_S * H_enc * sizeof(float));
             }
+        }
+    }
+
+    // ── Post-step encoding buffers (for guidance plugins with has_post_step) ──
+    // Mirror hot-step-sampler.h:435-470. These hold per-batch conditional and
+    // unconditional encoder states that eval_single_pass swaps into enc_buf
+    // when the post-step guidance hook (CFG-MP manifold projection, etc.)
+    // requests a fresh model evaluation at an intermediate point.
+    //
+    // enc_cond_full   [N_graph, enc_S, H_enc]: conditional encoder states
+    // enc_uncond_full [N_graph, enc_S, H_enc]: unconditional (null) encoder states
+    //
+    // Built unconditionally (cheap if has_post_step is false) so the buffers
+    // exist for the eval_single_pass lambda capture even when unused.
+    std::vector<float> enc_cond_full, enc_uncond_full;
+    {
+        std::vector<float> null_enc_single(H_enc * enc_S);
+        const float * uncond_src = (neg_enc_data != nullptr) ? neg_enc_data : nullptr;
+        if (uncond_src) {
+            for (int s = 0; s < enc_S; s++) {
+                memcpy(&null_enc_single[s * H_enc], uncond_src, H_enc * sizeof(float));
+            }
+        }
+        if (guidance_plugin->has_post_step && do_cfg && uncond_src) {
+            enc_cond_full.resize(H_enc * enc_S * N_graph);
+            enc_uncond_full.resize(H_enc * enc_S * N_graph);
+            for (int b = 0; b < N_graph; b++) {
+                int src_b = b % N;
+                memcpy(enc_cond_full.data() + b * enc_S * H_enc,
+                       enc_hidden_data + src_b * enc_S * H_enc,
+                       enc_S * H_enc * sizeof(float));
+                memcpy(enc_uncond_full.data() + b * enc_S * H_enc,
+                       null_enc_single.data(),
+                       enc_S * H_enc * sizeof(float));
+            }
+            fprintf(stderr, "[DiT-TRT] Post-step model eval buffers ready for '%s'\n",
+                    guidance_plugin->name.c_str());
         }
     }
 
@@ -554,6 +596,42 @@ static int dit_trt_generate(DitTrt *              trt,
     }
 
     bool forward_failed = false;
+
+    // ── eval_single_pass: run ONE model forward with specified encoding ──────
+    // Mirror hot-step-sampler.h:594-634. Used by post_step hooks (CFG-MP
+    // manifold projection, etc.) to evaluate the model at arbitrary
+    // (xt_in, t_val) points with either conditional or unconditional
+    // encoder states, writing the raw model output (before APG/CFG) into
+    // out_buf.
+    //
+    // The enc_full buffer holds N_graph slots of encoder states (either all
+    // conditional or all unconditional). We temporarily swap enc_buf to
+    // enc_full, run trt_forward, then restore enc_buf to its previous
+    // contents so the next evaluate_velocity call sees the correct encoder.
+    auto eval_single_pass = [&](const float * xt_in, float t_val,
+                                const std::vector<float> & enc_full,
+                                float * out_buf) {
+        if (forward_failed) return;
+        // Snapshot enc_buf so we can restore it (trt_forward re-uploads
+        // enc_buf to GPU every call; the host buffer is the source of truth).
+        std::vector<float> enc_save;
+        if (!enc_buf.empty() && !enc_full.empty() &&
+            enc_buf.size() == enc_full.size()) {
+            enc_save.assign(enc_buf.begin(), enc_buf.end());
+            memcpy(enc_buf.data(), enc_full.data(),
+                   enc_full.size() * sizeof(float));
+        }
+        // Run forward with N_graph batch (post-step hooks expect both cond
+        // and uncond slots, matching the GGML path).
+        if (!trt_forward(xt_in, t_val, N_graph, out_buf)) {
+            forward_failed = true;
+        }
+        // Restore enc_buf
+        if (!enc_save.empty()) {
+            memcpy(enc_buf.data(), enc_save.data(), enc_save.size() * sizeof(float));
+        }
+    };
+
     auto evaluate_velocity = [&](const float * xt_in, float t_val) {
         if (forward_failed) {
             return false;
@@ -711,7 +789,32 @@ static int dit_trt_generate(DitTrt *              trt,
             g_ctx.step_idx = step_idx + 1;
             g_ctx.t_curr   = t_curr;
             g_ctx.dt       = t_curr - t_next;
+            // Full-loop solvers control their own model_fn calls, so vt may
+            // have been overwritten. For safety, use vt as-is (full-loop
+            // solvers are responsible for their own vt state).
+            // TODO: snapshot vt in loop_on_step if full-loop multi-eval solvers need DCW
             sampler_apply_dcw(xt.data(), vt.data(), N, T, Oc, t_curr, t_next, step_idx, num_steps);
+
+            // ── Post-step guidance hook (CFG-MP manifold projection etc.) ──
+            // Mirror hot-step-sampler.h:744-755. Runs after the solver step
+            // but before repaint, allowing guidance plugins with
+            // has_post_step to request fresh model evaluations at the
+            // post-step (xt, t_next) point with either conditional or
+            // unconditional encoding.
+            if (guidance_plugin->has_post_step && do_cfg && step_idx < num_steps - 1 &&
+                !enc_cond_full.empty() && !enc_uncond_full.empty()) {
+                PostStepModelFn eval_cond_fn = [&](const float * xt_in, float t_v) {
+                    eval_single_pass(xt_in, t_v, enc_cond_full, vt_cond.data());
+                };
+                PostStepModelFn eval_uncond_fn = [&](const float * xt_in, float t_v) {
+                    eval_single_pass(xt_in, t_v, enc_uncond_full, vt_uncond.data());
+                };
+                lua_call_post_step(*guidance_plugin, xt.data(), t_next, n_total,
+                    eval_cond_fn, eval_uncond_fn,
+                    vt_cond.data(), vt_uncond.data(),
+                    g_ctx, g_hotstep_params.plugin_params);
+            }
+
             sampler_repaint_inject(xt.data(), noise, nullptr, N, T, Oc,
                                    0, 0, 0.5f, step_idx, num_steps, t_next);
 
@@ -862,13 +965,36 @@ static int dit_trt_generate(DitTrt *              trt,
                 }
             }
 
-            // Apply solver step
+            // ── Buffer separation for multi-eval solvers ──────────────
+            // Mirror hot-step-sampler.h:1046-1062. Multi-eval solvers
+            // (Heun, UniPC, RK4, DPM++ 3M, etc.) call model_fn during their
+            // step, which writes new velocity into the vt buffer. If both
+            // the "read-only original velocity" (arg 2) and the "model_fn
+            // output buffer" (arg 7) point to the same memory, solvers that
+            // reference the original velocity after model_fn get corrupted
+            // values (e.g. DPM++ 3M's correction term becomes zero,
+            // silently degrading it to Euler).
+            //
+            // Fix: snapshot vt into vt_pre_solver and pass it as the
+            // read-only arg 2. The live vt buffer (overwritten by
+            // model_fn) is passed as the mutable arg 7 (vt_buf).
             const float * vt_readonly = vt.data();
+            if (solver_plugin->needs_model) {
+                vt_pre_solver.assign(vt.begin(), vt.end());
+                vt_readonly = vt_pre_solver.data();
+            }
+
+            // ── Lua solver dispatch ────────────────────────────────────
+            // The solver step function modifies xt[] in-place.
+            // vt_readonly  = original velocity (preserved for read-only access)
+            // vt.data()    = mutable buffer where model_fn writes results
             solver_state.step_index = step;
-            lua_call_solver_step(*solver_plugin, xt.data(), vt_readonly,
-                t_curr, t_next, n_total,
+            lua_call_solver_step(
+                *solver_plugin,
+                xt.data(), vt_readonly, t_curr, t_next, n_total,
                 solver_state, evaluate_velocity, vt.data(),
-                g_hotstep_params.plugin_params);
+                g_hotstep_params.plugin_params
+            );
             if (forward_failed) {
                 fprintf(stderr, "[DiT-TRT] FATAL: plugin solver model evaluation failed at step %d/%d\n",
                         step + 1, num_steps);
@@ -876,8 +1002,33 @@ static int dit_trt_generate(DitTrt *              trt,
                 return -1;
             }
 
-            // DCW
-            sampler_apply_dcw(xt.data(), vt.data(), N, T, Oc, t_curr, t_next, step, num_steps);
+            // ── DCW correction ──
+            // Use the pre-solver velocity for multi-eval solvers (vt was
+            // clobbered by intermediate model_fn calls during the step).
+            sampler_apply_dcw(xt.data(), vt_readonly, N, T, Oc, t_curr, t_next, step, num_steps);
+
+            // ── Post-step guidance hook (CFG-MP manifold projection etc.) ──
+            // Mirror hot-step-sampler.h:1081-1097. Runs after the solver
+            // step but before repaint, allowing guidance plugins with
+            // has_post_step to request fresh model evaluations at the
+            // post-step (xt, t_next) point with either conditional or
+            // unconditional encoding.
+            if (guidance_plugin->has_post_step && do_cfg && step < num_steps - 1 &&
+                !enc_cond_full.empty() && !enc_uncond_full.empty()) {
+                PostStepModelFn eval_cond_fn = [&](const float * xt_in, float t_v) {
+                    eval_single_pass(xt_in, t_v, enc_cond_full, vt_cond.data());
+                };
+                PostStepModelFn eval_uncond_fn = [&](const float * xt_in, float t_v) {
+                    eval_single_pass(xt_in, t_v, enc_uncond_full, vt_uncond.data());
+                };
+                lua_call_post_step(
+                    *guidance_plugin,
+                    xt.data(), t_next, n_total,
+                    eval_cond_fn, eval_uncond_fn,
+                    vt_cond.data(), vt_uncond.data(),
+                    g_ctx, g_hotstep_params.plugin_params
+                );
+            }
 
             // Repaint
             sampler_repaint_inject(xt.data(), noise, nullptr, N, T, Oc,
