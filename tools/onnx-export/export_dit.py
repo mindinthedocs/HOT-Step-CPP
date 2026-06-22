@@ -2204,20 +2204,8 @@ def load_dit_model(
                 _am.common = _am
         except ImportError:
             print("[export_dit] WARNING: Could not import acestep.models")
-    
-    # Auto-detect the modeling module — different model variants use different
-    # filenames (modeling_acestep_v15_xl_base.py, xl_turbo.py, etc.)
-    import glob
-    modeling_files = glob.glob(str(model_dir / "modeling_acestep_v15*.py"))
-    if not modeling_files:
-        print(f"[export_dit] ERROR: No modeling_acestep_v15*.py found in {model_dir}")
-        sys.exit(1)
-    modeling_module = Path(modeling_files[0]).stem
-    print(f"[export_dit] Using modeling module: {modeling_module}")
-    
-    import importlib
-    mod = importlib.import_module(modeling_module)
-    AceStepDiTModel = mod.AceStepDiTModel
+
+    from modeling_acestep_v15_xl_base import AceStepDiTModel # only xl for now, it IS the same for all xl
     from configuration_acestep_v15 import AceStepConfig
     
     # Load config
@@ -2335,10 +2323,27 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
     # attention_mask shares the same seq_len Dim as input_latents (axis 1 == T),
     # and encoder_attention_mask shares enc_seq_len with enc_hidden (axis 1 == S).
     # Tying the Dims guarantees the runtime shapes agree, which TRT requires.
+    #
+    # patch_size constraint: the C++ host (pipeline-synth-ops.cpp:518
+    # ops_resolve_T) rounds T up to a multiple of patch_size before calling
+    # DiT, so at runtime T % patch_size == 0 always holds. We express this
+    # to dynamo via a DERIVED DIM: `_seq_len_post = Dim(min=32, max=4096)`
+    # is the post-patch sequence length, and `seq_len = patch_size *
+    # _seq_len_post` is the pre-patch length. This tells dynamo that
+    # seq_len is always a multiple of patch_size, which lets the modeling
+    # file's `tensor.unfold(patch_size, patch_size).max(dim=-1)` downsample
+    # the self-attn padding mask without triggering shape specialization.
+    #
+    # (torch 2.12's Dim API does not support a `modulo` parameter, so we
+    # use the derived-dim approach instead.)
     batch = torch.export.Dim("batch", min=1, max=4)
-    seq_len = torch.export.Dim("seq_len", min=64, max=8192)
+    # _seq_len_post bounds: 32..7500 covers both the "default" profile
+    # (max_T=3000 -> max post-patch=1500) and "full-10min" (max_T=15000 ->
+    # max post-patch=7500). seq_len = patch_size * _seq_len_post.
+    _seq_len_post = torch.export.Dim("_seq_len_post", min=32, max=7500)  # T // patch_size
+    seq_len = patch_size * _seq_len_post                                  # T, always a multiple of patch_size
     enc_seq_len = torch.export.Dim("enc_seq_len", min=64, max=2048)
-    
+
     dynamic_shapes = {
         "input_latents": {0: batch, 1: seq_len},
         "enc_hidden":    {0: batch, 1: enc_seq_len},

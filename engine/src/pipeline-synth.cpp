@@ -265,29 +265,43 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
     // Drives FSQ sidecar resolution in the synthesis ops.
     ctx->is_onnx_pipeline = is_onnx_dit && !use_gguf_aux_for_onnx;
 
-    // Native TRT bundle detection + all-three-or-nothing gate (partner §3.5/§5.7).
-    // The selected ONNX DiT directory is the bundle dir; a manifest.json there is
-    // the sole TRT-bundle detector. When a manifest is present, every component
-    // (dit, text_enc, cond_enc) MUST be declared with an existing engine on disk:
-    // trt_bundle_load_manifest enforces this and fails closed. We HARD FAIL the
-    // load on an incomplete manifest rather than silently routing encoders to
-    // GGUF. When no manifest is present, this is a GGML/ORT pipeline as before.
+    // Native TRT bundle detection — two independent bundles.
+    //
+    //  1. DiT bundle: detected from the selected DiT directory. Ships the DiT
+    //     transformer + condition encoder + FSQ. The text encoder is NOT in
+    //     this bundle — the GGUF Qwen3 is the default text encoder, or a
+    //     standalone Qwen3-emb bundle can be selected separately.
+    //
+    //  2. Qwen3-emb bundle: detected from the selected text-encoder path. Ships
+    //     the TRT Qwen3 text encoder as a standalone artifact (independent of
+    //     any DiT bundle). Built from its own source dir and placed in its own
+    //     bundle folder (trt-bundles/qwen3-emb/).
+    //
+    // The two detections are independent — a request can use any combination.
+
+    // --- DiT bundle detection ---
     if (ctx->is_onnx_pipeline) {
         std::string bundle_dir = dit_sidecar_dir(params->dit_path);
         if (trt_bundle_has_manifest(bundle_dir)) {
             std::string manifest_err;
             if (!trt_bundle_load_manifest(bundle_dir, &ctx->trt_manifest, &manifest_err)) {
                 fprintf(stderr,
-                        "[Synth-Load] FATAL: TRT bundle manifest at %s is incomplete; "
-                        "all-three-or-nothing requires dit+text_enc+cond_enc engines: %s\n",
+                        "[Synth-Load] FATAL: TRT DiT bundle manifest at %s is incomplete: %s\n",
                         bundle_dir.c_str(), manifest_err.c_str());
                 delete ctx;
                 return NULL;
             }
+            if (ctx->trt_manifest.dit.engine.empty()) {
+                // Not a DiT bundle (e.g. a Qwen3-emb bundle accidentally selected
+                // as the DiT). Refuse rather than routing the DiT forward through
+                // a non-DiT engine.
+                fprintf(stderr,
+                        "[Synth-Load] FATAL: selected DiT path is inside a TRT bundle with no dit engine: %s\n",
+                        bundle_dir.c_str());
+                delete ctx;
+                return NULL;
+            }
             ctx->use_trt_bundle = true;
-
-            ctx->text_enc_trt_key.kind = MODEL_TEXT_ENC_TRT;
-            ctx->text_enc_trt_key.path = ctx->trt_manifest.text_enc.engine;
             ctx->cond_enc_trt_key.kind = MODEL_COND_ENC_TRT;
             ctx->cond_enc_trt_key.path = ctx->trt_manifest.cond_enc.engine;
 
@@ -296,19 +310,58 @@ AceSynth * ace_synth_load(ModelStore * store, const AceSynthParams * params) {
             store_prune_bundle_except(store, bundle_dir);
 
             fprintf(stderr,
-                    "[Synth-Load] TRT bundle: version=%s source=%s variant=%s\n"
+                    "[Synth-Load] TRT DiT bundle: version=%s source=%s variant=%s\n"
                     "[Synth-Load]   dit      = %s\n"
-                    "[Synth-Load]   text_enc = %s\n"
                     "[Synth-Load]   cond_enc = %s\n",
                     ctx->trt_manifest.version.c_str(), ctx->trt_manifest.source_model.c_str(),
                     ctx->trt_manifest.variant.c_str(), ctx->trt_manifest.dit.engine.c_str(),
-                    ctx->trt_manifest.text_enc.engine.c_str(), ctx->trt_manifest.cond_enc.engine.c_str());
+                    ctx->trt_manifest.cond_enc.engine.c_str());
         }
     }
 
-    if (!ctx->use_trt_bundle) {
-        // Switching to a GGML/GGUF pipeline: any TRT bundle that was resident
-        // from a prior request must be evicted before the GGUF DiT loads, so the
+    // --- Qwen3-emb bundle detection ---
+    // If the selected text-encoder path is inside a directory carrying a
+    // manifest.json, treat it as a standalone TRT Qwen3-emb bundle. The path
+    // from the registry is the bundle's text_encoder.onnx; the parent dir is
+    // the bundle dir. The manifest's text_enc.engine points to the .engine file.
+    if (params->text_encoder_path && params->text_encoder_path[0]) {
+        std::string te_bundle_dir = dit_sidecar_dir(params->text_encoder_path);
+        if (trt_bundle_has_manifest(te_bundle_dir)) {
+            std::string te_err;
+            TrtBundleManifest te_manifest;
+            if (!trt_bundle_load_manifest(te_bundle_dir, &te_manifest, &te_err)) {
+                fprintf(stderr,
+                        "[Synth-Load] FATAL: TRT Qwen3-emb bundle manifest at %s is incomplete: %s\n",
+                        te_bundle_dir.c_str(), te_err.c_str());
+                delete ctx;
+                return NULL;
+            }
+            if (te_manifest.text_enc.engine.empty()) {
+                fprintf(stderr,
+                        "[Synth-Load] FATAL: selected text-encoder path is inside a TRT bundle with no text_enc engine: %s\n",
+                        te_bundle_dir.c_str());
+                delete ctx;
+                return NULL;
+            }
+            ctx->use_trt_text_enc    = true;
+            ctx->text_enc_trt_manifest = te_manifest;
+            ctx->text_enc_trt_key.kind = MODEL_TEXT_ENC_TRT;
+            ctx->text_enc_trt_key.path = te_manifest.text_enc.engine;
+
+            // Evict any previously-resident Qwen3-emb engine before this one loads.
+            store_prune_bundle_except(store, te_bundle_dir);
+
+            fprintf(stderr,
+                    "[Synth-Load] TRT Qwen3-emb bundle: version=%s source=%s\n"
+                    "[Synth-Load]   text_enc = %s\n",
+                    te_manifest.version.c_str(), te_manifest.source_model.c_str(),
+                    te_manifest.text_enc.engine.c_str());
+        }
+    }
+
+    if (!ctx->use_trt_bundle && !ctx->use_trt_text_enc) {
+        // Switching to a pure GGML/GGUF pipeline: any TRT bundle that was resident
+        // from a prior request must be evicted before the GGUF models load, so the
         // two never co-reside on the GPU. evict_all_except keeps the MODEL_DIT_TRT
         // resident shell across a require for a different kind, and the TRT
         // encoders' release retains their zero-byte shells, so a plain GGUF

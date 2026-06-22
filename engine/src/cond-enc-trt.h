@@ -1,20 +1,32 @@
 #pragma once
 // cond-enc-trt.h — TensorRT native loader for the ACEStep condition encoder.
 //
-// The cond-encoder engine is a strongly-typed FP16 graph with weights EMBEDDED
+// The cond-encoder engine is a strongly-typed graph with weights EMBEDDED
 // in the plan (NOT kREFIT_IDENTICAL like dit-trt.h). So this
 // loader only deserializes — there is no ONNX sidecar, no refitter, no weight
 // streaming. The lyric/timbre/text fusion (8L lyric encoder, 4L timbre encoder,
 // text projector, CLS prepend, pack order) is baked entirely into the graph.
 //
-// Engine I/O contract (from cond_encoder.engine.metadata.json, verified by
-// deserializing the engine — multi-input, all FP16):
-//   input  "text_hidden"   HALF [B, S_text,  1024]   (Qwen3-Embedding output)
-//   input  "lyric_embed"   HALF [B, S_lyric, 1024]   (CPU vocab lookup of lyrics)
-//   input  "timbre_feats"  HALF [B, S_ref,   64]     (reference audio features)
-//   output "enc_hidden"    HALF [B, S_total, 2048]   (S_total = S_lyric+1+S_text)
+// Engine I/O contract (auto-detected at load time from the engine's binding
+// dtypes — supports FP16, BF16, and FP32 engines):
+//   input  "text_hidden"   {HALF|BF16|FLOAT} [B, S_text,  1024]
+//   input  "lyric_embed"   {HALF|BF16|FLOAT} [B, S_lyric, 1024]
+//   input  "timbre_feats"  {HALF|BF16|FLOAT} [B, S_ref,   64]
+//   output "enc_hidden"    {HALF|BF16|FLOAT} [B, S_total, 2048]  (S_total = S_lyric+1+S_text)
 //   profiles: B fixed at 1; text S in [1,512], lyric S in [1,1024],
 //             timbre S in [1,512].
+//
+// FP16 vs BF16 vs FP32 trade-offs:
+//   FP16 (HALF):  smallest engine, ±65504 range — can saturate to ±Inf/NaN
+//                 on extreme activations (text_hidden can reach ±51, and
+//                 attention scores can overflow). Runtime sanitizes NaN/Inf
+//                 to finite range, corrupting ~5 elements per forward.
+//   BF16 (BF16):  same engine size as FP16, ±3.4e38 range (matches FP32) —
+//                 no overflow, no sanitization. PREFERRED on Ampere+ GPUs.
+//   FP32 (FLOAT): largest engine, safest, slowest. No conversion overhead.
+//
+// The C++ host always passes FP32 to cond_enc_trt_forward and receives FP32
+// back; the loader handles the FP32<->engine-dtype conversion internally.
 //
 // The output S dimension is DYNAMIC: the graph packs cat(lyric, timbre[0:1],
 // text_proj), so S_total = S_lyric + 1 + S_text when timbre is present. The
@@ -51,6 +63,35 @@
 #if defined(HOT_STEP_TRT_VERSION_MAJOR) && HOT_STEP_TRT_VERSION_MAJOR != 11
 #error "HOT_STEP_TRT requires TensorRT 11.x headers"
 #endif
+
+inline uint16_t cond_enc_trt_float_to_bf16(float f) {
+    // BF16 is the upper 16 bits of FP32, with round-to-nearest-even.
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    // Round-to-nearest-even: add 0x7FFF + (LSB of result) to bias the truncation.
+    uint32_t rounding_bias = 0x7FFF + ((x >> 16) & 1);
+    return (uint16_t)((x + rounding_bias) >> 16);
+}
+
+inline float cond_enc_trt_bf16_to_float(uint16_t b) {
+    // BF16 -> FP32: just zero-extend the upper 16 bits into the upper half of FP32.
+    uint32_t x = (uint32_t) b << 16;
+    float f;
+    memcpy(&f, &x, sizeof(f));
+    return f;
+}
+
+// ── Engine I/O dtype enum ────────────────────────────────────────────────────
+//
+// Auto-detected at load time from the output binding's dtype. Drives whether
+// the upload path converts FP32->FP16 or FP32->BF16 (or passes FP32 through),
+// and whether the download path runs the FP16 sanitization (FP16 only).
+
+enum CondEncIoDtype {
+    COND_ENC_IO_FP16 = 0,  // HALF  — ±65504 range, needs sanitization
+    COND_ENC_IO_BF16 = 1,  // BF16  — ±3.4e38 range, no sanitization needed
+    COND_ENC_IO_FP32 = 2,  // FLOAT — no conversion, no sanitization
+};
 
 // ── FP16 <-> FP32 helpers (full subnormal/Inf/NaN-correct) ──────────────────
 
@@ -130,16 +171,20 @@ struct CondEncTrt {
 
     // Evictable: freed by release_evictable, reallocated by forward.
     nvinfer1::IExecutionContext * context = nullptr;
-    void *  d_text   = nullptr;  // HALF [B*S_text*1024]
-    void *  d_lyric  = nullptr;  // HALF [B*S_lyric*1024]
-    void *  d_timbre = nullptr;  // HALF [B*S_ref*64]
-    void *  d_out    = nullptr;  // HALF [B*S_total*2048]
+    void *  d_text   = nullptr;  // engine-dtype [B*S_text*1024]
+    void *  d_lyric  = nullptr;  // engine-dtype [B*S_lyric*1024]
+    void *  d_timbre = nullptr;  // engine-dtype [B*S_ref*64]
+    void *  d_out    = nullptr;  // engine-dtype [B*S_total*2048]
     size_t  buf_text_bytes   = 0;
     size_t  buf_lyric_bytes  = 0;
     size_t  buf_timbre_bytes = 0;
     size_t  buf_out_bytes    = 0;
 
     int  hidden_size = 2048;  // resolved from the output binding at load
+
+    // Engine I/O dtype, auto-detected from the output binding at load time.
+    // Drives upload/download conversion and whether sanitization runs.
+    CondEncIoDtype io_dtype = COND_ENC_IO_FP16;
 
     CondEncTrtLogger logger;
     cudaStream_t     stream = nullptr;
@@ -208,9 +253,14 @@ inline bool cond_enc_trt_load(CondEncTrt * ctx, const char * engine_path, int de
         return false;
     }
 
-    // Resolve + validate the I/O contract against the embedded-weight FP16 graph.
+    // Resolve + validate the I/O contract against the embedded-weight graph.
+    // The engine I/O dtype (FP16 / BF16 / FP32) is auto-detected from the
+    // output binding and stored in ctx->io_dtype. The runtime adapts the
+    // upload (FP32 -> engine dtype) and download (engine dtype -> FP32 +
+    // sanitize if FP16) paths accordingly.
     bool saw_text = false, saw_lyric = false, saw_timbre = false, saw_output = false;
     int  num_io = ctx->engine->getNbIOTensors();
+    nvinfer1::DataType detected_dtype = nvinfer1::DataType::kHALF;  // default
     for (int i = 0; i < num_io; i++) {
         const char * name  = ctx->engine->getIOTensorName(i);
         auto         dtype = ctx->engine->getTensorDataType(name);
@@ -218,33 +268,58 @@ inline bool cond_enc_trt_load(CondEncTrt * ctx, const char * engine_path, int de
         const std::string n = name;
         if (n == "text_hidden") {
             saw_text = true;
-            if (mode != nvinfer1::TensorIOMode::kINPUT || dtype != nvinfer1::DataType::kHALF) {
+            if (mode != nvinfer1::TensorIOMode::kINPUT ||
+                (dtype != nvinfer1::DataType::kHALF &&
+                 dtype != nvinfer1::DataType::kBF16 &&
+                 dtype != nvinfer1::DataType::kFLOAT)) {
                 fprintf(stderr, "[CondEnc-TRT] text_hidden has unexpected mode/dtype\n");
                 return false;
             }
         } else if (n == "lyric_embed") {
             saw_lyric = true;
-            if (mode != nvinfer1::TensorIOMode::kINPUT || dtype != nvinfer1::DataType::kHALF) {
+            if (mode != nvinfer1::TensorIOMode::kINPUT ||
+                (dtype != nvinfer1::DataType::kHALF &&
+                 dtype != nvinfer1::DataType::kBF16 &&
+                 dtype != nvinfer1::DataType::kFLOAT)) {
                 fprintf(stderr, "[CondEnc-TRT] lyric_embed has unexpected mode/dtype\n");
                 return false;
             }
         } else if (n == "timbre_feats") {
             saw_timbre = true;
-            if (mode != nvinfer1::TensorIOMode::kINPUT || dtype != nvinfer1::DataType::kHALF) {
+            if (mode != nvinfer1::TensorIOMode::kINPUT ||
+                (dtype != nvinfer1::DataType::kHALF &&
+                 dtype != nvinfer1::DataType::kBF16 &&
+                 dtype != nvinfer1::DataType::kFLOAT)) {
                 fprintf(stderr, "[CondEnc-TRT] timbre_feats has unexpected mode/dtype\n");
                 return false;
             }
         } else if (n == "enc_hidden") {
             saw_output = true;
-            if (mode != nvinfer1::TensorIOMode::kOUTPUT || dtype != nvinfer1::DataType::kHALF) {
+            if (mode != nvinfer1::TensorIOMode::kOUTPUT ||
+                (dtype != nvinfer1::DataType::kHALF &&
+                 dtype != nvinfer1::DataType::kBF16 &&
+                 dtype != nvinfer1::DataType::kFLOAT)) {
                 fprintf(stderr, "[CondEnc-TRT] enc_hidden has unexpected mode/dtype\n");
                 return false;
             }
+            detected_dtype = dtype;
             nvinfer1::Dims d = ctx->engine->getTensorShape(name);
             if (d.nbDims == 3 && d.d[2] > 0) {
                 ctx->hidden_size = (int) d.d[2];
             }
         }
+    }
+    // Classify the detected dtype into our enum.
+    if (detected_dtype == nvinfer1::DataType::kHALF) {
+        ctx->io_dtype = COND_ENC_IO_FP16;
+    } else if (detected_dtype == nvinfer1::DataType::kBF16) {
+        ctx->io_dtype = COND_ENC_IO_BF16;
+    } else {
+        ctx->io_dtype = COND_ENC_IO_FP32;
+    }
+    {
+        const char * dtype_names[] = {"FP16", "BF16", "FP32"};
+        fprintf(stderr, "[CondEnc-TRT] I/O dtype: %s\n", dtype_names[ctx->io_dtype]);
     }
     if (!saw_text || !saw_lyric || !saw_timbre || !saw_output) {
         fprintf(stderr, "[CondEnc-TRT] Engine missing text_hidden/lyric_embed/timbre_feats/enc_hidden bindings\n");
@@ -265,12 +340,15 @@ inline bool cond_enc_trt_load(CondEncTrt * ctx, const char * engine_path, int de
 
 // ── Forward ─────────────────────────────────────────────────────────────────
 
-// Upload one FP16 input from a host FP32 array, (re)allocating its device buffer.
+// Upload one input from a host FP32 array, converting to the engine's I/O
+// dtype (FP16 / BF16 / FP32). (Re)allocates the device buffer as needed.
 // Returns false on a CUDA failure. d_buf / buf_bytes are the slot's tracked
-// device pointer + capacity; name is the binding's diagnostic label.
+// device pointer + capacity; label is the binding's diagnostic name.
 inline bool cond_enc_trt_upload(CondEncTrt * ctx, const float * src, size_t n_elems,
                                 void ** d_buf, size_t * buf_bytes, const char * label) {
-    const size_t bytes = n_elems * sizeof(uint16_t);
+    // Element size depends on the engine's I/O dtype.
+    const size_t elem_bytes = (ctx->io_dtype == COND_ENC_IO_FP32) ? sizeof(float) : sizeof(uint16_t);
+    const size_t bytes = n_elems * elem_bytes;
     if (*d_buf == nullptr || *buf_bytes < bytes) {
         if (*d_buf) cudaFree(*d_buf);
         if (cudaMalloc(d_buf, bytes) != cudaSuccess) {
@@ -282,9 +360,26 @@ inline bool cond_enc_trt_upload(CondEncTrt * ctx, const float * src, size_t n_el
         *buf_bytes = bytes;
         fprintf(stderr, "[CondEnc-TRT] forward: %s buffer allocated (%zu bytes)\n", label, bytes);
     }
+
+    if (ctx->io_dtype == COND_ENC_IO_FP32) {
+        // No conversion — upload FP32 directly.
+        if (cudaMemcpyAsync(*d_buf, src, bytes, cudaMemcpyHostToDevice, ctx->stream) != cudaSuccess) {
+            fprintf(stderr, "[CondEnc-TRT] H2D copy of %s failed\n", label);
+            return false;
+        }
+        return true;
+    }
+
+    // FP16 or BF16: convert FP32 -> engine dtype on host, then upload.
     std::vector<uint16_t> half(n_elems);
-    for (size_t i = 0; i < n_elems; i++) {
-        half[i] = cond_enc_trt_float_to_half(src[i]);
+    if (ctx->io_dtype == COND_ENC_IO_FP16) {
+        for (size_t i = 0; i < n_elems; i++) {
+            half[i] = cond_enc_trt_float_to_half(src[i]);
+        }
+    } else {  // COND_ENC_IO_BF16
+        for (size_t i = 0; i < n_elems; i++) {
+            half[i] = cond_enc_trt_float_to_bf16(src[i]);
+        }
     }
     if (cudaMemcpyAsync(*d_buf, half.data(), bytes, cudaMemcpyHostToDevice, ctx->stream) != cudaSuccess) {
         fprintf(stderr, "[CondEnc-TRT] H2D copy of %s failed\n", label);
@@ -357,7 +452,9 @@ inline bool cond_enc_trt_forward(CondEncTrt * ctx,
     }
     const int    S_total  = (int) od.d[1];
     const size_t n_out    = (size_t) B * S_total * H;
-    const size_t out_bytes = n_out * sizeof(uint16_t);
+    // Element size depends on engine I/O dtype (FP16/BF16 = 2 bytes, FP32 = 4 bytes).
+    const size_t out_elem_bytes = (ctx->io_dtype == COND_ENC_IO_FP32) ? sizeof(float) : sizeof(uint16_t);
+    const size_t out_bytes = n_out * out_elem_bytes;
 
     if (ctx->d_out == nullptr || ctx->buf_out_bytes < out_bytes) {
         if (ctx->d_out) cudaFree(ctx->d_out);
@@ -383,7 +480,25 @@ inline bool cond_enc_trt_forward(CondEncTrt * ctx,
         return false;
     }
 
-    // Pull FP16 output to host, convert to FP32 in [B,S_total,H] order.
+    // Pull engine-dtype output to host, convert to FP32 in [B,S_total,H] order.
+    out_f32.resize(n_out);
+    if (ctx->io_dtype == COND_ENC_IO_FP32) {
+        // No conversion — download FP32 directly into the output buffer.
+        if (cudaMemcpyAsync(out_f32.data(), ctx->d_out, out_bytes,
+                            cudaMemcpyDeviceToHost, ctx->stream) != cudaSuccess) {
+            fprintf(stderr, "[CondEnc-TRT] D2H copy of enc_hidden failed\n");
+            return false;
+        }
+        if (cudaStreamSynchronize(ctx->stream) != cudaSuccess) {
+            fprintf(stderr, "[CondEnc-TRT] stream sync failed\n");
+            return false;
+        }
+        // FP32 engine can't overflow; no sanitization needed.
+        if (out_S_total) *out_S_total = S_total;
+        return true;
+    }
+
+    // FP16 or BF16: download as uint16, then convert to FP32.
     std::vector<uint16_t> half(n_out);
     if (cudaMemcpyAsync(half.data(), ctx->d_out, out_bytes,
                         cudaMemcpyDeviceToHost, ctx->stream) != cudaSuccess) {
@@ -395,13 +510,23 @@ inline bool cond_enc_trt_forward(CondEncTrt * ctx,
         return false;
     }
 
-    // The cond engine is a fixed FP16 graph; extreme activations can saturate
-    // to ±Inf (and 0*Inf etc. to NaN) at isolated channels. The DiT consumer
-    // requires a finite enc_hidden — a single non-finite element poisons the
-    // whole denoise. Clamp on the FP16→FP32 boundary: NaN→0, ±Inf→±65504 (the
-    // FP16 finite max), preserving sign/magnitude of saturated values. The GGML
-    // FP32 cond path does not saturate, so this only affects the FP16 engine.
-    out_f32.resize(n_out);
+    if (ctx->io_dtype == COND_ENC_IO_BF16) {
+        // BF16 has FP32-equivalent range (±3.4e38) — no overflow possible,
+        // no sanitization needed. Just widen to FP32 (zero-extend upper 16 bits).
+        for (size_t i = 0; i < n_out; i++) {
+            out_f32[i] = cond_enc_trt_bf16_to_float(half[i]);
+        }
+        if (out_S_total) *out_S_total = S_total;
+        return true;
+    }
+
+    // FP16 path: extreme activations can saturate to ±Inf (and 0*Inf etc. to
+    // NaN) at isolated channels. The DiT consumer requires a finite enc_hidden
+    // — a single non-finite element poisons the whole denoise. Clamp on the
+    // FP16→FP32 boundary: NaN→0, ±Inf→±65504 (the FP16 finite max), preserving
+    // sign/magnitude of saturated values. The GGML FP32 cond path does not
+    // saturate, so this only affects the FP16 engine. BF16/FP32 engines skip
+    // this path entirely (handled above).
     size_t sanitized = 0;
     for (size_t i = 0; i < n_out; i++) {
         float v = cond_enc_trt_half_to_float(half[i]);

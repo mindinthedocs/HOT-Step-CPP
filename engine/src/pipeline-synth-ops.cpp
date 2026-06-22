@@ -620,18 +620,15 @@ static void build_prompt_strings(const AceRequest &  rb,
     lyric_out = std::string("# Languages\n") + language_b + "\n\n# Lyric\n" + rb.lyrics + "<|endoftext|>";
 }
 
-// Native TRT bundle encode (partner §5.3). Routes the text encoder through
-// text_enc_trt_forward and the condition encoder through cond_enc_trt_forward,
-// replacing the GGML qwen3/cond forwards at the call sites. The TRT forward
-// outputs match the GGML contracts (text_hidden [B,S,1024], enc_hidden
-// [B,S_total,2048]), so downstream padding/stacking is shared.
+// TRT encode path — handles all combinations of text/cond encoder backends:
 //
-// all-three-or-nothing already held at load (use_trt_bundle implies the bundle's
-// dit/text_enc/cond_enc engines all exist). The lyric embedding table has no TRT
-// engine of its own; the bundle must ship it as a text_enc sidecar. When that
-// sidecar is absent this hard-fails rather than falling back to the GGUF text
-// encoder — the all-three-or-nothing contract forbids a silent GGUF encoder
-// fallback when a TRT bundle is selected.
+//   text encoder  = TRT (standalone Qwen3-emb bundle)  OR  GGUF Qwen3
+//   cond encoder  = TRT (DiT bundle)                   OR  GGML cond
+//
+// The text and cond phases are independent: the text phase produces
+// text_hidden + lyric_embed as CPU buffers, the cond phase consumes them.
+// The outputs match the GGML contracts (text_hidden [B,S,1024], enc_hidden
+// [B,S_total,2048]), so downstream padding/stacking is shared.
 //
 // Populates main_fwd/nc_fwd (text_hidden + lyric_embed + S), s.per_enc* (cond
 // output), s.null_cond_vec, and H_text/H_cond, exactly like the GGML branch.
@@ -645,52 +642,87 @@ static int ops_encode_text_trt(const AceSynth *             ctx,
                                std::vector<TextEncForward> & nc_fwd,
                                int &                        H_text,
                                int &                        H_cond) {
-    H_text = 1024;  // Qwen3-Embedding text-encoder hidden size (engine output binding)
-    H_cond = 2048;  // condition-encoder hidden size (engine output binding)
+    const bool use_trt_text = ctx->use_trt_text_enc;   // standalone Qwen3-emb bundle
+    const bool use_trt_cond = ctx->use_trt_bundle;     // DiT bundle
 
-    // Lyric embed source: a bundle-shipped embed table sidecar. The all-three
-    // gate covers dit/text_enc/cond_enc engines; the lyric embed table is a
-    // text_enc sidecar — the embed lookup runs against this sidecar.
-    std::string embed_tokens_path;
-    for (const std::string & sc : ctx->trt_manifest.text_enc.sidecars) {
-        if (sc.find("embed_tokens") != std::string::npos && hs_file_exists(sc)) {
-            embed_tokens_path = sc;
-            break;
+    H_text = 1024;  // Qwen3-Embedding text-encoder hidden size
+    H_cond = 2048;  // condition-encoder hidden size
+
+    // ── Phase A: text encoder forward ──
+    // Acquire the text encoder (TRT or GGUF), run all forwards into CPU-resident
+    // TextEncForward, then release before cond_enc loads.
+    TextEncTrt * te_trt = nullptr;
+    Qwen3GGML  * te_gguf = nullptr;
+    const LyricEmbedLut * lyric_lut = nullptr;
+
+    if (use_trt_text) {
+        // Standalone Qwen3-emb bundle: load the TRT text engine + the bundle's
+        // embed_tokens.bin sidecar (the lyric embed table).
+        te_trt = store_require_text_enc_trt(ctx->store, ctx->text_enc_trt_key);
+        if (!te_trt) {
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: store_require_text_enc_trt failed\n");
+            return -1;
         }
-    }
-    if (embed_tokens_path.empty()) {
-        fprintf(stderr,
-                "[Encode-Text-TRT] FATAL: TRT bundle has no lyric embed_tokens sidecar; "
-                "lyric embedding requires the embed_tokens sidecar in the TRT bundle. "
-                "Refusing to fall back to the GGUF text encoder (all-three-or-nothing).\n");
-        return -1;
-    }
 
-    // Load the lyric embed table once (cached process-wide). Lyric tokens index
-    // its rows to produce lyric_embed [S_lyric, 1024], the cond engine's
-    // lyric_embed input — replacing the old 0.0f stub.
-    const LyricEmbedLut * lyric_lut = lyric_embed_lut_get_cached(embed_tokens_path);
-    if (!lyric_lut) {
-        fprintf(stderr, "[Encode-Text-TRT] FATAL: failed to load lyric embed table %s\n",
-                embed_tokens_path.c_str());
-        return -1;
-    }
-    if (lyric_lut->cols != H_text) {
-        fprintf(stderr,
-                "[Encode-Text-TRT] FATAL: embed table width %d != text hidden %d\n",
-                lyric_lut->cols, H_text);
-        return -1;
-    }
-
-    TextEncTrt * te = store_require_text_enc_trt(ctx->store, ctx->text_enc_trt_key);
-    if (!te) {
-        fprintf(stderr, "[Encode-Text-TRT] FATAL: store_require_text_enc_trt failed\n");
-        return -1;
+        std::string embed_tokens_path;
+        for (const std::string & sc : ctx->text_enc_trt_manifest.text_enc.sidecars) {
+            if (sc.find("embed_tokens") != std::string::npos && hs_file_exists(sc)) {
+                embed_tokens_path = sc;
+                break;
+            }
+        }
+        if (embed_tokens_path.empty()) {
+            fprintf(stderr,
+                    "[Encode-Text-TRT] FATAL: Qwen3-emb bundle has no lyric embed_tokens sidecar.\n");
+            store_release_text_enc_trt(ctx->store, te_trt);
+            return -1;
+        }
+        lyric_lut = lyric_embed_lut_get_cached(embed_tokens_path);
+        if (!lyric_lut) {
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: failed to load lyric embed table %s\n",
+                    embed_tokens_path.c_str());
+            store_release_text_enc_trt(ctx->store, te_trt);
+            return -1;
+        }
+        if (lyric_lut->cols != H_text) {
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: embed table width %d != text hidden %d\n",
+                    lyric_lut->cols, H_text);
+            store_release_text_enc_trt(ctx->store, te_trt);
+            return -1;
+        }
+        fprintf(stderr, "[Encode-Text-TRT] text encoder = TRT Qwen3-emb bundle (%s)\n",
+                ctx->text_enc_trt_key.path.c_str());
+    } else {
+        // GGUF Qwen3 text encoder (the project default).
+        te_gguf = store_require_text_enc(ctx->store, ctx->text_enc_key);
+        if (!te_gguf) {
+            fprintf(stderr, "[Encode-Text] FATAL: store_require_text_enc failed (GGUF Qwen3)\n");
+            return -1;
+        }
+        if (!ctx->params.use_fa) {
+            te_gguf->use_flash_attn = false;
+        }
+        H_text = te_gguf->cfg.hidden_size;
+        fprintf(stderr, "[Encode-Text-TRT] text encoder = GGUF Qwen3 (%s)\n",
+                ctx->params.text_encoder_path ? ctx->params.text_encoder_path : "<null>");
     }
 
     auto run_text = [&](const std::vector<int> & ids, int S, std::vector<float> & out) -> bool {
         out.resize((size_t) H_text * S);
-        return text_enc_trt_forward(te, ids.data(), 1, S, out.data());
+        if (use_trt_text) {
+            return text_enc_trt_forward(te_trt, ids.data(), 1, S, out.data());
+        }
+        qwen3_forward(te_gguf, ids.data(), S, out.data());
+        return true;
+    };
+
+    auto lookup_lyric = [&](const std::vector<int> & ids, int S, std::vector<float> & out) -> bool {
+        out.resize((size_t) H_text * S);
+        if (use_trt_text) {
+            return lyric_embed_lut_lookup(*lyric_lut, ids.data(), S, out);
+        }
+        qwen3_embed_lookup(te_gguf, ids.data(), S, out.data());
+        return true;
     };
 
     int text_rc = 0;
@@ -702,13 +734,11 @@ static int ops_encode_text_trt(const AceSynth *             ctx,
         main_fwd[b].S_text  = (int) text_ids.size();
         main_fwd[b].S_lyric = (int) lyric_ids.size();
         if (!run_text(text_ids, main_fwd[b].S_text, main_fwd[b].text_hidden)) {
-            fprintf(stderr, "[Encode-Text-TRT] FATAL: text_enc_trt_forward failed (batch %d)\n", b);
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: text_enc forward failed (batch %d)\n", b);
             text_rc = -1;
             break;
         }
-        // lyric_embed: row-gather the bundle embed_tokens table (CPU vocab lookup).
-        if (!lyric_embed_lut_lookup(*lyric_lut, lyric_ids.data(), main_fwd[b].S_lyric,
-                                    main_fwd[b].lyric_embed)) {
+        if (!lookup_lyric(lyric_ids, main_fwd[b].S_lyric, main_fwd[b].lyric_embed)) {
             fprintf(stderr, "[Encode-Text-TRT] FATAL: lyric embed lookup failed (batch %d)\n", b);
             text_rc = -1;
             break;
@@ -727,8 +757,7 @@ static int ops_encode_text_trt(const AceSynth *             ctx,
                 text_rc = -1;
                 break;
             }
-            if (!lyric_embed_lut_lookup(*lyric_lut, lyric_ids.data(), nc_fwd[b].S_lyric,
-                                        nc_fwd[b].lyric_embed)) {
+            if (!lookup_lyric(lyric_ids, nc_fwd[b].S_lyric, nc_fwd[b].lyric_embed)) {
                 fprintf(stderr, "[Encode-Text-TRT] FATAL: lyric embed lookup failed (nc batch %d)\n", b);
                 text_rc = -1;
                 break;
@@ -749,68 +778,108 @@ static int ops_encode_text_trt(const AceSynth *             ctx,
         }
     }
 
-    // Free text-enc evictable buffers + context before cond-enc loads (keeps the
-    // resident engine shell; mirrors the GGML branch's one-module-at-a-time peak).
-    store_release_text_enc_trt(ctx->store, te);
+    // Release the text encoder before cond_enc loads (one module at a time).
+    if (te_trt) {
+        store_release_text_enc_trt(ctx->store, te_trt);
+    }
+    if (te_gguf) {
+        store_release(ctx->store, (void *) te_gguf);
+    }
     if (text_rc != 0) {
         return -1;
     }
 
-    CondEncTrt * ce = store_require_cond_enc_trt(ctx->store, ctx->cond_enc_trt_key);
-    if (!ce) {
-        fprintf(stderr, "[Encode-Text-TRT] FATAL: store_require_cond_enc_trt failed\n");
-        return -1;
-    }
-
+    // ── Phase B: condition encoder forward ──
     s.per_enc.resize(batch_n);
     s.per_enc_S.resize(batch_n);
     s.per_enc_nc.resize(batch_n);
     s.per_enc_S_nc.assign(batch_n, 0);
 
-    // null_condition_emb stays on the EXISTING CFG path (DiTMeta), not an engine
-    // input — same as the GGML branch.
     s.null_cond_vec.resize(H_cond);
     if (!ctx->meta->null_cond_cpu.empty()) {
         memcpy(s.null_cond_vec.data(), ctx->meta->null_cond_cpu.data(), H_cond * sizeof(float));
     }
 
     int cond_rc = 0;
-    for (int b = 0; b < batch_n && cond_rc == 0; b++) {
-        // The lyric_embed feeding cond must be NON-ZERO (not the old 0.0f
-        // stub) — i.e. lyrics actually condition the song.
-        {
-            double le_absum = 0.0;
-            for (float v : main_fwd[b].lyric_embed) le_absum += (double) std::fabs(v);
-            fprintf(stderr, "[Encode-Text-TRT Batch%d] lyric_embed S_lyric=%d sum|.|=%.4f (NON-ZERO -> lyrics condition the song)\n",
-                    b, main_fwd[b].S_lyric, le_absum);
+    if (use_trt_cond) {
+        CondEncTrt * ce = store_require_cond_enc_trt(ctx->store, ctx->cond_enc_trt_key);
+        if (!ce) {
+            fprintf(stderr, "[Encode-Text-TRT] FATAL: store_require_cond_enc_trt failed\n");
+            return -1;
         }
-        if (!cond_enc_trt_forward(ce,
-                                  main_fwd[b].text_hidden.data(), main_fwd[b].S_text,
-                                  main_fwd[b].lyric_embed.data(), main_fwd[b].S_lyric,
-                                  s.timbre_feats.data(), s.S_ref_timbre, 1,
-                                  s.per_enc[b], &s.per_enc_S[b])) {
-            fprintf(stderr, "[Encode-Text-TRT] FATAL: cond_enc_trt_forward failed (batch %d)\n", b);
-            cond_rc = -1;
-            break;
-        }
-        fprintf(stderr, "[Encode-Text-TRT Batch%d] %d+%d tokens -> enc_S=%d\n",
-                b, main_fwd[b].S_text, main_fwd[b].S_lyric, s.per_enc_S[b]);
-    }
+        fprintf(stderr, "[Encode-Text-TRT] cond encoder = TRT (DiT bundle)\n");
 
-    if (cond_rc == 0 && s.need_enc_switch) {
         for (int b = 0; b < batch_n && cond_rc == 0; b++) {
+            {
+                double le_absum = 0.0;
+                for (float v : main_fwd[b].lyric_embed) le_absum += (double) std::fabs(v);
+                fprintf(stderr, "[Encode-Text-TRT Batch%d] lyric_embed S_lyric=%d sum|.|=%.4f\n",
+                        b, main_fwd[b].S_lyric, le_absum);
+            }
             if (!cond_enc_trt_forward(ce,
-                                      nc_fwd[b].text_hidden.data(), nc_fwd[b].S_text,
-                                      nc_fwd[b].lyric_embed.data(), nc_fwd[b].S_lyric,
+                                      main_fwd[b].text_hidden.data(), main_fwd[b].S_text,
+                                      main_fwd[b].lyric_embed.data(), main_fwd[b].S_lyric,
                                       s.timbre_feats.data(), s.S_ref_timbre, 1,
-                                      s.per_enc_nc[b], &s.per_enc_S_nc[b])) {
+                                      s.per_enc[b], &s.per_enc_S[b])) {
+                fprintf(stderr, "[Encode-Text-TRT] FATAL: cond_enc_trt_forward failed (batch %d)\n", b);
                 cond_rc = -1;
                 break;
+            }
+            fprintf(stderr, "[Encode-Text-TRT Batch%d] %d+%d tokens -> enc_S=%d\n",
+                    b, main_fwd[b].S_text, main_fwd[b].S_lyric, s.per_enc_S[b]);
+        }
+
+        if (cond_rc == 0 && s.need_enc_switch) {
+            for (int b = 0; b < batch_n && cond_rc == 0; b++) {
+                if (!cond_enc_trt_forward(ce,
+                                          nc_fwd[b].text_hidden.data(), nc_fwd[b].S_text,
+                                          nc_fwd[b].lyric_embed.data(), nc_fwd[b].S_lyric,
+                                          s.timbre_feats.data(), s.S_ref_timbre, 1,
+                                          s.per_enc_nc[b], &s.per_enc_S_nc[b])) {
+                    cond_rc = -1;
+                    break;
+                }
+            }
+        }
+        store_release_cond_enc_trt(ctx->store, ce);
+    } else {
+        // GGML cond encoder (GGUF DiT selected, TRT Qwen3 text encoder selected).
+        CondGGML * ce = store_require_cond_enc(ctx->store, ctx->cond_enc_key);
+        if (!ce) {
+            fprintf(stderr, "[Encode-Text] FATAL: store_require_cond_enc failed\n");
+            return -1;
+        }
+        ModelHandle ce_guard(ctx->store, ce);
+        if (!ctx->params.use_fa) {
+            ce->use_flash_attn = false;
+        }
+        ce->clamp_fp16 = ctx->params.clamp_fp16;
+        H_cond = ce->lyric_cfg.hidden_size;
+        s.null_cond_vec.resize(H_cond);
+        if (!ctx->meta->null_cond_cpu.empty()) {
+            memcpy(s.null_cond_vec.data(), ctx->meta->null_cond_cpu.data(), H_cond * sizeof(float));
+        }
+        fprintf(stderr, "[Encode-Text-TRT] cond encoder = GGML\n");
+
+        for (int b = 0; b < batch_n; b++) {
+            s.timer.reset();
+            cond_ggml_forward(ce, main_fwd[b].text_hidden.data(), main_fwd[b].S_text,
+                              main_fwd[b].lyric_embed.data(), main_fwd[b].S_lyric,
+                              s.timbre_feats.data(), s.S_ref_timbre,
+                              s.per_enc[b], &s.per_enc_S[b]);
+            fprintf(stderr, "[Encode-Text-TRT Batch%d] %d+%d tokens -> enc_S=%d, %.1f ms\n",
+                    b, main_fwd[b].S_text, main_fwd[b].S_lyric, s.per_enc_S[b], s.timer.ms());
+        }
+        if (s.need_enc_switch) {
+            for (int b = 0; b < batch_n; b++) {
+                cond_ggml_forward(ce, nc_fwd[b].text_hidden.data(), nc_fwd[b].S_text,
+                                  nc_fwd[b].lyric_embed.data(), nc_fwd[b].S_lyric,
+                                  s.timbre_feats.data(), s.S_ref_timbre,
+                                  s.per_enc_nc[b], &s.per_enc_S_nc[b]);
             }
         }
     }
 
-    store_release_cond_enc_trt(ctx->store, ce);
     return cond_rc;
 }
 #else
@@ -839,7 +908,15 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
     s.need_enc_switch = s.use_source_context && !s.is_repaint && !s.is_lego_region && s.rr.audio_cover_strength < 1.0f;
 
     // BPE tokenizer: GGUF TextEnc keeps tokenizer metadata in the GGUF file.
+    // When a TRT Qwen3-emb bundle is selected, the text_encoder_path points to
+    // the .onnx engine file — the BPE tokenizer loads from the bundle directory
+    // instead (vocab.json + merges.txt sidecars shipped with the bundle).
     const char * bpe_path = ctx->params.text_encoder_path;
+    std::string bpe_path_override;
+    if (ctx->use_trt_text_enc) {
+        bpe_path_override = ctx->text_enc_trt_manifest.bundle_dir;
+        bpe_path = bpe_path_override.c_str();
+    }
     BPETokenizer * bpe = store_bpe(ctx->store, bpe_path);
     if (!bpe) {
         fprintf(stderr, "[Encode-Text] FATAL: store_bpe failed (path=%s)\n", bpe_path);
@@ -851,7 +928,11 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
     int                         H_text = 0;
     int                         H_cond = 0;
 
-    if (ctx->use_trt_bundle) {
+    // Route to the TRT path when either a DiT bundle (TRT cond encoder) or a
+    // standalone Qwen3-emb bundle (TRT text encoder) is selected. The TRT path
+    // handles all 4 combinations of {TRT, GGUF} text × {TRT, GGML} cond; the
+    // pure-GGML case (no TRT at all) falls through to the GGML branch below.
+    if (ctx->use_trt_bundle || ctx->use_trt_text_enc) {
         if (ops_encode_text_trt(ctx, reqs, batch_n, s, bpe, main_fwd, nc_fwd, H_text, H_cond) != 0) {
             return -1;
         }
@@ -1127,6 +1208,32 @@ int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, 
 
     if (batch_n > 1) {
         fprintf(stderr, "[Encode-Text] Per-batch encoding done: max_enc_S=%d\n", s.max_enc_S);
+    }
+
+    // Section-by-section enc_hidden dump for TRT vs GGML comparison
+    {
+        int H = 2048;
+        int S_lyric = s.per_enc_S[0] > 0 ? 171 : 0;  // adjust as needed
+        int S_timbre = 1;
+        int S_text = s.per_enc_S[0] - S_lyric - S_timbre;
+
+        fprintf(stderr, "[DIAG] enc_hidden sections (first 8 elems):\n");
+        // Lyric section [0, S_lyric)
+        fprintf(stderr, "  lyric[0]:  ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", s.enc_hidden.data()[i]);
+        fprintf(stderr, "\n");
+        // Timbre section [S_lyric*H, (S_lyric+1)*H)
+        fprintf(stderr, "  timbre[0]: ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", s.enc_hidden.data()[S_lyric * H + i]);
+        fprintf(stderr, "\n");
+        // Text section [(S_lyric+1)*H, ...)
+        fprintf(stderr, "  text[0]:   ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", s.enc_hidden.data()[(S_lyric + 1) * H + i]);
+        fprintf(stderr, "\n");
+        // Last text token
+        fprintf(stderr, "  text[-1]:  ");
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%.6f ", s.enc_hidden.data()[(s.per_enc_S[0] - 1) * H + i]);
+        fprintf(stderr, "\n");
     }
 
     return 0;

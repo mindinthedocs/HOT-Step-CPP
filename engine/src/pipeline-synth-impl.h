@@ -52,16 +52,30 @@ struct AceSynth {
 
     bool        is_onnx_pipeline;   // true when FSQ/runtime side data is from the ONNX artifact dir
 
-    // Native TRT bundle routing. Set when the selected ONNX DiT directory carries
-    // a manifest.json (the sole TRT-bundle detector). When true the encoders route
-    // through the TRT engines named in the manifest instead of GGML qwen3/cond.
-    // The all-three-or-nothing gate runs at load: an incomplete manifest hard-fails
-    // ace_synth_load, so use_trt_bundle==true implies dit/text_enc/cond_enc engines
-    // are all present. The DiT TRT path keys off dit_key.path (ONNX dir) as before.
+    // Native TRT bundle routing. Two independent bundle detections:
+    //
+    //  1. DiT bundle — detected when the selected DiT directory carries a
+    //     manifest.json. When use_trt_bundle=true, the DiT forward and the
+    //     condition-encoder forward route through the bundle's TRT engines.
+    //     The text encoder is NOT in the DiT bundle (the GGUF Qwen3 is the
+    //     default text encoder; a standalone Qwen3-emb bundle can override it).
+    //
+    //  2. Qwen3-emb bundle — detected when the selected text-encoder path is
+    //     inside a directory carrying a manifest.json (e.g. trt-bundles/qwen3-emb/).
+    //     When text_enc_trt_key.path is non-empty, the text-encoder forward and
+    //     the lyric embed lookup route through the bundle's TRT text engine.
+    //     Otherwise the GGUF Qwen3 (params->text_encoder_path) is used.
+    //
+    // The two detections are independent: a request can use a TRT DiT bundle
+    // with a GGUF Qwen3 text encoder (hybrid), or a TRT Qwen3 text encoder
+    // with a GGUF DiT, or both TRT, or both GGUF.
     bool             use_trt_bundle = false;
-    TrtBundleManifest trt_manifest;       // resolved component paths (valid iff use_trt_bundle)
-    ModelKey         text_enc_trt_key;    // MODEL_TEXT_ENC_TRT, path = manifest text_enc engine
-    ModelKey         cond_enc_trt_key;    // MODEL_COND_ENC_TRT, path = manifest cond_enc engine
+    TrtBundleManifest trt_manifest;            // DiT bundle manifest (valid iff use_trt_bundle)
+    ModelKey         cond_enc_trt_key;         // MODEL_COND_ENC_TRT, path = DiT bundle cond_enc engine
+
+    bool             use_trt_text_enc = false;  // true when a standalone Qwen3-emb bundle is selected
+    TrtBundleManifest text_enc_trt_manifest;    // Qwen3-emb bundle manifest (valid iff use_trt_text_enc)
+    ModelKey         text_enc_trt_key;          // MODEL_TEXT_ENC_TRT, path = Qwen3-emb bundle text_enc engine
 };
 
 // Transient state for a single job, shared by reference across the primitive

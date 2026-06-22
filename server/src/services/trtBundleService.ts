@@ -32,6 +32,10 @@ interface StartBuildInput {
   variant: string;
   precision: string;
   ditDir: string;
+  sourceModel?: string;
+}
+
+interface StartEmbeddingBuildInput {
   textEncoderDir: string;
   sourceModel?: string;
 }
@@ -204,7 +208,6 @@ class TrtBundleService extends EventEmitter {
       '--variant', input.precision,
       '--output-dir', outputDir,
       '--dit-dir', input.ditDir,
-      '--text-encoder-dir', input.textEncoderDir,
       '--gguf', ggufPath,
     ];
     if (input.sourceModel) {
@@ -224,6 +227,80 @@ class TrtBundleService extends EventEmitter {
     this.writeLock({
       jobId,
       variant,
+      bundleName,
+      pid: child.pid ?? 0,
+      startedAt: new Date().toISOString(),
+      logPath,
+      bundleDir,
+    });
+
+    this.wireChild(job, child);
+    this.emit('progress');
+    return jobId;
+  }
+
+  /**
+   * Start a standalone Qwen3-emb TRT bundle build. The Qwen3-emb bundle is
+   * independent of any DiT bundle: it ships only the TRT Qwen3 text encoder
+   * (+ sidecars) and lives in its own folder (trt-bundles/qwen3-emb/). When
+   * the user selects it as the text encoder, the runtime routes the text-
+   * encoder forward through the TRT engine.
+   */
+  async startEmbeddingBuild(input: StartEmbeddingBuildInput): Promise<string> {
+    if (this.activeJobId !== null) {
+      throw new BuildLockedError('A TRT build is already running (single-GPU-locked)');
+    }
+    if (!fs.existsSync(this.pythonExe)) {
+      throw new Error(`Missing required .venv Python interpreter: ${this.pythonExe}`);
+    }
+    if (!fs.existsSync(this.cliScript)) {
+      throw new Error(`Missing TRT bundle CLI script: ${this.cliScript}`);
+    }
+
+    const bundleName = 'qwen3-emb';
+    const outputDir = path.join('models', 'trt-bundles', bundleName);
+    const bundleDir = path.join(PROJECT_ROOT, outputDir);
+
+    fs.mkdirSync(this.logsDir, { recursive: true });
+    fs.mkdirSync(path.dirname(bundleDir), { recursive: true });
+
+    const jobId = randomUUID().slice(0, 8);
+    const logPath = path.join(this.logsDir, `build-emb-${jobId}.log`);
+    const job: InternalJob = {
+      jobId,
+      variant: bundleName,
+      bundleName,
+      status: 'running',
+      progress: 0,
+      step: 'starting',
+      lines: [],
+      logPath,
+      bundleDir,
+    };
+
+    const argv = [
+      this.cliScript,
+      'embedding-bundle',
+      '--output-dir', outputDir,
+      '--text-encoder-dir', input.textEncoderDir,
+    ];
+    if (input.sourceModel) {
+      argv.push('--source-model', input.sourceModel);
+    }
+
+    this.jobs.set(jobId, job);
+    this.activeJobId = jobId;
+
+    const child = spawn(this.pythonExe, argv, {
+      cwd: PROJECT_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    job.child = child;
+    job.childPid = child.pid ?? undefined;
+
+    this.writeLock({
+      jobId,
+      variant: bundleName,
       bundleName,
       pid: child.pid ?? 0,
       startedAt: new Date().toISOString(),

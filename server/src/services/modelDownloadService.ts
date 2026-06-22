@@ -202,14 +202,12 @@ class ModelDownloadService extends EventEmitter {
     return registry.trtVariants ?? [];
   }
 
-  async ensureTrtVariantSources(variant: TrtRegistryVariant): Promise<{ ditDir: string; textEncoderDir: string }> {
+  async ensureTrtVariantSources(variant: TrtRegistryVariant): Promise<{ ditDir: string }> {
     const safeToken = variant.id.replace(/[^A-Za-z0-9._-]/g, '-');
     const rootDir = path.join(PROJECT_ROOT, '.enc-build', 'trt-src', safeToken);
     const ditDir = path.join(rootDir, 'dit');
-    const textEncoderDir = path.join(rootDir, 'qwen3-emb');
 
     fs.mkdirSync(ditDir, { recursive: true });
-    fs.mkdirSync(textEncoderDir, { recursive: true });
 
     await this.downloadFromHuggingFace(variant.hfRepo, ['config.json', 'silence_latent.pt'], ditDir);
     // Download Python modeling files required by export_cond_enc.py and export_dit.py.
@@ -234,6 +232,19 @@ class ModelDownloadService extends EventEmitter {
     }
     await this.downloadSafetensorsWeights(variant.hfRepo, ditDir);
 
+    return { ditDir };
+  }
+
+  /**
+   * Ensure the Qwen3-Embedding source safetensors are cached locally for the
+   * standalone TRT Qwen3-emb build pipeline. The source lives in its own
+   * directory (.enc-build/trt-src/qwen3-emb) — independent of any DiT variant —
+   * so it is downloaded once and reused across builds.
+   */
+  async ensureQwen3EmbeddingSource(): Promise<{ textEncoderDir: string }> {
+    const textEncoderDir = path.join(PROJECT_ROOT, '.enc-build', 'trt-src', 'qwen3-emb');
+    fs.mkdirSync(textEncoderDir, { recursive: true });
+
     await this.downloadFromHuggingFace('Qwen/Qwen3-Embedding-0.6B', [
       'config.json',
       'vocab.json',
@@ -243,7 +254,7 @@ class ModelDownloadService extends EventEmitter {
     ], textEncoderDir);
     await this.downloadSafetensorsWeights('Qwen/Qwen3-Embedding-0.6B', textEncoderDir);
 
-    return { ditDir, textEncoderDir };
+    return { textEncoderDir };
   }
 
   /** Scan models directory for installed model files (.gguf, .onnx, .safetensors),

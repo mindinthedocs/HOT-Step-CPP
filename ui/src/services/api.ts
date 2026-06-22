@@ -348,9 +348,12 @@ export const trtBundleApi = {
   variants: () => get<{ variants: TrtVariant[] }>('/trt-bundles/variants'),
   /** Active build rehydration for browser refresh */
   activeBuild: () => get<{ job: TrtBuildJob | null }>('/trt-bundles/active-build'),
-  /** Start a build { variant, precision }. Throws on 409 (single-GPU lock). */
+  /** Start a DiT bundle build { variant, precision }. Throws on 409 (single-GPU lock). */
   build: (variant: string, precision?: string) =>
     post<{ jobId: string }>('/trt-bundles/build', { variant, precision }),
+  /** Start a standalone Qwen3-emb TRT bundle build. Independent of DiT bundles. */
+  buildEmbedding: () =>
+    post<{ jobId: string }>('/trt-bundles/build-embedding', {}),
   /** Build-job status */
   status: (jobId: string) => get<TrtBuildJob>(`/trt-bundles/build/${jobId}`),
   /** Cancel a running build */

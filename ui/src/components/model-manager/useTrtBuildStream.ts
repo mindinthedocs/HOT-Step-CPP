@@ -64,7 +64,7 @@ export function useTrtBuildStream(opts?: UseTrtBuildStreamOptions) {
     return () => { mounted = false; };
   }, []);
 
-  /** Start a build and begin streaming its progress. Surfaces 409/errors to the caller. */
+  /** Start a DiT bundle build and begin streaming its progress. Surfaces 409/errors to the caller. */
   const startBuild = useCallback(async (variant: string, precision?: string) => {
     const { jobId } = await trtBundleApi.build(variant, precision);
     // Bundle directory naming mirrors the server's TrtBundleService.bundleNameFor:
@@ -75,6 +75,17 @@ export function useTrtBuildStream(opts?: UseTrtBuildStreamOptions) {
     const p = precision ?? 'q8map-fp16';
     setJob({
       jobId, variant, bundleName: `trt-${variant}-${p}`,
+      status: 'running', progress: 0, step: 'starting', lines: [],
+    });
+    setActiveJobId(jobId);
+    return jobId;
+  }, []);
+
+  /** Start a standalone Qwen3-emb TRT bundle build (independent of DiT bundles). */
+  const startEmbeddingBuild = useCallback(async () => {
+    const { jobId } = await trtBundleApi.buildEmbedding();
+    setJob({
+      jobId, variant: 'qwen3-emb', bundleName: 'qwen3-emb',
       status: 'running', progress: 0, step: 'starting', lines: [],
     });
     setActiveJobId(jobId);
@@ -96,5 +107,5 @@ export function useTrtBuildStream(opts?: UseTrtBuildStreamOptions) {
 
   const isBuilding = job?.status === 'running';
 
-  return { job, isBuilding, startBuild, cancelBuild, clear };
+  return { job, isBuilding, startBuild, startEmbeddingBuild, cancelBuild, clear };
 }

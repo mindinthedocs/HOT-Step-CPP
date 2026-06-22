@@ -31,22 +31,41 @@ import torch.nn as nn
 
 class TextEncoderWrapper(nn.Module):
     """Wrapper around Qwen3Model that returns hidden_states as a flat tensor.
-    
+
     ONNX inputs:
         input_ids:     [B, S] int64 — BPE token IDs
-    
+
     ONNX output:
         hidden_states: [B, S, 1024] fp16 — last hidden state
+
+    CRITICAL: The GGML text encoder (qwen3-enc.h:351) hardcodes is_causal=true,
+    applying a lower-triangular causal mask (token i attends only to tokens 0..i).
+    The HuggingFace Qwen3Model with attention_mask=None generates a causal mask
+    ONLY for decoder models (is_decoder=True). Qwen3-Embedding is an encoder
+    model, so attention_mask=None produces BIDIRECTIONAL attention — all tokens
+    attend to all tokens. This mismatch causes completely different hidden
+    states (the "text[0]" section of enc_hidden diverges entirely between TRT
+    and GGML).
+
+    Fix: explicitly build and pass a causal attention mask [B, S] (1=valid),
+    which HF converts to a lower-triangular additive bias. This matches the
+    GGML path's causal masking bit-for-bit.
     """
-    
+
     def __init__(self, model):
         super().__init__()
         self.model = model
-    
+
     def forward(self, input_ids):
+        B, S = input_ids.shape
+        # Build causal attention mask: [B, S] all-ones.
+        # HF's _prepare_4d_causal_attention_mask converts this to a
+        # lower-triangular additive bias (0.0 for j<=i, -inf for j>i),
+        # matching GGML's qwen3_forward mask construction.
+        attention_mask = torch.ones(B, S, device=input_ids.device, dtype=torch.long)
         outputs = self.model(
             input_ids=input_ids,
-            attention_mask=None,  # causal mask generated internally
+            attention_mask=attention_mask,  # causal mask: all valid, lower-triangular
             output_hidden_states=False,
             return_dict=True,
         )
@@ -216,6 +235,14 @@ def main():
     parser.add_argument("--fp16", action="store_true",
                         help="Export the ONNX graph in FP16 (native half weights, "
                              "the strongly-typed TRT 11 encoder precision for sm_75)")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Export the ONNX graph in BF16 (bfloat16 weights). "
+                             "Preferred over --fp16 for the text-enc engine: BF16 has "
+                             "the same dynamic range as FP32 (8 exponent bits), so "
+                             "intermediate activations in the 28-layer Qwen3 encoder "
+                             "can't saturate to ±Inf/NaN. The C++ text-enc runtime "
+                             "auto-detects the engine I/O dtype. Requires Ampere+ GPU "
+                             "(sm80+) for native BF16 throughput.")
     parser.add_argument("--force", action="store_true",
                         help="Re-export even if the output ONNX already exists")
     parser.add_argument("--low-memory-export", dest="low_memory_export", action="store_true", default=True,
@@ -247,7 +274,25 @@ def main():
             return
     
     # Load model
-    export_dtype = torch.float16 if args.fp16 else torch.float32
+    # The text-enc TRT runtime (engine/src/text-enc-trt.h) auto-detects the
+    # engine I/O dtype at load time and supports FP16 / BF16 / FP32 engines.
+    #   --fp16: smallest engine, FP16 dynamic range (±65504) — intermediate
+    #           activations in the 28-layer Qwen3 encoder can saturate to
+    #           ±Inf/NaN, subtly degrading text_hidden which propagates to
+    #           cond_enc and DiT. No sanitization in text-enc-trt.h (unlike
+    #           cond-enc-trt.h), so corruption passes straight through.
+    #   --bf16: same engine size as FP16, BF16 dynamic range (±3.4e38) matches
+    #           FP32 — no overflow, no corruption. PREFERRED for text-enc.
+    #           Requires Ampere+ GPU (sm80+) for native throughput.
+    #   (default) FP32: largest engine, safest, slowest.
+    if args.bf16 and args.fp16:
+        raise SystemExit("--bf16 and --fp16 are mutually exclusive")
+    if args.bf16:
+        export_dtype = torch.bfloat16
+    elif args.fp16:
+        export_dtype = torch.float16
+    else:
+        export_dtype = torch.float32
     model, config = load_model(args.model_dir, device=args.device, dtype=export_dtype,
                                low_memory_export=args.low_memory_export)
     

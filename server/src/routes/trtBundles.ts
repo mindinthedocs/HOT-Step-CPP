@@ -109,14 +109,12 @@ router.post('/build', async (req, res) => {
 
   const normalizedVariantToken = variant.replace(/[^A-Za-z0-9._-]/g, '-');
   const ditDir = path.join(PROJECT_ROOT, '.enc-build', 'trt-src', normalizedVariantToken, 'dit');
-  const textEncoderDir = path.join(PROJECT_ROOT, '.enc-build', 'trt-src', normalizedVariantToken, 'qwen3-emb');
 
   try {
     const jobId = await trtBundleService.startBuild({
       variant,
       precision: (precision as string) ?? 'q8map-fp16',
       ditDir,
-      textEncoderDir,
       sourceModel: variantMeta.id,
     });
     res.json({ jobId });
@@ -126,6 +124,33 @@ router.post('/build', async (req, res) => {
       return;
     }
     res.status(400).json({ error: err.message });
+  }
+});
+
+// POST /api/trt-bundles/build-embedding
+// Start a standalone Qwen3-emb TRT bundle build. Independent of DiT bundles —
+// downloads Qwen3-Embedding-0.6B to .enc-build/trt-src/qwen3-emb and builds a
+// TRT text encoder bundle at models/trt-bundles/qwen3-emb/.
+router.post('/build-embedding', async (_req, res) => {
+  const prereqs = await checkPrerequisites();
+  if (!prereqs.cuda.installed) {
+    res.status(400).json({ error: 'CUDA is required for TRT engine builds' });
+    return;
+  }
+
+  try {
+    const { textEncoderDir } = await modelDownloadService.ensureQwen3EmbeddingSource();
+    const jobId = await trtBundleService.startEmbeddingBuild({
+      textEncoderDir,
+      sourceModel: 'Qwen3-Embedding-0.6B',
+    });
+    res.json({ jobId });
+  } catch (err: any) {
+    if (err instanceof BuildLockedError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
+    res.status(400).json({ error: err?.message || 'Failed to start Qwen3-emb build' });
   }
 });
 

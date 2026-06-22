@@ -509,15 +509,16 @@ static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
     }
 
     // Scan native TRT bundles: models/trt-bundles/<name>/ each carrying a
-    // manifest.json + dit.onnx (+ text_encoder.onnx). Registering the bundle's
-    // dit.onnx as a DiT named <name> and text_encoder.onnx as a Text-Enc named
-    // <name> lets a synth request select it via synth_model="<name>"; the synth
-    // path detects the sibling manifest.json and routes DiT+TextEnc+CondEnc
-    // through the TRT engines (the registered ONNX paths provide the bundle dir
-    // for manifest detection and the BPE tokenizer sidecars). Without this the
-    // generic subdir scan skips trt-bundles/ — its .onnx files live one level
-    // deeper, in trt-bundles/<name>/ — so the bundle would show in /props but
-    // not be selectable as a DiT.
+    // manifest.json. Two bundle shapes are supported:
+    //   - DiT bundle: manifest.json + dit.onnx (+ cond_encoder.onnx). Registered
+    //     as a DiT entry so a synth request can select it via synth_model="<name>".
+    //   - Qwen3-emb bundle: manifest.json + text_encoder.onnx (no dit.onnx).
+    //     Registered as a Text-Enc entry so the user can select it as the text
+    //     encoder. The synth path detects the sibling manifest.json and routes
+    //     the text-encoder forward through the TRT engine.
+    // Without this scan the generic subdir scan skips trt-bundles/ — its .onnx
+    // files live one level deeper, in trt-bundles/<name>/ — so the bundles would
+    // show in /props but not be selectable as DiT or Text-Enc.
     {
         std::string trt_root = std::string(models_dir) + REGISTRY_SEP + "trt-bundles";
         std::vector<std::string> bundle_dirs;
@@ -526,12 +527,12 @@ static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
         for (const auto & bundle_name : bundle_dirs) {
             std::string bundle_path   = trt_root + REGISTRY_SEP + bundle_name;
             std::string manifest_path = bundle_path + REGISTRY_SEP + "manifest.json";
-            std::string dit_onnx_path = bundle_path + REGISTRY_SEP + "dit.onnx";
-            if (!registry_is_file(manifest_path.c_str()) || !registry_is_file(dit_onnx_path.c_str())) {
-                continue;  // not a complete TRT bundle (full manifest validation lives in synth-load)
+            if (!registry_is_file(manifest_path.c_str())) {
+                continue;  // not a TRT bundle — no manifest.json
             }
-            // Registers dit.onnx (DiT) and text_encoder.onnx (Text-Enc) under the
-            // bundle name; cond_encoder.onnx is unclassified and skipped.
+            // registry_scan_onnx_bundle_dir registers whichever .onnx files are
+            // present: dit.onnx (DiT), text_encoder.onnx (Text-Enc), etc. A DiT
+            // bundle has dit.onnx; a Qwen3-emb bundle has text_encoder.onnx only.
             count += registry_scan_onnx_bundle_dir(reg, bundle_name, bundle_path);
         }
     }

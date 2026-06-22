@@ -297,7 +297,7 @@ static int dit_trt_generate(DitTrt *              trt,
     }
 
     // ── Build attention masks (int64) ──────────────────────────────────
-    // attention_mask[B, T]         — self-attn padding (1=real, 0=pad beyond real_S[b])
+    // attention_mask[B, T]         — self-attn padding (1=real, 0=pad beyond real_S_pre[b])
     // encoder_attention_mask[B, S] — cross-attn padding (1=real, 0=pad beyond real_enc_S[b])
     //
     // The TRT DiT engine feeds these to the model's attention_mask /
@@ -318,6 +318,41 @@ static int dit_trt_generate(DitTrt *              trt,
     // happens (real_enc_S_switch != real_enc_S) or (b) CFG cutoff shrinks
     // N_graph from 2N to N. The build_attn_mask lambda is reused in both
     // rebuild sites with the appropriate real_arr pointer.
+    //
+    // ── Self-attn mask shape contract ─────────────────────────────────
+    // The engine's `attention_mask` input is at PRE-PATCH resolution
+    // [B, T] (T = latent length before patchify). The model internally
+    // downsamples it to [B, S] (S = T / patch_size) via reshape+max.
+    //
+    // The caller passes `real_S[b]` at POST-PATCH resolution (s.S =
+    // T / patch_size, see pipeline-synth-ops.cpp:1386 s.per_S.assign).
+    // To build a PRE-PATCH mask, we must multiply real_S by patch_size
+    // to get the equivalent pre-patch cutoff: real_S_pre[b] =
+    // real_S[b] * patch_size = (T / patch_size) * patch_size = T.
+    //
+    // Without this multiplication, the mask would mark positions
+    // [real_S[b], T) as padding — i.e. the second half of the pre-patch
+    // sequence — even though all positions are valid. After the model's
+    // reshape+max downsample, this would incorrectly mark half the
+    // post-patch positions as padding, causing the DiT to ignore the
+    // second half of the source latent (devastating for cover-nofsq).
+    //
+    // patch_size is hardcoded to 2 (matching dit.h:600, the modeling file,
+    // and the TRT engine export). The C++ host guarantees T is a multiple
+    // of patch_size (pipeline-synth-ops.cpp:518 rounds T up).
+    const int PATCH_SIZE = 2;
+    [[maybe_unused]] const int S = T / PATCH_SIZE;  // post-patch sequence length (matches s.S)
+
+    // Build a pre-patch real_S array by multiplying each post-patch real_S
+    // by patch_size. This makes the mask cutoff refer to pre-patch positions.
+    std::vector<int> real_S_pre;
+    if (real_S) {
+        real_S_pre.resize(N);
+        for (int b = 0; b < N; b++) {
+            real_S_pre[b] = real_S[b] * PATCH_SIZE;
+        }
+    }
+
     auto build_attn_mask = [&](std::vector<int64_t> & buf, int n_graph, int seq,
                                 const int * real_arr) {
         buf.assign((size_t) n_graph * seq, 1);
@@ -339,7 +374,11 @@ static int dit_trt_generate(DitTrt *              trt,
 
     std::vector<int64_t> attn_mask_buf;          // [N_graph, T] — rebuilt on CFG cutoff
     std::vector<int64_t> enc_attn_mask_buf;      // [N_graph, enc_S] — rebuilt on cover switch + CFG cutoff
-    build_attn_mask(attn_mask_buf, N_graph, T, real_S);
+    // Self-attn mask: pass pre-patch real_S (real_S_pre) since the mask is
+    // at pre-patch resolution [N_graph, T]. The model downsamples internally.
+    build_attn_mask(attn_mask_buf, N_graph, T, real_S ? real_S_pre.data() : nullptr);
+    // Cross-attn mask: real_enc_S is already at encoder resolution (enc_S),
+    // no scaling needed.
     build_attn_mask(enc_attn_mask_buf, N_graph, enc_S, real_enc_S);
 
     // Data layout depends on engine I/O dtype:
@@ -719,7 +758,9 @@ static int dit_trt_generate(DitTrt *              trt,
                 // Rebuild masks at N (drop the uncond slots). Self-attn mask
                 // is the same cond-slot slice; encoder mask depends on whether
                 // we already switched to the cover encoder.
-                build_attn_mask(attn_mask_buf, N, T, real_S);
+                // Self-attn: pass pre-patch real_S (real_S_pre) since the mask
+                // is at pre-patch resolution [N, T].
+                build_attn_mask(attn_mask_buf, N, T, real_S ? real_S_pre.data() : nullptr);
                 if (switched_cover_fl) {
                     build_attn_mask(enc_attn_mask_buf, N, enc_S, real_enc_S_switch);
                 } else {

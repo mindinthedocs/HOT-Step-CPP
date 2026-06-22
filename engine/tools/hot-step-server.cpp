@@ -993,7 +993,12 @@ static void synth_worker(std::shared_ptr<Job>    job,
         return;
     }
     const bool dit_is_onnx = entry_is_onnx(dit);
-    const ModelEntry * default_emb = dit_is_onnx ? bucket_first_onnx(g_registry.text_enc) : bucket_first_non_onnx(g_registry.text_enc);
+    // The text encoder default is ALWAYS the GGUF Qwen3 — for both GGUF DiT and
+    // TRT DiT. The BPE tokenizer metadata and the (default) text-encoder forward
+    // both read from this path. A standalone TRT Qwen3-emb bundle (if built and
+    // selected by the user) overrides this at runtime via its own bundle
+    // detection in ace_synth_load, but the default selection here is the GGUF.
+    const ModelEntry * default_emb = bucket_first_non_onnx(g_registry.text_enc);
     const ModelEntry * default_vae = nullptr;
     if (!dit_is_onnx) {
         default_vae = bucket_first_non_onnx(g_registry.vae);
@@ -1010,8 +1015,12 @@ static void synth_worker(std::shared_ptr<Job>    job,
         job->status.store(2);
         return;
     }
-    if (!dit_is_onnx && (!default_emb || g_registry.vae.empty())) {
-        fprintf(stderr, "[Server] Missing Text-Enc or VAE in registry\n");
+    if (!default_emb) {
+        // A GGUF Qwen3 text encoder is required for every pipeline: GGUF DiT
+        // uses it directly; TRT DiT uses it for BPE tokenizer metadata and as
+        // the default text-encoder forward (unless a TRT Qwen3-emb bundle is
+        // explicitly selected).
+        fprintf(stderr, "[Server] Missing GGUF/SafeTensors Text-Enc in registry (required for BPE + default text forward)\n");
         free(src_interleaved);
         free(src_latents);
         free(ref_interleaved);
@@ -1019,17 +1028,8 @@ static void synth_worker(std::shared_ptr<Job>    job,
         job->status.store(2);
         return;
     }
-    if (dit_is_onnx && !default_emb) {
-        fprintf(stderr, "[Server] Missing ONNX Text-Enc bundle in registry\n");
-        free(src_interleaved);
-        free(src_latents);
-        free(ref_interleaved);
-        free(ref_latents);
-        job->status.store(2);
-        return;
-    }
-    if (!dit_is_onnx && entry_is_onnx(default_emb)) {
-        fprintf(stderr, "[Server] GGUF/SafeTensors DiT requires a GGUF/SafeTensors text encoder\n");
+    if (!dit_is_onnx && g_registry.vae.empty()) {
+        fprintf(stderr, "[Server] Missing VAE in registry\n");
         free(src_interleaved);
         free(src_latents);
         free(ref_interleaved);
@@ -1048,15 +1048,10 @@ static void synth_worker(std::shared_ptr<Job>    job,
         }
     }
     const ModelEntry * text_for_params = emb_entry ? emb_entry : default_emb;
-    if (!dit_is_onnx && entry_is_onnx(text_for_params)) {
-        fprintf(stderr, "[Server] GGUF/SafeTensors DiT requires a GGUF/SafeTensors text encoder\n");
-        free(src_interleaved);
-        free(src_latents);
-        free(ref_interleaved);
-        free(ref_latents);
-        job->status.store(2);
-        return;
-    }
+    // Note: no ONNX-vs-GGUF guard here. A TRT Qwen3-emb bundle (ONNX text
+    // encoder) is a valid text encoder for both GGUF DiT and TRT DiT — the
+    // engine detects it via the manifest.json in the parent directory. A raw
+    // ONNX file without a manifest would fail at synth-load with a clear error.
     p.text_encoder_path = text_for_params ? text_for_params->path.c_str() : nullptr;
     p.dit_path          = dit->path.c_str();
     // HOT-STEP: VAE model selection. Resolve by name from registry.

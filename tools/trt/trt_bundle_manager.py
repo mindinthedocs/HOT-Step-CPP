@@ -107,8 +107,8 @@ REGISTRY: dict[str, ComponentSpec] = {
         display_name="Qwen3 text encoder",
         export_script="export_text_enc.py",
         build_flag_weight_stream=False,
-        precision_options=("fp16",),
-        default_precision="fp16",
+        precision_options=("bf16", "fp16"),
+        default_precision="bf16",
         sidecar_files=("embed_tokens.bin", "vocab.json", "merges.txt"),
         onnx_dynamic_shapes=True,
     ),
@@ -117,15 +117,28 @@ REGISTRY: dict[str, ComponentSpec] = {
         display_name="Condition encoder",
         export_script="export_cond_enc.py",
         build_flag_weight_stream=False,
-        precision_options=("fp16",),
-        default_precision="fp16",
+        precision_options=("bf16", "fp16"),
+        default_precision="bf16",
         sidecar_files=("null_condition_emb.bin",),
         onnx_dynamic_shapes=True,
-        depends_on=("text_enc",),
+        # cond_enc loads its weights from the DiT safetensors (encoder.* prefix
+        # via load_prefixed_tensors in export_cond_enc.py), NOT from any text_enc
+        # artifact.
+        depends_on=(),
     ),
 }
 
-MVP_COMPONENTS: tuple[str, ...] = ("dit", "text_enc", "cond_enc")
+# MVP components for a DiT bundle: dit + cond_enc. The text encoder is NOT in
+# the DiT bundle — the GGUF Qwen3 is the default text encoder at runtime, or a
+# standalone TRT Qwen3-emb bundle (see EMBEDDING_COMPONENTS below) can be built
+# and selected separately.
+MVP_COMPONENTS: tuple[str, ...] = ("dit", "cond_enc")
+
+# Components for a standalone Qwen3-emb bundle: text_enc only. This bundle is
+# built independently of any DiT bundle and lives in its own folder
+# (trt-bundles/qwen3-emb/). When the user selects it as the text encoder, the
+# runtime routes the text-encoder forward through the TRT engine.
+EMBEDDING_COMPONENTS: tuple[str, ...] = ("text_enc",)
 
 
 # --------------------------------------------------------------------------
@@ -257,88 +270,64 @@ def build_plan(
     variant: str,
     output_dir: Path,
     dit_dir: Path,
-    text_encoder_dir: Path,
     *,
     components: Sequence[str] = MVP_COMPONENTS,
     source_model: str | None = None,
     gguf_path: Path | None = None,
 ) -> list[Step]:
-    """Build the ordered, resumable step list for a variant.
+    """Build the ordered, resumable step list for a DiT bundle.
 
-    Order: download -> prepare -> export(text_enc, cond_enc, dit) -> build(text_enc,
-    cond_enc, dit) -> fsq -> sidecars -> manifest. ``prepare`` converts BF16 DiT
-    weights to the F32 the exporter needs and reconstructs ``silence_latent.pt``
-    from the GGUF when absent, so a fresh bundle runs from the published snapshot
-    without manual prep. Encoders export/build before DiT because cond_enc depends
-    on the text-encoder embed table, and the heavy DiT build is last so a resume
-    re-runs only it after an OOM.
+    The DiT bundle ships DiT + cond_enc + FSQ. The text encoder is NOT included
+    — the GGUF Qwen3 is the default text encoder at runtime, or a standalone
+    TRT Qwen3-emb bundle (see build_embedding_plan) can be built and selected
+    separately.
+
+    Order: download -> prepare -> export(cond_enc, dit) -> build(cond_enc, dit)
+    -> fsq -> sidecars -> manifest. ``prepare`` converts BF16 DiT weights to the
+    F32 the exporter needs and reconstructs ``silence_latent.pt`` from the GGUF
+    when absent, so a fresh bundle runs from the published snapshot without manual
+    prep. cond_enc loads its weights from the DiT safetensors (encoder.* prefix),
+    so it does NOT depend on a text_enc source dir. The heavy DiT build is last so
+    a resume re-runs only it after an OOM.
     """
 
-    # Resolve all paths to absolute so that Step.is_complete() checks
-    # work regardless of the current working directory. Relative paths
-    # cause exists() to resolve against CWD, which may differ between
-    # the server process and the filesystem.
     output_dir = output_dir.resolve()
     dit_dir = dit_dir.resolve()
-    text_encoder_dir = text_encoder_dir.resolve()
     if gguf_path is not None:
         gguf_path = gguf_path.resolve()
 
     selected = [REGISTRY[name] for name in components]
     if "dit" not in components:
-        raise ValueError("plan requires the dit component")
+        raise ValueError("DiT bundle plan requires the dit component")
 
     dit_src, staging = _resolve_dit_source(dit_dir, output_dir)
     gguf = gguf_path or (SCRIPT_DIR.parent.parent / DEFAULT_GGUF)
 
     dit_onnx = output_dir / "dit.onnx"
-    text_onnx = output_dir / "text_encoder.onnx"
     cond_onnx = output_dir / "cond_encoder.onnx"
     dit_engine = output_dir / "dit.engine"
-    text_engine = output_dir / "text_encoder.engine"
     cond_engine = output_dir / "cond_encoder.engine"
     fsq_sidecar = output_dir / "fsq.safetensors"
     manifest = output_dir / "manifest.json"
-    # For sharded models the marker is model.safetensors.index.json;
-    # for single-file models it is model.safetensors. Either way,
-    # SILENCE_LATENT and DIT_MODELING_PY are also required outputs.
-    # Check dit_dir (the original source) because dit_src may be a
-    # staging dir that doesn't exist yet at plan-construction time.
     _is_sharded = (dit_dir / "model.safetensors.index.json").is_file()
     _marker = dit_src / ("model.safetensors.index.json" if _is_sharded else "model.safetensors")
     prepare_outputs = (_marker, dit_src / SILENCE_LATENT, dit_src / DIT_MODELING_PY)
 
-    # text_enc is invoked WITHOUT --dit-dir so it is NOT a second producer of
-    # null_condition_emb — cond_enc is the sole owner.  build-trt-engine.py
-    # writes the primary engine into engines/<stem>.engine then copies the
-    # runtime alias dit.engine next to dit.onnx.  See _dit_build_complete for
-    # the resume logic that handles crashes between those two writes.
     steps: list[Step] = [
-        Step("download", (), (dit_dir / "config.json", text_encoder_dir / "config.json"),
-             1.0, action=lambda: _require_sources(dit_dir, text_encoder_dir)),
+        Step("download", (), (dit_dir / "config.json",),
+             1.0, action=lambda: _require_dit_source(dit_dir)),
         Step("prepare-dit", (dit_dir / "config.json",), prepare_outputs, 1.0,
              action=lambda: prepare_dit_dir(dit_dir, staging or dit_src, gguf)),
-        Step("export-text_enc", (text_encoder_dir / "config.json",),
-             (text_onnx, output_dir / "embed_tokens.bin"), 2.0,
-             command=_exporter("export_text_enc.py",
-                               ["--model-dir", str(text_encoder_dir), "--output", str(text_onnx), "--fp16"])),
         Step("export-cond_enc", (dit_src / "config.json",),
              (cond_onnx, output_dir / "null_condition_emb.bin"), 2.0,
              command=_exporter("export_cond_enc.py",
-                               ["--model-dir", str(dit_src), "--output", str(cond_onnx), "--fp16"])),
+                               ["--model-dir", str(dit_src), "--output", str(cond_onnx), "--bf16"])),
         Step("export-dit", (dit_src / "config.json",), (dit_onnx,), 4.0,
              command=_exporter("export_dit.py",
                                ["--model-dir", str(dit_src), "--output", str(dit_onnx),
                                 "--precision", variant])),
-        Step("build-text_enc", (text_onnx,), (text_engine,), 2.0,
-             command=_build_encoder("text-enc", text_onnx, "text_encoder", output_dir)),
         Step("build-cond_enc", (cond_onnx,), (cond_engine,), 2.0,
              command=_build_encoder("cond-enc", cond_onnx, "cond_encoder", output_dir)),
-        # build-dit: build-trt-engine.py writes dit.engine directly next to
-        # dit.onnx (single source of truth — no engines/ subdir, no alias).
-        # The step's outputs list dit_engine, so Step.is_complete() checks
-        # it directly; the complete_check is a belt-and-suspenders guard
-        # that also rejects zero-byte engines from interrupted builds.
         Step("build-dit", (dit_onnx,), (dit_engine,), 6.0,
              command=_tools_script("build-trt-engine.py",
                                    ["--onnx", str(dit_onnx),
@@ -347,35 +336,82 @@ def build_plan(
         Step("fsq-sidecar", (dit_src / "config.json",), (fsq_sidecar,), 1.0,
              command=_exporter("export_fsq_sidecar.py",
                                ["--model-dir", str(dit_src), "--output-dir", str(output_dir)])),
-        _sidecar_copy_step(output_dir, dit_src, text_encoder_dir, selected),
-        Step("manifest", (dit_engine, text_engine, cond_engine, fsq_sidecar), (manifest,), 1.0,
+        _dit_sidecar_copy_step(output_dir, dit_src, selected),
+        Step("manifest", (dit_engine, cond_engine, fsq_sidecar), (manifest,), 1.0,
              action=lambda: write_manifest(manifest, variant, dit_dir, source_model=source_model)),
     ]
     return steps
 
 
-def _require_sources(dit_dir: Path, text_encoder_dir: Path) -> None:
-    for label, path in (("DiT source", dit_dir), ("text-encoder source", text_encoder_dir)):
-        if not (path / "config.json").is_file():
-            raise FileNotFoundError(
-                f"{label} not cached: expected {path / 'config.json'} "
-                "(download the source safetensors before running the bundle)"
-            )
+def build_embedding_plan(
+    output_dir: Path,
+    text_encoder_dir: Path,
+    *,
+    source_model: str | None = None,
+) -> list[Step]:
+    """Build the ordered, resumable step list for a standalone Qwen3-emb bundle.
+
+    The Qwen3-emb bundle ships only the TRT Qwen3 text encoder (+ sidecars). It
+    is independent of any DiT bundle and lives in its own folder
+    (trt-bundles/qwen3-emb/). When the user selects it as the text encoder, the
+    runtime routes the text-encoder forward through the TRT engine and the lyric
+    embed lookup through the bundle's embed_tokens.bin sidecar.
+
+    Order: download -> export-text_enc -> build-text_enc -> sidecars -> manifest.
+    """
+
+    output_dir = output_dir.resolve()
+    text_encoder_dir = text_encoder_dir.resolve()
+
+    text_onnx = output_dir / "text_encoder.onnx"
+    text_engine = output_dir / "text_encoder.engine"
+    manifest = output_dir / "manifest.json"
+
+    steps: list[Step] = [
+        Step("download", (), (text_encoder_dir / "config.json",),
+             1.0, action=lambda: _require_text_source(text_encoder_dir)),
+        Step("export-text_enc", (text_encoder_dir / "config.json",),
+             (text_onnx, output_dir / "embed_tokens.bin"), 2.0,
+             command=_exporter("export_text_enc.py",
+                               ["--model-dir", str(text_encoder_dir),
+                                "--output", str(text_onnx), "--fp16"])),
+        Step("build-text_enc", (text_onnx,), (text_engine,), 2.0,
+             command=_build_encoder("text-enc", text_onnx, "text_encoder", output_dir)),
+        _embedding_sidecar_copy_step(output_dir, text_encoder_dir),
+        Step("manifest", (text_engine,), (manifest,), 1.0,
+             action=lambda: write_embedding_manifest(manifest, text_encoder_dir,
+                                                     source_model=source_model)),
+    ]
+    return steps
 
 
-def _sidecar_copy_step(
+def _require_dit_source(dit_dir: Path) -> None:
+    if not (dit_dir / "config.json").is_file():
+        raise FileNotFoundError(
+            f"DiT source not cached: expected {dit_dir / 'config.json'} "
+            "(download the source safetensors before running the bundle)"
+        )
+
+
+def _require_text_source(text_encoder_dir: Path) -> None:
+    if not (text_encoder_dir / "config.json").is_file():
+        raise FileNotFoundError(
+            f"Qwen3-emb source not cached: expected {text_encoder_dir / 'config.json'} "
+            "(download Qwen/Qwen3-Embedding-0.6B before running the embedding bundle)"
+        )
+
+
+def _dit_sidecar_copy_step(
     output_dir: Path,
     dit_dir: Path,
-    text_encoder_dir: Path,
     selected: Sequence[ComponentSpec],
 ) -> Step:
-    # Sidecars copied verbatim from source dirs (vs sidecars produced by an
-    # exporter step such as embed_tokens / null_condition_emb / fsq).
+    # DiT bundle sidecars: config.json + silence_latent.pt from the DiT source.
+    # (vocab.json + merges.txt are NOT here — they belong to the Qwen3 text
+    # encoder, which is a separate bundle.)
     copy_map: dict[str, Path] = {
         "config.json": dit_dir / "config.json",
         "silence_latent.pt": dit_dir / "silence_latent.pt",
-        "vocab.json": text_encoder_dir / "vocab.json",
-        "merges.txt": text_encoder_dir / "merges.txt",
     }
     wanted: dict[str, Path] = {}
     for spec in selected:
@@ -396,6 +432,31 @@ def _sidecar_copy_step(
     )
 
 
+def _embedding_sidecar_copy_step(
+    output_dir: Path,
+    text_encoder_dir: Path,
+) -> Step:
+    # Qwen3-emb bundle sidecars: vocab.json + merges.txt (BPE tokenizer files)
+    # copied verbatim from the Qwen3 source. embed_tokens.bin is produced by
+    # the export-text_enc step, not copied here.
+    copy_map: dict[str, Path] = {
+        "vocab.json": text_encoder_dir / "vocab.json",
+        "merges.txt": text_encoder_dir / "merges.txt",
+    }
+
+    def copy_all() -> None:
+        for fname, src in copy_map.items():
+            copy_sidecar(src, output_dir / fname, fname)
+
+    return Step(
+        "collect-sidecars",
+        tuple(copy_map.values()),
+        tuple(output_dir / fname for fname in copy_map),
+        1.0,
+        action=copy_all,
+    )
+
+
 MANIFEST_VERSION = "1"
 DIT_ENGINE = "dit.engine"
 TEXT_ENC_ENGINE = "text_encoder.engine"
@@ -404,19 +465,14 @@ FSQ_SIDECAR = "fsq.safetensors"
 
 
 def _build_manifest(variant: str, source_model: str) -> dict[str, object]:
-    """The manifest payload matching the C++ reader (``trt-bundle-manifest.h``).
+    """The DiT bundle manifest payload matching the C++ reader.
 
-    Field names track ``trt_bundle_load_manifest`` exactly: a ``components``
-    object keyed ``dit``/``text_enc``/``cond_enc``/``fsq``, each with a relative
-    ``engine`` (or ``sidecar`` for fsq), optional ``metadata``/``precision``/
-    ``sidecars``/``weight_streaming``. Paths are relative to the manifest (bundle
-    root). The DiT precision is the build variant (``q8map-fp16``/``w8a8``/
-    ``fp32``); the encoders are FP16 — never ``bf16``, since sm_75 has no BF16
-    tensor cores.
+    Components: dit + cond_enc + fsq. text_enc is intentionally NOT emitted —
+    the text encoder is not part of the DiT bundle (the GGUF Qwen3 is the
+    default, or a standalone Qwen3-emb bundle can be built separately).
     """
 
     dit_spec = REGISTRY["dit"]
-    text_spec = REGISTRY["text_enc"]
     cond_spec = REGISTRY["cond_enc"]
     return {
         "version": MANIFEST_VERSION,
@@ -428,12 +484,6 @@ def _build_manifest(variant: str, source_model: str) -> dict[str, object]:
                 "metadata": "dit.metadata.json",
                 "precision": variant,
                 "weight_streaming": dit_spec.build_flag_weight_stream,
-            },
-            "text_enc": {
-                "engine": TEXT_ENC_ENGINE,
-                "metadata": "text_encoder.metadata.json",
-                "precision": text_spec.default_precision,
-                "sidecars": list(text_spec.sidecar_files),
             },
             "cond_enc": {
                 "engine": COND_ENC_ENGINE,
@@ -449,18 +499,48 @@ def _build_manifest(variant: str, source_model: str) -> dict[str, object]:
     }
 
 
+def _build_embedding_manifest(source_model: str) -> dict[str, object]:
+    """The Qwen3-emb bundle manifest payload matching the C++ reader.
+
+    Components: text_enc only. This is a standalone bundle — no dit, no cond_enc,
+    no fsq. When the user selects this bundle as the text encoder, the runtime
+    detects it via the manifest.json in the bundle directory.
+    """
+
+    text_spec = REGISTRY["text_enc"]
+    return {
+        "version": MANIFEST_VERSION,
+        "source_model": source_model,
+        "variant": "fp16",
+        "components": {
+            "text_enc": {
+                "engine": TEXT_ENC_ENGINE,
+                "metadata": "text_encoder.metadata.json",
+                "precision": text_spec.default_precision,
+                "sidecars": list(text_spec.sidecar_files),
+            },
+        },
+    }
+
+
 def write_manifest(manifest: Path, variant: str, dit_dir: Path,
                    *, source_model: str | None = None) -> None:
-    """Emit ``manifest.json`` per the schema the C++ reader parses.
-
-    ``source_model`` is the explicit model label when supplied (so the badge
-    reads e.g. ``acestep-v15-sft`` not an HF snapshot hash); else the dir name.
-    """
+    """Emit a DiT bundle's ``manifest.json`` per the C++ reader schema."""
 
     payload = _build_manifest(variant, source_model=source_model or dit_dir.name)
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"[trt-bundle] manifest: {manifest}")
+
+
+def write_embedding_manifest(manifest: Path, text_encoder_dir: Path,
+                             *, source_model: str | None = None) -> None:
+    """Emit a Qwen3-emb bundle's ``manifest.json`` per the C++ reader schema."""
+
+    payload = _build_embedding_manifest(source_model=source_model or text_encoder_dir.name)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[trt-bundle] embedding manifest: {manifest}")
 
 
 # --------------------------------------------------------------------------

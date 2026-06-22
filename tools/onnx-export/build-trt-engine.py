@@ -387,7 +387,7 @@ def main() -> int:
     parser.add_argument("--onnx", required=True)
     parser.add_argument("--profile", default="default", choices=sorted(TRT_PROFILES.keys()))
     parser.add_argument("--precision-policy", choices=["q8map-fp16", "w8a8", "fp32"], default="q8map-fp16")
-    parser.add_argument("--workspace-gb", type=float, default=2,
+    parser.add_argument("--workspace-gb", type=float, default=3,
                         help="Workspace size in GB (default: 4.6). w8a8 DiT builds need ~5GB.")
     parser.add_argument("--builder-optimization-level", type=int, default=5, choices=range(0, 6), metavar="{0..5}")
     parser.add_argument("--strip-plan", action="store_true", default=False,
@@ -395,7 +395,7 @@ def main() -> int:
     parser.add_argument("--no-strip-plan", action="store_false", dest="strip_plan")
     parser.add_argument("--refit-identical", action="store_true", default=True)
     parser.add_argument("--no-refit-identical", action="store_false", dest="refit_identical")
-    parser.set_defaults(weight_streaming=True)
+    parser.set_defaults(weight_streaming=False)
     parser.add_argument("--weight-streaming", action="store_true", dest="weight_streaming",
                         help="Build with kWEIGHT_STREAMING to avoid OOM during engine compilation (default).")
     parser.add_argument("--no-weight-streaming", action="store_false", dest="weight_streaming",

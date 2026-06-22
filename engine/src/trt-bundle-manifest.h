@@ -6,23 +6,32 @@
 // selected bundle dir is what marks the directory as a TRT runtime bundle. This
 // retires the legacy onnx_dit_has_synth_bundle() file-list probe.
 //
-// Schema (partner §4.4):
-//   {
-//     "version": <str>,
-//     "source_model": <str>,
-//     "variant": <str>,
-//     "components": {
-//       "dit":      {"engine": <rel>, "metadata": <rel>, "precision": <str>, "weight_streaming": <bool>},
-//       "text_enc": {"engine": <rel>, "metadata": <rel>, "precision": <str>, "sidecars": [<rel>...]},
-//       "cond_enc": {"engine": <rel>, "metadata": <rel>, "precision": <str>, "sidecars": [<rel>...]},
-//       "fsq":      {"sidecar": <rel>, "metadata": <rel>}
-//     }
-//   }
+// Two bundle shapes are supported:
 //
-// all-three-or-nothing (partner §5.7): a manifest that is present but missing
-// dit | text_enc | cond_enc (or whose declared engine file is absent) is a HARD
-// FAILURE. The runtime never silently falls back to GGUF encoders when a TRT
-// manifest is present but incomplete.
+//  1. DiT bundle — ships the DiT transformer + condition encoder + FSQ. The
+//     text encoder is NOT included: the GGUF Qwen3 (the same model the GGUF
+//     DiT path uses) is the text encoder of record at runtime. Schema:
+//       "components": {
+//         "dit":      {"engine": <rel>, "metadata": <rel>, "precision": <str>, "weight_streaming": <bool>},
+//         "cond_enc": {"engine": <rel>, "metadata": <rel>, "precision": <str>, "sidecars": [<rel>...]},
+//         "fsq":      {"sidecar": <rel>, "metadata": <rel>}
+//       }
+//     dit + cond_enc are MANDATORY. text_enc is ignored if present (no legacy
+//     support — the runtime never loads a TRT text encoder from a DiT bundle).
+//
+//  2. Qwen3-emb bundle — ships the TRT Qwen3 text encoder as a standalone
+//     artifact, independent of any DiT bundle. Built from its own source
+//     directory and placed in its own bundle folder (trt-bundles/qwen3-emb/).
+//     Schema:
+//       "components": {
+//         "text_enc": {"engine": <rel>, "metadata": <rel>, "precision": <str>, "sidecars": [<rel>...]}
+//       }
+//     text_enc is MANDATORY. When the user selects this bundle as the text
+//     encoder, the runtime loads the TRT text engine from here.
+//
+// A manifest that is present but missing a mandatory component (or whose
+// declared engine file is absent) is a HARD FAILURE. The runtime never silently
+// falls back to GGUF encoders when a TRT manifest is present but incomplete.
 #pragma once
 
 #include "trt-artifact-manifest.h"  // yyjson read/get helpers, dirname/join
@@ -78,9 +87,12 @@ static inline bool trt_bundle_has_manifest(const std::string & bundle_dir) {
 }
 
 // Parse one component object (engine + metadata + precision [+ ws] [+ sidecars]).
-// require_engine_present enforces that the declared engine file exists on disk —
-// the all-three-or-nothing gate fails closed when it does not.
-static inline bool trt_bundle_parse_component(yyjson_val *          components,
+// require_engine_present enforces that the declared engine file exists on disk.
+// Returns TRT_PARSE_ABSENT when the component object itself is missing, so the
+// caller can decide whether the missing component is mandatory or optional.
+enum TrtBundleParseResult { TRT_PARSE_OK = 0, TRT_PARSE_ABSENT = 1, TRT_PARSE_ERROR = 2 };
+
+static inline int trt_bundle_parse_component(yyjson_val *          components,
                                               const char *          key,
                                               const std::string &   manifest_path,
                                               bool                  want_weight_streaming,
@@ -89,15 +101,18 @@ static inline bool trt_bundle_parse_component(yyjson_val *          components,
                                               std::string *         err) {
     yyjson_val * comp = yyjson_obj_get(components, key);
     if (!comp || !yyjson_is_obj(comp)) {
-        trt_artifact_set_error(err, std::string("manifest is missing component object: components.") + key);
-        return false;
+        if (!comp) {
+            return TRT_PARSE_ABSENT;
+        }
+        trt_artifact_set_error(err, std::string("manifest component ") + key + " is not an object");
+        return TRT_PARSE_ERROR;
     }
 
     std::string engine_rel;
     std::string metadata_rel;
     if (!trt_artifact_get_string(comp, "engine", engine_rel, err)) {
         trt_artifact_set_error(err, std::string("manifest component ") + key + " is missing string field: engine");
-        return false;
+        return TRT_PARSE_ERROR;
     }
     // metadata + precision are informational; tolerate absence so the gate keys
     // strictly on the engine artifact existing.
@@ -135,20 +150,23 @@ static inline bool trt_bundle_parse_component(yyjson_val *          components,
         }
     }
 
-    // all-three-or-nothing: the declared engine file must exist on disk.
+    // The declared engine file must exist on disk.
     FILE * ef = fopen(out.engine.c_str(), "rb");
     if (!ef) {
         trt_artifact_set_error(err, std::string("manifest component ") + key +
                                         " declares an engine that is missing on disk: " + out.engine);
-        return false;
+        return TRT_PARSE_ERROR;
     }
     fclose(ef);
-    return true;
+    return TRT_PARSE_OK;
 }
 
 // Load + validate a bundle manifest. On success out carries every resolved
-// component path. Fails closed (returns false, sets err) when manifest.json is
-// absent, malformed, or missing/incomplete in any of dit | text_enc | cond_enc.
+// component path. The manifest must declare at least one of dit or text_enc
+// (this distinguishes a DiT bundle from a Qwen3-emb bundle). For DiT bundles,
+// dit + cond_enc are mandatory. For Qwen3-emb bundles, text_enc is mandatory.
+// Fails closed (returns false, sets err) when manifest.json is absent, malformed,
+// or missing a mandatory component.
 static inline bool trt_bundle_load_manifest(const std::string &   bundle_dir,
                                             TrtBundleManifest *   out,
                                             std::string *         err) {
@@ -183,18 +201,48 @@ static inline bool trt_bundle_load_manifest(const std::string &   bundle_dir,
         return false;
     }
 
-    if (!trt_bundle_parse_component(components, "dit", manifest_path,
-                                    /*weight_streaming*/ true, /*sidecars*/ false, m.dit, err) ||
-        !trt_bundle_parse_component(components, "text_enc", manifest_path,
-                                    /*weight_streaming*/ false, /*sidecars*/ true, m.text_enc, err) ||
-        !trt_bundle_parse_component(components, "cond_enc", manifest_path,
-                                    /*weight_streaming*/ false, /*sidecars*/ true, m.cond_enc, err)) {
+    // Parse whichever components are present. The caller decides which are
+    // mandatory based on the bundle type (DiT vs Qwen3-emb).
+    int rc_dit  = trt_bundle_parse_component(components, "dit", manifest_path,
+                                             /*weight_streaming*/ true, /*sidecars*/ false, m.dit, err);
+    if (rc_dit == TRT_PARSE_ERROR) {
         yyjson_doc_free(doc);
         return false;
     }
 
+    int rc_text = trt_bundle_parse_component(components, "text_enc", manifest_path,
+                                             /*weight_streaming*/ false, /*sidecars*/ true, m.text_enc, err);
+    if (rc_text == TRT_PARSE_ERROR) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+
+    int rc_cond = trt_bundle_parse_component(components, "cond_enc", manifest_path,
+                                             /*weight_streaming*/ false, /*sidecars*/ true, m.cond_enc, err);
+    if (rc_cond == TRT_PARSE_ERROR) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+
+    // Validate: at least one of dit or text_enc must be present, and a DiT
+    // bundle (dit present) must also have cond_enc.
+    bool has_dit  = (rc_dit  == TRT_PARSE_OK);
+    bool has_text = (rc_text == TRT_PARSE_OK);
+    bool has_cond = (rc_cond == TRT_PARSE_OK);
+
+    if (!has_dit && !has_text) {
+        yyjson_doc_free(doc);
+        trt_artifact_set_error(err, "manifest declares neither dit nor text_enc — at least one required");
+        return false;
+    }
+    if (has_dit && !has_cond) {
+        yyjson_doc_free(doc);
+        trt_artifact_set_error(err, "DiT bundle manifest is missing cond_enc (mandatory for DiT bundles)");
+        return false;
+    }
+
     // FSQ is delivered through the existing fsq.safetensors sidecar mechanism;
-    // it is not part of the all-three gate. Parse it when present.
+    // it is not part of the mandatory gate. Parse it when present.
     yyjson_val * fsq = yyjson_obj_get(components, "fsq");
     if (fsq && yyjson_is_obj(fsq)) {
         yyjson_val * sc = yyjson_obj_get(fsq, "sidecar");

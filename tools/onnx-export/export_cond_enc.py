@@ -430,16 +430,8 @@ def load_model(model_dir: str, device: str = "cpu", dtype=None):
     encoder_config.intermediate_size = config.encoder_intermediate_size
     encoder_config.num_attention_heads = config.encoder_num_attention_heads
     encoder_config.num_key_value_heads = config.encoder_num_key_value_heads
-    
-    import glob
-    import importlib
-    modeling_files = sorted(glob.glob(str(model_dir / "modeling_acestep_v15*.py")))
-    if not modeling_files:
-        raise SystemExit(f"[export_cond_enc] ERROR: No modeling_acestep_v15*.py found in {model_dir}")
-    modeling_module = Path(modeling_files[0]).stem
-    print(f"[export_cond_enc] Using modeling module: {modeling_module}")
-    mod = importlib.import_module(modeling_module)
-    AceStepConditionEncoder = mod.AceStepConditionEncoder
+
+    from from modeling_acestep_v15_xl_base import AceStepConditionEncoder # only xl for now, it IS the same for all xl
     
     cond_encoder = AceStepConditionEncoder(encoder_config)
     
@@ -581,6 +573,15 @@ def main():
                              "and enc_hidden is a kHALF output. Without --fp16 the "
                              "ONNX traces as FP32 and the engine inherits FP32 IO "
                              "dtypes, failing the runtime contract.")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Export the ONNX graph in BF16 (bfloat16 weights). "
+                             "Preferred over --fp16 for the cond-enc engine: BF16 has "
+                             "the same dynamic range as FP32 (8 exponent bits), so "
+                             "extreme activations don't saturate to ±Inf/NaN. "
+                             "The C++ cond-enc runtime auto-detects the engine I/O "
+                             "dtype and skips the FP16 sanitization path when the "
+                             "engine is BF16 or FP32. Requires Ampere+ GPU (sm80+) "
+                             "for native BF16 throughput.")
     args = parser.parse_args()
     
     if args.output is None:
@@ -607,12 +608,27 @@ def main():
             return
     
     # Load model
-    # The cond-enc TRT runtime (engine/src/cond-enc-trt.h) validates that
-    # text_hidden/lyric_embed/timbre_feats are kHALF inputs and enc_hidden
-    # is a kHALF output. build_encoder_trt.py builds a strongly-typed engine,
-    # so the ONNX graph must be FP16 — pass dtype=torch.float16 to load_model
-    # so PyTorch traces with half-precision weights and dummy inputs.
-    export_dtype = torch.float16 if args.fp16 else torch.float32
+    # The cond-enc TRT runtime (engine/src/cond-enc-trt.h) auto-detects the
+    # engine I/O dtype at load time and supports FP16 / BF16 / FP32 engines.
+    #   --fp16: smallest engine, FP16 dynamic range (±65504) — can overflow
+    #           on extreme activations (the cond encoder's text_hidden input
+    #           has values up to ±51, and intermediate attention scores can
+    #           saturate). The runtime sanitizes NaN/Inf to finite range,
+    #           but this corrupts ~5 elements per forward and degrades DiT
+    #           output fidelity.
+    #   --bf16: same engine size as FP16, but BF16 dynamic range (±3.4e38)
+    #           matches FP32 — no overflow, no sanitization, no corruption.
+    #           Requires Ampere+ GPU (sm80+) for native throughput.
+    #           PREFERRED for cond-enc.
+    #   (default) FP32: largest engine, safest, slowest.
+    if args.bf16 and args.fp16:
+        raise SystemExit("--bf16 and --fp16 are mutually exclusive")
+    if args.bf16:
+        export_dtype = torch.bfloat16
+    elif args.fp16:
+        export_dtype = torch.float16
+    else:
+        export_dtype = torch.float32
     cond_encoder, config = load_model(args.model_dir, device=args.device, dtype=export_dtype)
     if args.timbre_cls == "auto":
         use_timbre_cls = model_uses_timbre_cls(args.model_dir)

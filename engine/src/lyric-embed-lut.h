@@ -1,11 +1,12 @@
 #pragma once
-// lyric-embed-lut.h — CPU lyric-embedding lookup for the native TRT path.
+// lyric-embed-lut.h — CPU lyric-embedding lookup for the TRT Qwen3-emb path.
 //
 // On the GGML path the lyric embedding is produced by qwen3_embed_lookup
 // (qwen3-enc.h), a ggml_get_rows against the text encoder's embed_tokens tensor.
-// On the TRT path the GGML Qwen3 encoder is NOT loaded (all-three-or-nothing
-// forbids the GGUF text encoder when a TRT bundle is selected), so the lookup
-// reads the bundle's raw embed_tokens.bin sidecar directly.
+// On the TRT Qwen3-emb path (a standalone TRT Qwen3 bundle is selected as the
+// text encoder), the TRT text engine has no embed lookup API — the lyric embed
+// table is shipped as a raw embed_tokens.bin sidecar in the bundle, and this
+// header's lyric_embed_lut_* helpers read it directly.
 //
 // embed_tokens.bin format (written by tools/onnx-export/export_text_enc.py
 // export_embed_table): an 8-byte header of two little-endian uint32 — V (rows,
