@@ -69,7 +69,7 @@ ENCODER_PROFILES: dict[str, dict[str, dict[str, tuple[int, ...]]]] = {
             # the common case in song covers.
             "text_hidden": (1, 512, 1024),
             "lyric_embed": (1, 1024, 1024),
-            "timbre_feats": (1, 8192, 64),
+            "timbre_feats": (1, 2048, 64),
         },
     },
 }

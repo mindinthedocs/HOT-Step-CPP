@@ -431,7 +431,7 @@ def load_model(model_dir: str, device: str = "cpu", dtype=None):
     encoder_config.num_attention_heads = config.encoder_num_attention_heads
     encoder_config.num_key_value_heads = config.encoder_num_key_value_heads
 
-    from from modeling_acestep_v15_xl_base import AceStepConditionEncoder # only xl for now, it IS the same for all xl
+    from modeling_acestep_v15_xl_base import AceStepConditionEncoder # only xl for now, it IS the same for all xl
     
     cond_encoder = AceStepConditionEncoder(encoder_config)
     

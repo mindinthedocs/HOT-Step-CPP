@@ -388,7 +388,7 @@ def main() -> int:
     parser.add_argument("--profile", default="default", choices=sorted(TRT_PROFILES.keys()))
     parser.add_argument("--precision-policy", choices=["q8map-fp16", "w8a8", "fp32"], default="q8map-fp16")
     parser.add_argument("--workspace-gb", type=float, default=3,
-                        help="Workspace size in GB (default: 4.6). w8a8 DiT builds need ~5GB.")
+                        help="Workspace size in GB (default: 3). w8a8 DiT builds need ~5GB.")
     parser.add_argument("--builder-optimization-level", type=int, default=5, choices=range(0, 6), metavar="{0..5}")
     parser.add_argument("--strip-plan", action="store_true", default=False,
                         help="(Deprecated, ignored) Engines now always embed weights.")
