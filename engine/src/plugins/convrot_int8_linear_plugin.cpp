@@ -6,7 +6,7 @@
  *   enqueue() pipeline:
  *     1. ConvRot activation rotation + per-row INT8 quant (custom CUDA kernel)
  *     2. INT8 × INT8 → INT32 matmul (cuBLASLt cublasLtMatmul)
- *     3. Dequant + bias epilogue (custom CUDA kernel)
+ *     3. Dequant + bias epilogue (custom CUDA kernel; FP16 output by default)
  *
  * cuBLASLt setup:
  *   - Matmul descriptor: CUBLASLT_MATMUL_DESC_COMPUTE_TYPE = CUBLAS_COMPUTE_32I
@@ -33,11 +33,15 @@
 
 #include <cublasLt.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cctype>
 #include <cstdio>
 #include <limits>
 #include <sstream>
+#include <string>
+#include <utility>
 
 namespace hotstep {
 
@@ -68,6 +72,54 @@ int64_t flattenedRows(nvinfer1::Dims const& dims) {
 int32_t lastDim(nvinfer1::Dims const& dims) {
     if (dims.nbDims < 1) return 0;
     return dims.d[dims.nbDims - 1];
+}
+
+int32_t normalizeDtypeId(int32_t value, int32_t defaultValue = 10) {
+    // ONNX TensorProto enum: FLOAT=1, FLOAT16=10, BFLOAT16=16.
+    if (value == 1 || value == 10 || value == 16) return value;
+    return defaultValue;
+}
+
+int32_t parseDtypeId(char const* value, int32_t defaultValue = 10) {
+    if (value == nullptr || value[0] == '\0') return defaultValue;
+    std::string s(value);
+    for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    if (s == "FP16" || s == "FLOAT16" || s == "HALF") return 10;
+    if (s == "BF16" || s == "BFLOAT16") return 16;
+    if (s == "FP32" || s == "FLOAT" || s == "FLOAT32") return 1;
+    return defaultValue;
+}
+
+nvinfer1::DataType trtTypeFromDtypeId(int32_t dtypeId) {
+    if (dtypeId == 10) return nvinfer1::DataType::kHALF;
+    if (dtypeId == 16) return nvinfer1::DataType::kBF16;
+    return nvinfer1::DataType::kFLOAT;
+}
+
+int32_t kernelDtypeFromTrt(nvinfer1::DataType dtype) {
+    if (dtype == nvinfer1::DataType::kHALF) return 1;
+    if (dtype == nvinfer1::DataType::kBF16) return 2;
+    return 0;
+}
+
+char const* dtypeNameFromId(int32_t dtypeId) {
+    if (dtypeId == 10) return "FP16";
+    if (dtypeId == 16) return "BF16";
+    return "FP32";
+}
+
+bool readPluginString(nvinfer1::PluginField const& f, char* dst, size_t dstSize) {
+    if (dst == nullptr || dstSize == 0) return false;
+    dst[0] = '\0';
+    if (f.data == nullptr || f.length <= 0) return false;
+    auto const* src = static_cast<char const*>(f.data);
+    size_t maxLen = static_cast<size_t>(f.length);
+    size_t n = 0;
+    while (n < maxLen && src[n] != '\0') ++n;
+    n = std::min(n, dstSize - 1);
+    std::memcpy(dst, src, n);
+    dst[n] = '\0';
+    return true;
 }
 
 bool validGroupSize(int32_t groupSize, int32_t K) {
@@ -107,19 +159,28 @@ size_t pluginWorkspaceBytes(int64_t M, int64_t K, int64_t N) {
 // ──────────────────────────────────────────────────────────────────────────
 
 ConvRotInt8LinearPlugin::ConvRotInt8LinearPlugin(
-    int32_t group_size, int32_t in_features, int32_t out_features, int32_t has_bias)
+    int32_t group_size, int32_t in_features, int32_t out_features, int32_t has_bias,
+    int32_t input_dtype_id, int32_t output_dtype_id, std::string preferred_format)
     : m_group_size(group_size),
       m_in_features(in_features),
       m_out_features(out_features),
-      m_has_bias(has_bias) {}
+      m_has_bias(has_bias),
+      m_input_dtype_id(normalizeDtypeId(input_dtype_id)),
+      m_output_dtype_id(normalizeDtypeId(output_dtype_id)),
+      m_preferred_format(std::move(preferred_format)) {}
 
 ConvRotInt8LinearPlugin::ConvRotInt8LinearPlugin(void const* data, size_t length) {
     if (length != getSerializationSize()) return;
     uint8_t const* d = static_cast<uint8_t const*>(data);
+    int32_t input_dtype_id = 10, output_dtype_id = 10;
     std::memcpy(&m_group_size,   d, sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(&m_in_features,  d, sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(&m_out_features, d, sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(&m_has_bias,     d, sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(&input_dtype_id,  d, sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(&output_dtype_id, d, sizeof(int32_t)); d += sizeof(int32_t);
+    m_input_dtype_id = normalizeDtypeId(input_dtype_id);
+    m_output_dtype_id = normalizeDtypeId(output_dtype_id);
 }
 
 ConvRotInt8LinearPlugin::~ConvRotInt8LinearPlugin() {
@@ -158,7 +219,7 @@ int32_t ConvRotInt8LinearPlugin::getOutputDataTypes(
     nvinfer1::DataType* outputTypes, int32_t nbOutputs,
     nvinfer1::DataType const*, int32_t) const noexcept {
     if (nbOutputs < 1) return -1;
-    outputTypes[0] = nvinfer1::DataType::kFLOAT;  // FP32 output
+    outputTypes[0] = trtTypeFromDtypeId(m_output_dtype_id);
     return 0;
 }
 
@@ -182,19 +243,29 @@ bool ConvRotInt8LinearPlugin::supportsFormatCombination(
     int32_t pos, nvinfer1::DynamicPluginTensorDesc const* inOut,
     int32_t nbInputs, int32_t nbOutputs) noexcept {
     if (pos < 0 || pos >= nbInputs + nbOutputs) return false;
+
+    // The current kernel indexes tensors as contiguous row-major memory. Keep
+    // kLINEAR as the only accepted physical layout until the packed-layout
+    // kernels land; the v2 dtype/tactic contract is independent of that future
+    // optimization. The ONNX-side preferred_format attribute is still parsed
+    // and serialized so future kernels can enable packed formats without graph
+    // changes.
     if (inOut[pos].desc.format != nvinfer1::PluginFormat::kLINEAR) return false;
+
     auto type = inOut[pos].desc.type;
+    auto inputType = trtTypeFromDtypeId(m_input_dtype_id);
+    auto outputType = trtTypeFromDtypeId(m_output_dtype_id);
     if (pos < nbInputs) {
         switch (pos) {
-            case 0: return type == nvinfer1::DataType::kFLOAT;       // x
+            case 0: return type == inputType;                        // x
             case 1: return type == nvinfer1::DataType::kINT8;        // weight_q
             case 2: return type == nvinfer1::DataType::kFLOAT;       // weight_scale
-            case 3: return type == nvinfer1::DataType::kFLOAT;       // H
-            case 4: return m_has_bias && type == nvinfer1::DataType::kFLOAT;  // bias
+            case 3: return type == inputType;                        // H (ignored by butterfly impl)
+            case 4: return m_has_bias && type == nvinfer1::DataType::kFLOAT; // bias stays FP32 (1D sane rule)
             default: return false;
         }
     }
-    return type == nvinfer1::DataType::kFLOAT;  // output y
+    return type == outputType;  // output y
 }
 
 int32_t ConvRotInt8LinearPlugin::configurePlugin(
@@ -231,22 +302,29 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(
 // ── Custom Tactics (IPluginV3OneBuild) ──────────────────────────────────────
 
 int32_t ConvRotInt8LinearPlugin::getNbTactics() noexcept {
-    return 0;
+    return 4;
 }
 
 int32_t ConvRotInt8LinearPlugin::getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept {
-    (void)tactics;
-    (void)nbTactics;
+    if (tactics == nullptr || nbTactics < 4) return 1;
+    // TensorRT reserves tactic 0 for the implicit default path; advertised
+    // custom tactic IDs must be unique and non-zero (NvInferRuntime.h).
+    // getValidTactics returns an error code, not the number of tactics.
+    tactics[0] = 1;
+    tactics[1] = 2;
+    tactics[2] = 3;
+    tactics[3] = 4;
     return 0;
 }
 
 char const* ConvRotInt8LinearPlugin::getTimingCacheID() noexcept {
-    return "ConvRotInt8Linear";
+    return "ConvRotInt8Linear.v2";
 }
 
 int32_t ConvRotInt8LinearPlugin::getFormatCombinationLimit() noexcept {
-    // Only 1 format combination (kLINEAR FP32/INT8) — no need for TRT to
-    // try multiple format combos.
+    // One physical layout combination today (kLINEAR), with dtype selected by
+    // input_dtype/output_dtype. Packed-layout tactics can raise this later
+    // without changing the ONNX custom-op schema.
     return 1;
 }
 
@@ -255,10 +333,14 @@ char const* ConvRotInt8LinearPlugin::getMetadataString() noexcept {
     // This is called once; the buffer must live as long as the plugin.
     static thread_local std::string meta;
     std::ostringstream oss;
-    oss << "ConvRotInt8Linear(gs=" << m_group_size
+    oss << "ConvRotInt8Linear.v2(gs=" << m_group_size
         << ",K=" << m_in_features
         << ",N=" << m_out_features
-        << ",bias=" << m_has_bias << ")";
+        << ",bias=" << m_has_bias
+        << ",in=" << dtypeNameFromId(m_input_dtype_id)
+        << ",out=" << dtypeNameFromId(m_output_dtype_id)
+        << ",fmt=" << m_preferred_format
+        << ",tactic=" << m_tactic << ")";
     meta = oss.str();
     return meta.c_str();
 }
@@ -266,8 +348,13 @@ char const* ConvRotInt8LinearPlugin::getMetadataString() noexcept {
 // ── IPluginV3OneRuntime ────────────────────────────────────────────────────
 
 int32_t ConvRotInt8LinearPlugin::setTactic(int32_t tactic) noexcept {
-    m_tactic = 0;
-    return tactic == 0 ? 0 : -1;
+    if (tactic < 0 || tactic > 4) return -1;
+    // Tactic 0 is TensorRT's implicit default. Tactics 1-4 are the advertised
+    // forward-compatible build contract and currently fall through to the same
+    // cuBLASLt implementation, so ONNX export and TRT timing-cache keys are
+    // decoupled from future kernel optimization work.
+    m_tactic = tactic;
+    return 0;
 }
 
 int32_t ConvRotInt8LinearPlugin::onShapeChange(
@@ -304,12 +391,12 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         int32_t M = m_M, K = m_K, N = m_N;
         if (M <= 0 || K <= 0 || N <= 0) return -1;
 
-        float const* x_ptr     = static_cast<float const*>(inputs[0]);
+        void const* x_ptr      = inputs[0];
         int8_t const* wq_ptr   = static_cast<int8_t const*>(inputs[1]);
         float const* ws_ptr    = static_cast<float const*>(inputs[2]);
-        float const* H_ptr     = static_cast<float const*>(inputs[3]);
-        float const* bias_ptr  = m_has_bias ? static_cast<float const*>(inputs[4]) : nullptr;
-        float* y_ptr           = static_cast<float*>(outputs[0]);
+        void const* H_ptr      = inputs[3];
+        void const* bias_ptr   = m_has_bias ? inputs[4] : nullptr;
+        void* y_ptr            = outputs[0];
 
         if (workspace == nullptr) return -1;
 
@@ -335,9 +422,14 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         cursor = alignPtr(cursor, 256);
         void* cublas_workspace = cursor;
 
+        int32_t const input_dtype = kernelDtypeFromTrt(inputDesc[0].type);
+        int32_t const bias_dtype = m_has_bias ? kernelDtypeFromTrt(inputDesc[4].type) : input_dtype;
+        int32_t const output_dtype = kernelDtypeFromTrt(outputDesc[0].type);
+
         // Phase 1: ConvRot rotation + per-row INT8 quantization
         if (!launch_convrot_activation_quant(x_ptr, xq_w, xs_w, H_ptr,
-                                             M, K, m_group_size, stream)) {
+                                             M, K, m_group_size, input_dtype,
+                                             stream)) {
             std::fprintf(stderr, "[ConvRotInt8Linear] convrot_activation_quant failed\n");
             return -1;
         }
@@ -366,7 +458,8 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
 
         // Phase 3: Dequant + bias epilogue
         if (!launch_dequant_bias_epilogue(acc_w, y_ptr, xs_w, ws_ptr, bias_ptr,
-                                          M, N, m_has_bias != 0, stream)) {
+                                          M, N, m_has_bias != 0, bias_dtype,
+                                          output_dtype, stream)) {
             std::fprintf(stderr, "[ConvRotInt8Linear] dequant_bias_epilogue failed\n");
             return -1;
         }
@@ -378,7 +471,9 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
 
 nvinfer1::IPluginV3* ConvRotInt8LinearPlugin::clone() noexcept {
     auto* p = new ConvRotInt8LinearPlugin(m_group_size, m_in_features,
-                                          m_out_features, m_has_bias);
+                                          m_out_features, m_has_bias,
+                                          m_input_dtype_id, m_output_dtype_id,
+                                          m_preferred_format);
     p->m_namespace = m_namespace;
     p->m_tactic = m_tactic;
     return p;
@@ -398,13 +493,26 @@ nvinfer1::PluginFieldCollection const* ConvRotInt8LinearPlugin::getFieldsToSeria
     m_fields.push_back({kFIELD_IN_FEATURES,  &m_in_features,  nvinfer1::PluginFieldType::kINT32, 1});
     m_fields.push_back({kFIELD_OUT_FEATURES, &m_out_features, nvinfer1::PluginFieldType::kINT32, 1});
     m_fields.push_back({kFIELD_HAS_BIAS,     &m_has_bias,     nvinfer1::PluginFieldType::kINT32, 1});
+    static thread_local std::string input_dtype;
+    static thread_local std::string output_dtype;
+    input_dtype = dtypeNameFromId(m_input_dtype_id);
+    output_dtype = dtypeNameFromId(m_output_dtype_id);
+    static thread_local int32_t input_dtype_id;
+    static thread_local int32_t output_dtype_id;
+    input_dtype_id = m_input_dtype_id;
+    output_dtype_id = m_output_dtype_id;
+    m_fields.push_back({kFIELD_INPUT_DTYPE,  input_dtype.c_str(),  nvinfer1::PluginFieldType::kCHAR, static_cast<int32_t>(input_dtype.size() + 1)});
+    m_fields.push_back({kFIELD_OUTPUT_DTYPE, output_dtype.c_str(), nvinfer1::PluginFieldType::kCHAR, static_cast<int32_t>(output_dtype.size() + 1)});
+    m_fields.push_back({kFIELD_INPUT_DTYPE_ID,  &input_dtype_id,  nvinfer1::PluginFieldType::kINT32, 1});
+    m_fields.push_back({kFIELD_OUTPUT_DTYPE_ID, &output_dtype_id, nvinfer1::PluginFieldType::kINT32, 1});
+    m_fields.push_back({kFIELD_PREFERRED_FORMAT, m_preferred_format.c_str(), nvinfer1::PluginFieldType::kCHAR, static_cast<int32_t>(m_preferred_format.size() + 1)});
     m_fc.nbFields = static_cast<int32_t>(m_fields.size());
     m_fc.fields = m_fields.data();
     return &m_fc;
 }
 
 size_t ConvRotInt8LinearPlugin::getSerializationSize() const noexcept {
-    return 4 * sizeof(int32_t);  // group_size, in_features, out_features, has_bias
+    return 6 * sizeof(int32_t);  // group_size, in_features, out_features, has_bias, input_dtype_id, output_dtype_id
 }
 
 void ConvRotInt8LinearPlugin::serialize(void* buffer) const noexcept {
@@ -413,6 +521,8 @@ void ConvRotInt8LinearPlugin::serialize(void* buffer) const noexcept {
     std::memcpy(d, &m_in_features,  sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(d, &m_out_features, sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(d, &m_has_bias,     sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(d, &m_input_dtype_id,  sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(d, &m_output_dtype_id, sizeof(int32_t)); d += sizeof(int32_t);
 }
 
 // ── cuBLASLt initialization ────────────────────────────────────────────────
@@ -471,6 +581,11 @@ ConvRotInt8LinearPluginCreator::ConvRotInt8LinearPluginCreator() {
     m_fields.emplace_back(kFIELD_IN_FEATURES,  nullptr, nvinfer1::PluginFieldType::kINT32, 1);
     m_fields.emplace_back(kFIELD_OUT_FEATURES, nullptr, nvinfer1::PluginFieldType::kINT32, 1);
     m_fields.emplace_back(kFIELD_HAS_BIAS,     nullptr, nvinfer1::PluginFieldType::kINT32, 1);
+    m_fields.emplace_back(kFIELD_INPUT_DTYPE,  nullptr, nvinfer1::PluginFieldType::kCHAR, 0);
+    m_fields.emplace_back(kFIELD_OUTPUT_DTYPE, nullptr, nvinfer1::PluginFieldType::kCHAR, 0);
+    m_fields.emplace_back(kFIELD_INPUT_DTYPE_ID,  nullptr, nvinfer1::PluginFieldType::kINT32, 1);
+    m_fields.emplace_back(kFIELD_OUTPUT_DTYPE_ID, nullptr, nvinfer1::PluginFieldType::kINT32, 1);
+    m_fields.emplace_back(kFIELD_PREFERRED_FORMAT, nullptr, nvinfer1::PluginFieldType::kCHAR, 0);
     m_fc.nbFields = static_cast<int32_t>(m_fields.size());
     m_fc.fields = m_fields.data();
 }
@@ -493,8 +608,12 @@ nvinfer1::IPluginV3* ConvRotInt8LinearPluginCreator::createPlugin(
     char const*, nvinfer1::PluginFieldCollection const* fc,
     nvinfer1::TensorRTPhase) noexcept {
     int32_t group_size = 0, in_features = 0, out_features = 0, has_bias = 0;
+    int32_t input_dtype_id = 10;
+    int32_t output_dtype_id = 10;
+    std::string preferred_format = "HWC8";
     for (int32_t i = 0; i < fc->nbFields; ++i) {
         auto const& f = fc->fields[i];
+        if (f.name == nullptr || f.data == nullptr) continue;
         if (std::strcmp(f.name, kFIELD_GROUP_SIZE) == 0)
             group_size = *static_cast<int32_t const*>(f.data);
         else if (std::strcmp(f.name, kFIELD_IN_FEATURES) == 0)
@@ -503,8 +622,31 @@ nvinfer1::IPluginV3* ConvRotInt8LinearPluginCreator::createPlugin(
             out_features = *static_cast<int32_t const*>(f.data);
         else if (std::strcmp(f.name, kFIELD_HAS_BIAS) == 0)
             has_bias = *static_cast<int32_t const*>(f.data);
+        else if (std::strcmp(f.name, kFIELD_INPUT_DTYPE) == 0) {
+            if (f.type == nvinfer1::PluginFieldType::kINT32) {
+                input_dtype_id = (*static_cast<int32_t const*>(f.data) != 0) ? 10 : 1;
+            } else {
+                char tmp[16];
+                if (readPluginString(f, tmp, sizeof(tmp))) input_dtype_id = parseDtypeId(tmp, input_dtype_id);
+            }
+        } else if (std::strcmp(f.name, kFIELD_OUTPUT_DTYPE) == 0) {
+            if (f.type == nvinfer1::PluginFieldType::kINT32) {
+                output_dtype_id = (*static_cast<int32_t const*>(f.data) != 0) ? 10 : 1;
+            } else {
+                char tmp[16];
+                if (readPluginString(f, tmp, sizeof(tmp))) output_dtype_id = parseDtypeId(tmp, output_dtype_id);
+            }
+        } else if (std::strcmp(f.name, kFIELD_INPUT_DTYPE_ID) == 0) {
+            input_dtype_id = normalizeDtypeId(*static_cast<int32_t const*>(f.data), input_dtype_id);
+        } else if (std::strcmp(f.name, kFIELD_OUTPUT_DTYPE_ID) == 0) {
+            output_dtype_id = normalizeDtypeId(*static_cast<int32_t const*>(f.data), output_dtype_id);
+        } else if (std::strcmp(f.name, kFIELD_PREFERRED_FORMAT) == 0) {
+            char tmp[32];
+            if (readPluginString(f, tmp, sizeof(tmp))) preferred_format = tmp;
+        }
     }
-    return new ConvRotInt8LinearPlugin(group_size, in_features, out_features, has_bias);
+    return new ConvRotInt8LinearPlugin(group_size, in_features, out_features, has_bias,
+                                       input_dtype_id, output_dtype_id, preferred_format);
 }
 
 }  // namespace hotstep

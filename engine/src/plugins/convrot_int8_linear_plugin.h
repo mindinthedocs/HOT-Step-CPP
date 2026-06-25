@@ -6,9 +6,9 @@
  *   1. Online activation rotation: x_rot = x @ H_block (group-wise Hadamard)
  *   2. Per-row dynamic INT8 quantization of x_rot
  *   3. INT8 × INT8 → INT32 matmul via cuBLASLt
- *   4. Dequantize to FP32 via per-row activation scale and per-output-channel
+ *   4. Dequantize via per-row activation scale and per-output-channel
  *      weight scale
- *   5. Add bias (if present)
+ *   5. Add bias (if present) and write FP16 by default
  *
  * This is the same architecture class as TRT-LLM's smooth_quant_gemm_plugin:
  *   - Custom CUDA kernel for ConvRot rotation + per-row quant (TRT can't do this natively)
@@ -17,15 +17,17 @@
  *
  * Op signature (ONNX custom op, domain "hotstep", type "ConvRotInt8Linear"):
  *
- *   inputs[0]: x              FP32 [..., in_features]
+ *   inputs[0]: x              FP16 [..., in_features] by default
  *   inputs[1]: weight_q       INT8 [out_features, in_features]
  *   inputs[2]: weight_scale   FP32 [out_features]
- *   inputs[3]: H              FP32 [group_size, group_size]
- *   inputs[4]: bias           FP32 [out_features]  (optional)
+ *   inputs[3]: H              FP16 [group_size, group_size] by default
+ *   inputs[4]: bias           FP32 [out_features]  (optional; 1D tensors stay FP32)
  *
- *   output[0]: y              FP32 [..., out_features]
+ *   output[0]: y              FP16 [..., out_features] by default
  *
- * Attributes: group_size, in_features, out_features, has_bias
+ * Attributes: group_size, in_features, out_features, has_bias,
+ *             input_dtype={FP16,FP32}, output_dtype={FP16,FP32},
+ *             preferred_format={LINEAR,HWC8,CHW32,HWC16}
  */
 
 #pragma once
@@ -44,13 +46,18 @@
 namespace hotstep {
 
 constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_NAME    = "ConvRotInt8Linear";
-constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_VERSION = "1";
+constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_VERSION = "2";
 constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE = "hotstep";
 
 constexpr char const* const kFIELD_GROUP_SIZE   = "group_size";
 constexpr char const* const kFIELD_IN_FEATURES  = "in_features";
 constexpr char const* const kFIELD_OUT_FEATURES = "out_features";
 constexpr char const* const kFIELD_HAS_BIAS     = "has_bias";
+constexpr char const* const kFIELD_INPUT_DTYPE  = "input_dtype";
+constexpr char const* const kFIELD_OUTPUT_DTYPE = "output_dtype";
+constexpr char const* const kFIELD_INPUT_DTYPE_ID  = "input_dtype_id";
+constexpr char const* const kFIELD_OUTPUT_DTYPE_ID = "output_dtype_id";
+constexpr char const* const kFIELD_PREFERRED_FORMAT = "preferred_format";
 
 /*
  * ConvRotInt8LinearPlugin — IPluginV3 implementation around cuBLASLt.
@@ -70,7 +77,10 @@ class ConvRotInt8LinearPlugin
       public nvinfer1::IPluginV3OneRuntime {
 public:
     ConvRotInt8LinearPlugin(int32_t group_size, int32_t in_features,
-                            int32_t out_features, int32_t has_bias);
+                            int32_t out_features, int32_t has_bias,
+                            int32_t input_dtype_id = 10,
+                            int32_t output_dtype_id = 10,
+                            std::string preferred_format = "HWC8");
     ConvRotInt8LinearPlugin(void const* data, size_t length);
     ~ConvRotInt8LinearPlugin() override;
 
@@ -106,7 +116,7 @@ public:
                             int32_t nbOutputs) const noexcept override;
     // Note: destroy() was removed in TRT 11. The destructor handles cleanup.
 
-    // ── Custom Tactics (disabled until correctness is validated) ────
+    // ── Custom Tactics (stable tactic surface; tactic 0 is current implementation) ────
     int32_t getNbTactics() noexcept override;
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override;
     char const* getTimingCacheID() noexcept override;
@@ -139,10 +149,14 @@ private:
     int32_t m_in_features{0};
     int32_t m_out_features{0};
     int32_t m_has_bias{0};
+    // ONNX TensorProto dtype ids: FLOAT=1, FLOAT16=10, BFLOAT16=16.
+    int32_t m_input_dtype_id{10};
+    int32_t m_output_dtype_id{10};
+    std::string m_preferred_format{"HWC8"};
     std::string m_namespace{kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE};
 
     // Runtime state
-    int32_t m_tactic{0};           // retained for API compatibility; only 0 is valid
+    int32_t m_tactic{0};           // tactic requested by TRT (0 default, 1-4 advertised)
     int32_t m_M{0};                 // rows (from onShapeChange)
     int32_t m_K{0};                 // in_features (from onShapeChange)
     int32_t m_N{0};                 // out_features (= m_out_features)

@@ -88,10 +88,10 @@ rem Discover TensorRT SDK (optional — TRT acceleration for DiT w8a8 path).
 rem Checks TRT_ROOT or TENSORRT_ROOT env vars; passes -DTRT_ROOT to CMake if found.
 set "CMAKE_TRT_OPT="
 if defined TRT_ROOT (
-    set "CMAKE_TRT_OPT=-DTRT_ROOT=%TRT_ROOT%"
+    set "CMAKE_TRT_OPT=-DTRT_ROOT:PATH=%TRT_ROOT%"
     echo TRT_ROOT : %TRT_ROOT%
 ) else if defined TENSORRT_ROOT (
-    set "CMAKE_TRT_OPT=-DTRT_ROOT=%TENSORRT_ROOT%"
+    set "CMAKE_TRT_OPT=-DTRT_ROOT:PATH=%TENSORRT_ROOT%"
     echo TENSORRT_ROOT : %TENSORRT_ROOT%
 ) else (
     echo TRT      : not set (set TRT_ROOT or TENSORRT_ROOT for TRT acceleration)

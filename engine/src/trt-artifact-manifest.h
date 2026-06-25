@@ -289,8 +289,12 @@ static inline bool trt_artifact_validate_precision_manifest(const std::string & 
     std::unordered_set<std::string> quantized_set;
     if (!trt_artifact_string_array(root, "matched_allowlist", nullptr, &matched_set,
                                    &check.matched_allowlist_count, err) ||
-        !trt_artifact_string_array(root, "downcast_to_fp16", nullptr, &downcast_set,
-                                   &check.downcast_to_fp16_count, err) ||
+        // Older/experimental w8a8 manifests may omit this q8map-fp16-only
+        // field. Match the Python validator behavior: absent means an empty
+        // downcast set, which is valid for w8a8/fp32 and invalid for q8map-fp16
+        // later in the policy-specific checks.
+        !trt_artifact_string_array_optional(root, "downcast_to_fp16", nullptr, &downcast_set,
+                                            &check.downcast_to_fp16_count, err) ||
         !trt_artifact_string_array_optional(root, "quantized_to_int8", nullptr, &quantized_set,
                                             &check.quantized_to_int8_count, err) ||
         !trt_artifact_string_array(root, "preserved_fp32", nullptr, nullptr,

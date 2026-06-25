@@ -73,7 +73,7 @@ endif()
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     find_package(CUDAToolkit QUIET)
     # Base arch list: Turing through Lovelace/Ada
-    set(CMAKE_CUDA_ARCHITECTURES "75-virtual;80-virtual;86-real;89-real;90-real")
+    set(CMAKE_CUDA_ARCHITECTURES "75-real;80-virtual;86-real;89-real;90-real")
     if(CUDAToolkit_FOUND)
         # Blackwell sm_120a: CUDA 12.8+
         if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
@@ -273,12 +273,40 @@ endif()
 # (libnvinfer.so, libnvonnxparser.so). Prefer exact TRT 11 libraries when they
 # exist, then fall back to neutral names after the header version check passes.
 set(TRT_ENABLED FALSE)
+set(_TRT_DEFAULT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/tensorrt")
 set(TRT_ROOT "" CACHE PATH "Path to TensorRT 11 SDK root")
-if(NOT TRT_ROOT AND DEFINED ENV{TENSORRT_ROOT})
-    set(TRT_ROOT "$ENV{TENSORRT_ROOT}")
+
+# Accept both the CMake cache variable and the two environment names used by
+# scripts/docs. This is intentionally before falling back to engine/deps so a
+# PowerShell setting like `$env:TRT_ROOT = "D:\ai\TensorRT"` works even when
+# build orchestration does not forward -DTRT_ROOT explicitly. If an older CMake
+# cache contains the built-in fallback path, treat it as unset so the env var can
+# repair an existing build directory without --clean.
+set(_TRT_ROOT_IS_DEFAULT_FALLBACK FALSE)
+if(TRT_ROOT STREQUAL _TRT_DEFAULT_ROOT)
+    set(_TRT_ROOT_IS_DEFAULT_FALLBACK TRUE)
+endif()
+if((NOT TRT_ROOT OR _TRT_ROOT_IS_DEFAULT_FALLBACK) AND DEFINED ENV{TRT_ROOT})
+    set(TRT_ROOT "$ENV{TRT_ROOT}" CACHE PATH "Path to TensorRT 11 SDK root" FORCE)
+endif()
+if((NOT TRT_ROOT OR _TRT_ROOT_IS_DEFAULT_FALLBACK) AND DEFINED ENV{TENSORRT_ROOT})
+    set(TRT_ROOT "$ENV{TENSORRT_ROOT}" CACHE PATH "Path to TensorRT 11 SDK root" FORCE)
 endif()
 if(NOT TRT_ROOT)
-    set(TRT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/tensorrt")
+    set(TRT_ROOT "${_TRT_DEFAULT_ROOT}" CACHE PATH "Path to TensorRT 11 SDK root" FORCE)
+endif()
+
+# Some local installs use a wrapper directory (e.g. D:/ai/TensorRT containing a
+# TensorRT-11.x/ child). If the provided root does not directly contain the SDK
+# include directory, auto-select the first child that does.
+if(TRT_ROOT AND NOT EXISTS "${TRT_ROOT}/include/NvInfer.h")
+    file(GLOB _TRT_ROOT_CHILDREN LIST_DIRECTORIES TRUE "${TRT_ROOT}/*")
+    foreach(_TRT_ROOT_CHILD IN LISTS _TRT_ROOT_CHILDREN)
+        if(EXISTS "${_TRT_ROOT_CHILD}/include/NvInfer.h")
+            set(TRT_ROOT "${_TRT_ROOT_CHILD}" CACHE PATH "Path to TensorRT 11 SDK root" FORCE)
+            break()
+        endif()
+    endforeach()
 endif()
 
 set(_TRT_INC_DIR "${TRT_ROOT}/include")
@@ -341,6 +369,8 @@ if(EXISTS "${_TRT_INC_DIR}/NvInfer.h" AND EXISTS "${_TRT_VERSION_HEADER}")
     endif()
 else()
     message(STATUS "[TRT] Not found (set TRT_ROOT or TENSORRT_ROOT to a TensorRT 11 SDK)")
+    message(STATUS "[TRT] Checked root: ${TRT_ROOT}")
+    message(STATUS "[TRT] Expected headers: ${_TRT_INC_DIR}/NvInfer.h and ${_TRT_VERSION_HEADER}")
 endif()
 
 # Core library (shared between binaries)

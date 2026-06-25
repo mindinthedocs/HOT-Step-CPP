@@ -24,7 +24,7 @@
  *   1. Reads INT32 accumulator from cuBLASLt output
  *   2. Loads x_scale[m] and w_scale[n]
  *   3. Computes y = acc * x_scale * w_scale + bias
- *   4. Writes FP32 output
+ *   4. Writes FP16 output by default (or FP32 for explicit fallback)
  */
 
 #pragma once
@@ -32,6 +32,7 @@
 #ifdef HOT_STEP_TRT
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdint>
 
 namespace hotstep {
@@ -46,12 +47,12 @@ namespace hotstep {
  * Grid: (M,)
  * Shared memory: 2 * GROUP_SIZE * sizeof(float)
  */
-template <int GROUP_SIZE, int BLOCK_K>
+template <typename X_T, int GROUP_SIZE, int BLOCK_K>
 __global__ void convrot_activation_quant_kernel(
-    float const* __restrict__ x_ptr,       // [M, K] FP32
+    X_T const* __restrict__ x_ptr,         // [M, K] FP16/FP32
     int8_t* __restrict__ x_q_ptr,          // [M, K] INT8 (output)
     float* __restrict__ x_scale_ptr,       // [M] FP32 (output)
-    float const* __restrict__ H_ptr,       // [GROUP_SIZE, GROUP_SIZE] FP32
+    void const* __restrict__ H_ptr,        // [GROUP_SIZE, GROUP_SIZE] FP16/FP32 (ignored by butterfly impl)
     int32_t M, int32_t K);
 
 /*
@@ -63,25 +64,27 @@ __global__ void convrot_activation_quant_kernel(
  *
  * Grid: (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))
  */
-template <int BLOCK_M, int BLOCK_N, bool HAS_BIAS>
+template <typename Y_T, typename BIAS_T, int BLOCK_M, int BLOCK_N, bool HAS_BIAS>
 __global__ void dequant_bias_epilogue_kernel(
     int32_t const* __restrict__ acc_ptr,   // [M, N] INT32 (from cuBLASLt)
-    float* __restrict__ y_ptr,             // [M, N] FP32 (output)
+    Y_T* __restrict__ y_ptr,               // [M, N] FP16/FP32 (output)
     float const* __restrict__ x_scale,     // [M] FP32
     float const* __restrict__ w_scale,     // [N] FP32
-    float const* __restrict__ bias_ptr,    // [N] FP32 (or nullptr)
+    BIAS_T const* __restrict__ bias_ptr,   // [N] FP16/FP32 (or nullptr)
     int32_t M, int32_t N);
 
 // ── Launch helpers ──────────────────────────────────────────────────
 
 bool launch_convrot_activation_quant(
-    float const* x, int8_t* x_q, float* x_scale, float const* H,
-    int32_t M, int32_t K, int32_t group_size, cudaStream_t stream);
+    void const* x, int8_t* x_q, float* x_scale, void const* H,
+    int32_t M, int32_t K, int32_t group_size, int32_t input_dtype,
+    cudaStream_t stream);
 
 bool launch_dequant_bias_epilogue(
-    int32_t const* acc, float* y,
-    float const* x_scale, float const* w_scale, float const* bias,
-    int32_t M, int32_t N, bool has_bias, cudaStream_t stream);
+    int32_t const* acc, void* y,
+    float const* x_scale, float const* w_scale, void const* bias,
+    int32_t M, int32_t N, bool has_bias, int32_t bias_dtype,
+    int32_t output_dtype, cudaStream_t stream);
 
 }  // namespace hotstep
 

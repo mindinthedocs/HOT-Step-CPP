@@ -110,7 +110,7 @@ bool run_kernel_test(const TestVector& tv) {
 
     // Phase 1: ConvRot activation quant
     if (!hotstep::launch_convrot_activation_quant(
-            d_x, d_xq, d_xs, d_H, tv.M, tv.K, tv.group_size, stream)) {
+            d_x, d_xq, d_xs, d_H, tv.M, tv.K, tv.group_size, false, stream)) {
         fprintf(stderr, "launch_convrot_activation_quant failed\n");
         return false;
     }

@@ -946,6 +946,73 @@ def _derived_runtime_buffer_array(name: str, wrapper: nn.Module, dims: list[int]
     arr = tensor.detach().cpu().numpy().astype(np.float32, copy=False)
     return _match_derived_array_to_dims(name, arr, dims)
 
+def _float32_to_bfloat16_uint16(arr):
+    import numpy as np
+
+    f32 = np.ascontiguousarray(arr, dtype=np.float32)
+    bits = f32.view(np.uint32)
+    lsb = (bits >> np.uint32(16)) & np.uint32(1)
+    rounded = bits + np.uint32(0x7FFF) + lsb
+    return np.ascontiguousarray((rounded >> np.uint32(16)).astype(np.uint16))
+
+
+def _w8a8_plugin_boundary_dtype() -> str:
+    # GGML Q8_0 linears produce FP32 tensors, and RMSNorm/AdaLN/residual math
+    # stays FP32. Keep that as the default for audio quality. FP16/BF16 are
+    # explicit experimental modes for profiling or overflow investigations.
+    value = os.environ.get("HOTSTEP_W8A8_PLUGIN_IO_DTYPE", "FP32").strip().upper()
+    if value in {"FP16", "FLOAT16", "HALF"}:
+        return "FP16"
+    if value in {"BF16", "BFLOAT16"}:
+        return "BF16"
+    if value in {"FP32", "FLOAT", "FLOAT32"}:
+        return "FP32"
+    raise SystemExit(
+        "HOTSTEP_W8A8_PLUGIN_IO_DTYPE must be one of FP16, BF16, or FP32; "
+        f"got {value!r}"
+    )
+
+
+def _onnx_dtype_for_plugin_boundary(TensorProto, dtype_name: str) -> int:
+    if dtype_name == "BF16":
+        return TensorProto.BFLOAT16
+    if dtype_name == "FP16":
+        return TensorProto.FLOAT16
+    return TensorProto.FLOAT
+
+
+def _numpy_boundary_array(arr, dtype_name: str):
+    import numpy as np
+
+    if dtype_name == "BF16":
+        return _float32_to_bfloat16_uint16(arr)
+    if dtype_name == "FP16":
+        return np.ascontiguousarray(arr, dtype=np.float16)
+    return np.ascontiguousarray(arr, dtype=np.float32)
+
+
+def _stream_f32_as_bf16(source: dict, out, chunk_bytes: int) -> tuple[int, int]:
+    import numpy as np
+
+    if source["dtype"] != "F32":
+        raise SystemExit(f"low-memory BF16 streaming expects FP32 safetensors, got {source['dtype']}")
+    offset = out.tell()
+    remaining = int(source["length"])
+    if remaining % 4:
+        raise SystemExit(f"FP32 safetensor byte length is not divisible by 4 for {source['path']}")
+    max_bytes = max(4, int(chunk_bytes) // 4 * 4)
+    with open(source["path"], "rb") as f:
+        f.seek(int(source["offset"]))
+        while remaining:
+            block = f.read(min(max_bytes, remaining))
+            if not block:
+                raise IOError(f"unexpected EOF while reading {source['path']}")
+            arr = np.frombuffer(block, dtype="<f4")
+            out_arr = _float32_to_bfloat16_uint16(arr)
+            out.write(memoryview(out_arr).cast("B"))
+            remaining -= len(block)
+    return offset, int(source["length"] // 2)
+
 
 def _source_layout(source: dict, onnx_dims: list[int]) -> tuple[list[int], bool]:
     source_dims = [int(x) for x in source["shape"]]
@@ -1032,7 +1099,7 @@ def _write_low_memory_precision_manifest(
     output_path: str,
     wrapper: nn.Module,
     precision: str,
-    downcast_to_fp16: list[str],
+    downcast_to_lowp: list[str],
     quantized_to_int8: list[str],
     rewrite_report: dict | None = None,
     w8_axes: dict[str, int] | None = None,
@@ -1053,7 +1120,7 @@ def _write_low_memory_precision_manifest(
     report = {
         "precision_policy": precision,
         "matched_allowlist": fp16_names if precision in {"q8map-fp16", "w8a8"} else [],
-        "downcast_to_fp16": sorted(downcast_to_fp16),
+        "downcast_to_lowp": sorted(downcast_to_lowp),
         "quantized_to_int8": sorted(quantized_to_int8),
         "preserved_fp32": sorted(all_param_names) if precision == "fp32" else preserved_names,
         "missing_initializers": [],
@@ -1082,6 +1149,11 @@ def _write_low_memory_precision_manifest(
             "scheme": "symmetric",
             "q_range": [-127, 127],
             "matmul": "ConvRotInt8Linear",
+            "plugin_contract_version": 2,
+            "plugin_boundary_dtype": _w8a8_plugin_boundary_dtype().lower(),
+            "plugin_input_dtype_default": _w8a8_plugin_boundary_dtype().lower(),
+            "plugin_output_dtype_default": _w8a8_plugin_boundary_dtype().lower(),
+            "plugin_output_dtype_fallback": "fp32",
         }
         rotated_by_name = w8a8_rotated_by_name or {}
         report["convrot"] = {
@@ -1239,10 +1311,16 @@ def _externalize_initializers_from_safetensors(
     fallback = 0
     transposed = []
     added_initializers = []
-    downcast_to_fp16 = []
+    downcast_to_lowp = []
     quantized_to_int8 = []
     scale_names: dict[str, str] = {}
     zero_point_names: dict[str, str] = {}
+    w8a8_boundary_dtype = _w8a8_plugin_boundary_dtype() if precision == "w8a8" else "FP16"
+    w8a8_boundary_tensorproto = _onnx_dtype_for_plugin_boundary(TensorProto, w8a8_boundary_dtype)
+    # Sane quantization rule from the GGUF path: 1D tensors (norms/biases) stay
+    # FP32. Even when a bias is folded into ConvRotInt8Linear, keep the ONNX
+    # initializer and plugin input FP32; only activations/H use the lowp boundary
+    # dtype selected by HOTSTEP_W8A8_PLUGIN_IO_DTYPE.
     # w8a8-specific bookkeeping
     w8a8_rotated_by_name: dict[str, bool] = {}
     w8a8_group_size: int | None = None
@@ -1332,20 +1410,31 @@ def _externalize_initializers_from_safetensors(
                 continue
 
             if precision == "q8map-fp16" and name in selected_initializer_names:
+                boundary_dtype = "FP16"
+                boundary_tensorproto = TensorProto.FLOAT16
                 if source is not None:
                     if is_transposed:
-                        offset, length = _stream_f32_transposed(source, source_dims, data_path, data_out, "<f2", chunk_bytes)
-                    else:
+                        dst_dtype = "<f2" if boundary_dtype == "FP16" else ("<f4" if boundary_dtype == "FP32" else "<u2")
+                        transform = None if boundary_dtype != "BF16" else (lambda chunk, _row_start: _float32_to_bfloat16_uint16(chunk))
+                        offset, length = _stream_f32_transposed(source, source_dims, data_path, data_out, dst_dtype, chunk_bytes, transform=transform)
+                    elif boundary_dtype == "BF16":
+                        offset, length = _stream_f32_as_bf16(source, data_out, chunk_bytes)
+                    elif boundary_dtype == "FP16":
                         offset, length = _stream_f32_as_f16(source, data_out, chunk_bytes)
+                    else:
+                        offset = data_out.tell()
+                        _copy_file_range(source["path"], source["offset"], source["length"], data_out, chunk_bytes)
+                        length = int(source["length"])
                 elif derived_array is not None:
-                    offset, length = _write_numpy_external(data_out, derived_array.astype(np.float16))
+                    offset, length = _write_numpy_external(data_out, _numpy_boundary_array(derived_array, boundary_dtype))
                 else:
                     param = wrapper_tensors[name].detach().cpu().contiguous()
                     arr = param.numpy().T if is_transposed else param.numpy()
-                    offset, length = _write_numpy_external(data_out, arr.astype(np.float16))
+                    offset, length = _write_numpy_external(data_out, _numpy_boundary_array(arr, boundary_dtype))
                     fallback += 1
-                added_initializers.append(_external_initializer(name, TensorProto.FLOAT16, dims, data_location, offset, length))
-                downcast_to_fp16.append(name)
+                added_initializers.append(_external_initializer(name, boundary_tensorproto, dims, data_location, offset, length))
+                if precision == "q8map-fp16":
+                    downcast_to_lowp.append(name)
                 streamed_fp16 += 1
                 continue
 
@@ -1367,22 +1456,20 @@ def _externalize_initializers_from_safetensors(
                 fallback += 1
             added_initializers.append(_external_initializer(name, TensorProto.FLOAT, dims, data_location, offset, length))
 
-    # Write the shared ConvRot H matrix to the external data file. We re-open
-    # the file in append mode and seek to end before recording the offset,
-    # because Python's "ab" mode initializes the file position to 0 even
-    # though writes go to the end. The H matrix is small (256×256×4 B =
-    # 256 KB at the default group size) so this is cheap.
+    # Write the shared ConvRot H matrix to the external data file with the
+    # plugin boundary dtype. We keep the FP32 copy in memory for offline weight
+    # rotation; only the ONNX boundary initializer is narrowed.
     if precision == "w8a8" and _w8a8_H_np is not None and w8a8_h_name:
         with open(data_path, "ab") as h_data_out:
             h_data_out.seek(0, os.SEEK_END)
             h_offset = h_data_out.tell()
-            h_arr = np.ascontiguousarray(_w8a8_H_np, dtype=np.float32)
+            h_arr = _numpy_boundary_array(_w8a8_H_np, w8a8_boundary_dtype)
             h_data_out.write(memoryview(h_arr).cast("B"))
             h_length = int(h_arr.nbytes)
         added_initializers.append(
             _external_initializer(
                 w8a8_h_name,
-                TensorProto.FLOAT,
+                w8a8_boundary_tensorproto,
                 list(_w8a8_H_np.shape),
                 data_location,
                 h_offset,
@@ -1395,7 +1482,7 @@ def _externalize_initializers_from_safetensors(
 
     rewrite_report = {}
     if precision == "q8map-fp16":
-        rewrite_report = _rewrite_fp16_weight_ops(model_proto, set(downcast_to_fp16))
+        rewrite_report = _rewrite_fp16_weight_ops(model_proto, set(downcast_to_lowp))
     elif precision == "w8a8":
         quant_report = {
             "quantized": sorted(quantized_to_int8),
@@ -1414,6 +1501,30 @@ def _externalize_initializers_from_safetensors(
     sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model_proto)
     if sequence_rewrite_report["split_to_sequence_rewritten"]:
         rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
+    if precision == "w8a8" and w8a8_boundary_dtype != "FP32":
+        # The SplitToSequence compatibility pass may introduce new Split/
+        # Identity/Squeeze nodes after the initial plugin rewrite. In lowp test
+        # modes, run the island type-fix pass once more so TensorRT strongly
+        # typed parsing does not see Add/Mul/etc. with mixed dtypes.
+        rewrite_report["fp16_island_rewrite_after_sequence"] = _rewrite_w8a8_fp16_islands(model_proto, set(), w8a8_boundary_dtype)
+    # Attention rewrite: replace decomposed SDPA (MatMul+Softmax+MatMul)
+    # with a single ONNX Attention-23 op running in BF16 internally.
+    # This is mandatory for the attention block — matches GGML Q8_0's
+    # flash-attention precision and lets TRT dispatch to its FMHA kernel.
+    # Must run AFTER the w8a8 plugin rewrite (so Q/K/V come from
+    # ConvRotInt8Linear outputs) and AFTER SplitToSequence lowering, but
+    # BEFORE constant folding (so the dead Q/K scaling nodes get cleaned up).
+    attention_rewrite_report = rewrite_attention_to_onnx_attention_fp16(model_proto)
+    if attention_rewrite_report.get("rewritten", 0):
+        rewrite_report["attention_rewrite"] = attention_rewrite_report
+        if attention_rewrite_report.get("skipped"):
+            print(f"[export_dit] Attention rewrite: {attention_rewrite_report['rewritten']} blocks fused, "
+                  f"skipped={attention_rewrite_report['skipped']}")
+        else:
+            print(f"[export_dit] Attention rewrite: {attention_rewrite_report['rewritten']} blocks fused")
+    elif attention_rewrite_report.get("skipped"):
+        print(f"[export_dit] Attention rewrite: 0 blocks fused, skipped={attention_rewrite_report['skipped']}")
+
     constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(
         model_proto,
         data_path=data_path,
@@ -1437,7 +1548,7 @@ def _externalize_initializers_from_safetensors(
         output_path,
         wrapper,
         precision,
-        downcast_to_fp16,
+        downcast_to_lowp,
         quantized_to_int8,
         rewrite_report,
         w8a8_axes_param,
@@ -1698,7 +1809,7 @@ def _convrot_default_group_size() -> int:
 
 
 def _emit_convrot_h_initializer(model, group_size: int, name: str) -> str:
-    """Add (or reuse) a single FP32 H initializer shared by all rotation sites.
+    """Add (or reuse) a single FP16 H initializer shared by all rotation sites.
 
     Returns the initializer name so callers can reference it from their MatMul
     nodes. Storing H once keeps the graph small (32 layers × 7 linears would
@@ -1712,7 +1823,8 @@ def _emit_convrot_h_initializer(model, group_size: int, name: str) -> str:
             return name
     from convrot import build_hadamard
 
-    H = build_hadamard(group_size).astype(np.float32)
+    boundary_dtype = _w8a8_plugin_boundary_dtype()
+    H = _numpy_boundary_array(build_hadamard(group_size), boundary_dtype)
     model.graph.initializer.extend([numpy_helper.from_array(H, name=name)])
     return name
 
@@ -1859,13 +1971,15 @@ def _quantize_w8a8_initializers_with_convrot(
         )
     H_np = build_hadamard(group_size).astype(np.float32)
 
-    # Single shared H initializer for activation rotation. Stored as FP32 so
-    # both FP32 and FP16-typed activations can use it without an extra cast
-    # (we always cast activations to FP32 inside the quant subgraph).
+    # Single shared H initializer for activation rotation. The v2 plugin
+    # contract uses FP16 activation/H/bias tensors by default; the CUDA
+    # butterfly implementation does not read H at runtime, but typing it as
+    # FP16 keeps the ONNX contract cast-free at the plugin boundary.
     H_name = "convrot.hadamard"
     H_already_present = any(init.name == H_name for init in model.graph.initializer)
     if not H_already_present:
-        model.graph.initializer.extend([numpy_helper.from_array(H_np, name=H_name)])
+        boundary_dtype = _w8a8_plugin_boundary_dtype()
+        model.graph.initializer.extend([numpy_helper.from_array(_numpy_boundary_array(H_np, boundary_dtype), name=H_name)])
 
     initializers = {init.name: init for init in model.graph.initializer}
     quantized: list[str] = []
@@ -1932,6 +2046,240 @@ def _quantize_w8a8_initializers_with_convrot(
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Attention rewrite: decomposed SDPA → ONNX Attention-23 op (BF16 mandatory)
+# ──────────────────────────────────────────────────────────────────────────
+# Ported from tools/onnx-export/optimize_dit_onnx.py. Replaces the manually
+# decomposed ``MatMul(Q,Kᵀ) → Mul(scale) → Add(mask) → Softmax → MatMul(.,V)``
+# pattern (produced by torch dynamo's sdpa decomposition) with a single
+# ONNX ``Attention`` op (opset 23). This lets TensorRT dispatch to its
+# built-in FMHA kernel instead of the current FP32 MatMul+Softmax+MatMul
+# chain, which is ~30% of total inference time.
+#
+# The attention island runs in BF16 (mandatory — matches GGML Q8_0's
+# flash-attention precision). TRT's Attention op handles softmax
+# precision internally (always FP32 accumulation) — the
+# ``softmax_precision`` attribute is NOT supported by TRT's parser.
+# The surrounding graph stays in its current dtype (FP32 for the baseline);
+# Casts are inserted at the attention I/O boundary.
+
+
+def _attn_node_by_output(model) -> dict:
+    """Map tensor name → producing node."""
+    return {out: node for node in model.graph.node for out in node.output if out}
+
+
+def _attn_consumers_by_input(model) -> dict:
+    """Map tensor name → list of consuming nodes."""
+    import collections
+    consumers: dict[str, list] = collections.defaultdict(list)
+    for node in model.graph.node:
+        for inp in node.input:
+            if inp:
+                consumers[inp].append(node)
+    return consumers
+
+
+def _attn_ensure_main_opset(model, min_version: int) -> None:
+    """Bump the main (ai.onnx) opset to at least ``min_version``."""
+    from onnx import helper
+    for opset in model.opset_import:
+        if opset.domain in ("", "ai.onnx"):
+            if opset.version < min_version:
+                opset.version = min_version
+            return
+    model.opset_import.extend([helper.make_opsetid("", min_version)])
+
+
+def _is_sqrt_scalar_node(node, prod: dict) -> bool:
+    """True if ``node`` is a ``Sqrt(CastLike(scalar, q_tensor))`` pattern."""
+    if node is None or node.op_type != "Sqrt" or len(node.input) != 1:
+        return False
+    src = prod.get(node.input[0])
+    return src is None or src.op_type in {"CastLike", "Cast", "Constant", "Reshape", "Squeeze"}
+
+
+def _split_scaled_mul(mul_node, prod: dict):
+    """Return ``(data_input, sqrt_scale_input)`` for ``Mul(data, Sqrt(scale))``."""
+    if mul_node is None or mul_node.op_type != "Mul" or len(mul_node.input) != 2:
+        return None
+    a, b = mul_node.input
+    pa, pb = prod.get(a), prod.get(b)
+    if _is_sqrt_scalar_node(pa, prod):
+        return b, a
+    if _is_sqrt_scalar_node(pb, prod):
+        return a, b
+    return None
+
+
+def _trace_untranspose_k(name: str, prod: dict):
+    """Undo the exporter's ``K^T`` reshape/transpose/reshape wrapper."""
+    r2 = prod.get(name)
+    if r2 is None or r2.op_type != "Reshape" or len(r2.input) < 1:
+        return None
+    tr = prod.get(r2.input[0])
+    if tr is None or tr.op_type != "Transpose" or len(tr.input) < 1:
+        return None
+    r1 = prod.get(tr.input[0])
+    if r1 is None or r1.op_type != "Reshape" or len(r1.input) < 1:
+        return None
+    return r1.input[0]
+
+
+def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
+    """Rewrite decomposed SDPA islands to ONNX ``Attention`` op (opset 23, fp16).
+
+    Pattern matched::
+
+        Mul(Q, sqrt(scale))            Mul(K^T, sqrt(scale))
+             |                              |
+              MatMul(Q, K^T) → Add(mask) → Softmax → MatMul(., V) → output
+
+    Replacement::
+
+        Cast Q/K/V/mask → fp16
+        Attention(Q_fp16, K_fp16, V_fp16, mask_fp16, scale=1/sqrt(D),
+                  is_causal=0)
+        Cast output → FP32 (reuses the original AV MatMul output name)
+
+    The attention island **must** run in fp16 — this matches GGML Q8_0's
+    flash-attention precision and is the whole point of the rewrite. The
+    TRT's Attention op handles softmax precision internally (always FP32
+    accumulation) — the ``softmax_precision`` attribute is rejected by TRT's
+    ONNX parser (``!hasSoftmaxPrecision`` assertion). The surrounding graph stays
+    in its current dtype (FP32 for the baseline); Casts are inserted at the
+    attention I/O boundary.
+
+    Returns a report dict with ``rewritten`` count and ``skipped`` reasons.
+    """
+    from onnx import TensorProto, helper
+
+    prod = _attn_node_by_output(model)
+    consumers = _attn_consumers_by_input(model)
+    remove_node_names: set[str] = set()
+    replacements: dict[str, list] = {}
+    rewritten = []
+    skipped: dict[str, int] = {}
+
+    used_names = {name for node in model.graph.node
+                  for name in list(node.input) + list(node.output) if name}
+    used_names.update(init.name for init in model.graph.initializer)
+
+    def unique(base: str) -> str:
+        name = base
+        i = 0
+        while name in used_names:
+            i += 1
+            name = f"{base}_{i}"
+        used_names.add(name)
+        return name
+
+    for softmax in list(model.graph.node):
+        if softmax.op_type != "Softmax" or len(softmax.input) != 1 or len(softmax.output) != 1:
+            continue
+        sm_in, sm_out = softmax.input[0], softmax.output[0]
+        add = prod.get(sm_in)
+        if add is None or add.op_type != "Add" or len(add.input) != 2:
+            skipped["softmax_input_not_add"] = skipped.get("softmax_input_not_add", 0) + 1
+            continue
+
+        # Find QK matmul and additive mask input.
+        qk = None
+        mask = None
+        for inp in add.input:
+            p = prod.get(inp)
+            if p is not None and p.op_type == "MatMul":
+                qk = p
+            else:
+                mask = inp
+        if qk is None or mask is None or len(qk.input) != 2 or len(qk.output) != 1:
+            skipped["no_qk_or_mask"] = skipped.get("no_qk_or_mask", 0) + 1
+            continue
+
+        q_mul = prod.get(qk.input[0])
+        k_mul = prod.get(qk.input[1])
+        q_parts = _split_scaled_mul(q_mul, prod)
+        k_parts = _split_scaled_mul(k_mul, prod)
+        if q_parts is None or k_parts is None:
+            skipped["scaled_mul_not_matched"] = skipped.get("scaled_mul_not_matched", 0) + 1
+            continue
+        q_name, _q_scale = q_parts
+        k_transposed_name, _k_scale = k_parts
+        k_name = _trace_untranspose_k(k_transposed_name, prod)
+        if k_name is None:
+            skipped["k_untranspose_not_matched"] = skipped.get("k_untranspose_not_matched", 0) + 1
+            continue
+
+        av_consumers = [node for node in consumers.get(sm_out, [])
+                        if node.op_type == "MatMul" and len(node.input) == 2]
+        if len(av_consumers) != 1:
+            skipped["av_consumer_count"] = skipped.get("av_consumer_count", 0) + 1
+            continue
+        av = av_consumers[0]
+        if av.input[0] != sm_out:
+            skipped["av_softmax_not_first_input"] = skipped.get("av_softmax_not_first_input", 0) + 1
+            continue
+        v_name = av.input[1]
+        if len(av.output) != 1:
+            skipped["av_output_count"] = skipped.get("av_output_count", 0) + 1
+            continue
+        out_name = av.output[0]
+
+        base = av.name or softmax.name or out_name
+        q_fp16 = unique(out_name + "_attention_q_fp16")
+        k_fp16 = unique(out_name + "_attention_k_fp16")
+        v_fp16 = unique(out_name + "_attention_v_fp16")
+        mask_fp16 = unique(out_name + "_attention_mask_fp16")
+        y_fp16 = unique(out_name + "_attention_y_fp16")
+
+        new_nodes = [
+            helper.make_node("Cast", [q_name], [q_fp16],
+                             name=base + "/CastQTofp16", to=TensorProto.BFLOAT16),
+            helper.make_node("Cast", [k_name], [k_fp16],
+                             name=base + "/CastKTofp16", to=TensorProto.BFLOAT16),
+            helper.make_node("Cast", [v_name], [v_fp16],
+                             name=base + "/CastVTofp16", to=TensorProto.BFLOAT16),
+            helper.make_node("Cast", [mask], [mask_fp16],
+                             name=base + "/CastMaskTofp16", to=TensorProto.BFLOAT16),
+            helper.make_node(
+                "Attention",
+                [q_fp16, k_fp16, v_fp16, mask_fp16],
+                [y_fp16],
+                name=base + "/Attentionfp16",
+                scale=0.08838834764831845,  # 1/sqrt(128) for head_dim=128
+                is_causal=0,
+            ),
+            helper.make_node("Cast", [y_fp16], [out_name],
+                             name=base + "/CastAttentionOutputToFP32",
+                             to=TensorProto.FLOAT),
+        ]
+        replacements[av.name] = new_nodes
+        remove_node_names.update({softmax.name, add.name, qk.name, av.name})
+        # Q/K scaling nodes become dead after QK removal; remove when uniquely named.
+        if q_mul is not None:
+            remove_node_names.add(q_mul.name)
+        if k_mul is not None:
+            remove_node_names.add(k_mul.name)
+        rewritten.append({"softmax": softmax.name, "qk": qk.name,
+                          "av": av.name, "output": out_name})
+
+    if not rewritten:
+        return {"rewritten": 0, "skipped": dict(skipped)}
+
+    new_graph_nodes = []
+    for node in model.graph.node:
+        if node.name in replacements:
+            new_graph_nodes.extend(replacements[node.name])
+            continue
+        if node.name in remove_node_names:
+            continue
+        new_graph_nodes.append(node)
+    del model.graph.node[:]
+    model.graph.node.extend(new_graph_nodes)
+    _attn_ensure_main_opset(model, 23)
+    return {"rewritten": len(rewritten), "examples": rewritten[:8], "skipped": dict(skipped)}
+
+
 def _w8a8_rewrite_dispatch(model, quant_report: dict) -> dict:
     """Emit the fused ``ConvRotInt8Linear`` custom op for every w8a8 site.
 
@@ -1944,6 +2292,176 @@ def _w8a8_rewrite_dispatch(model, quant_report: dict) -> dict:
     launch — a direct port of the ComfyUI-INT8-Fast Triton kernel.
     """
     return _rewrite_w8a8_weight_ops_with_plugin(model, quant_report)
+
+
+def _cast_attr_to_dtype(onnx, node) -> int | None:
+    for attr in node.attribute:
+        if attr.name == "to" and attr.type == onnx.AttributeProto.INT:
+            return int(attr.i)
+    return None
+
+
+def _string_attr(node, name: str, default: str = "") -> str:
+    import onnx
+
+    for attr in node.attribute:
+        if attr.name == name and attr.type == onnx.AttributeProto.STRING:
+            return attr.s.decode("utf-8", errors="replace")
+    return default
+
+
+def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_name: str = "FP16") -> dict:
+    """Make TensorRT strongly-typed elementwise islands agree on the plugin lowp dtype.
+
+    ConvRotInt8Linear v2 emits FP16 by default and can be switched to BF16 for
+    overflow testing. In a strongly typed TRT network, elementwise nodes such as
+    Add/Mul are not allowed to mix FP32 and lowp tensors. This pass propagates
+    the target lowp dtype through dtype-preserving ONNX ops and inserts casts
+    only on the non-lowp side of mixed arithmetic islands.
+    """
+    import onnx
+    from onnx import TensorProto, helper
+
+    target_dtype_name = target_dtype_name.upper()
+    target_tensorproto = _onnx_dtype_for_plugin_boundary(TensorProto, target_dtype_name)
+    lowp = set(seed_lowp_tensors)
+    for init in model.graph.initializer:
+        if init.data_type == target_tensorproto:
+            lowp.add(init.name)
+
+    same_type_ops = {
+        "Add", "Sub", "Mul", "Div", "Pow", "Max", "Min", "Mean",
+    }
+    unary_preserve_ops = {
+        "Abs", "Acos", "Acosh", "Asin", "Asinh", "Atan", "Atanh",
+        "Ceil", "Cos", "Cosh", "Elu", "Erf", "Exp", "Floor", "Gelu",
+        "HardSigmoid", "LeakyRelu", "Log", "Neg", "Reciprocal", "Relu",
+        "Round", "Selu", "Sigmoid", "Sin", "Sinh", "Softmax", "Sqrt",
+        "Tan", "Tanh", "ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin",
+        "ReduceProd", "ReduceL2",
+    }
+    data_movement_ops = {
+        "Identity", "Reshape", "Transpose", "Squeeze", "Unsqueeze", "Slice",
+        "Gather", "GatherElements", "GatherND", "Flatten", "Expand", "Tile",
+        "Pad", "DepthToSpace", "SpaceToDepth",
+        # PyTorch export commonly lowers chunk()/getitem() through sequence ops;
+        # the TensorRT compatibility pass later rewrites these to Split, so the
+        # FP16 propagation pass must understand both forms.
+        "Split", "SplitToSequence", "SequenceAt",
+    }
+    matmul_like_ops = {"MatMul", "Gemm"}
+
+    inserted = []
+    new_nodes = []
+    used_names = {name for node in model.graph.node for name in list(node.input) + list(node.output) if name}
+    used_names.update(init.name for init in model.graph.initializer)
+
+    def unique_name(base: str) -> str:
+        base = base.replace(" ", "_")
+        candidate = base
+        idx = 0
+        while candidate in used_names:
+            idx += 1
+            candidate = f"{base}_{idx}"
+        used_names.add(candidate)
+        return candidate
+
+    def cast_to_lowp(tensor_name: str, node_name: str, input_index: int) -> str:
+        if tensor_name in lowp:
+            return tensor_name
+        suffix = target_dtype_name.lower()
+        cast_out = unique_name(f"{tensor_name}_to_{suffix}_for_{node_name}_{input_index}")
+        cast_node = helper.make_node(
+            "Cast",
+            [tensor_name],
+            [cast_out],
+            name=unique_name(f"{node_name}/CastInput{input_index}To{target_dtype_name}"),
+            to=target_tensorproto,
+        )
+        new_nodes.append(cast_node)
+        lowp.add(cast_out)
+        inserted.append({"node": cast_node.name, "input": tensor_name, "output": cast_out})
+        return cast_out
+
+    def clone_with_inputs(node, inputs):
+        cloned = onnx.NodeProto()
+        cloned.CopyFrom(node)
+        del cloned.input[:]
+        cloned.input.extend(inputs)
+        return cloned
+
+    for node in model.graph.node:
+        node_name = node.name or (node.output[0] if node.output else node.op_type)
+
+        if node.op_type == "Cast":
+            new_nodes.append(node)
+            if _cast_attr_to_dtype(onnx, node) == target_tensorproto:
+                lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type == "ConvRotInt8Linear":
+            new_nodes.append(node)
+            if _string_attr(node, "output_dtype", "FP16").upper() == target_dtype_name:
+                lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type in same_type_ops and any(i in lowp for i in node.input if i):
+            patched_inputs = [cast_to_lowp(i, node_name, idx) if i and i not in lowp else i
+                              for idx, i in enumerate(node.input)]
+            new_nodes.append(clone_with_inputs(node, patched_inputs))
+            lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type == "Concat" and any(i in lowp for i in node.input if i):
+            patched_inputs = [cast_to_lowp(i, node_name, idx) if i and i not in lowp else i
+                              for idx, i in enumerate(node.input)]
+            new_nodes.append(clone_with_inputs(node, patched_inputs))
+            lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type == "Where" and len(node.input) >= 3 and any(i in lowp for i in node.input[1:3] if i):
+            patched_inputs = list(node.input)
+            for idx in (1, 2):
+                if patched_inputs[idx] and patched_inputs[idx] not in lowp:
+                    patched_inputs[idx] = cast_to_lowp(patched_inputs[idx], node_name, idx)
+            new_nodes.append(clone_with_inputs(node, patched_inputs))
+            lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type == "Clip" and node.input and node.input[0] in lowp:
+            patched_inputs = list(node.input)
+            for idx in range(1, len(patched_inputs)):
+                if patched_inputs[idx] and patched_inputs[idx] not in lowp:
+                    patched_inputs[idx] = cast_to_lowp(patched_inputs[idx], node_name, idx)
+            new_nodes.append(clone_with_inputs(node, patched_inputs))
+            lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type in matmul_like_ops and any(i in lowp for i in node.input if i):
+            patched_inputs = [cast_to_lowp(i, node_name, idx) if i and i not in lowp else i
+                              for idx, i in enumerate(node.input)]
+            new_nodes.append(clone_with_inputs(node, patched_inputs))
+            lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type in unary_preserve_ops and node.input and node.input[0] in lowp:
+            new_nodes.append(node)
+            lowp.update(o for o in node.output if o)
+            continue
+
+        if node.op_type in data_movement_ops and node.input and node.input[0] in lowp:
+            new_nodes.append(node)
+            lowp.update(o for o in node.output if o)
+            continue
+
+        new_nodes.append(node)
+
+    del model.graph.node[:]
+    model.graph.node.extend(new_nodes)
+    return {
+        "lowp_boundary_casts_inserted": inserted,
+        "lowp_tensor_count": len(lowp),
+    }
 
 
 def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
@@ -2027,6 +2545,10 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
     rewritten = []
     new_nodes: list = []
     consumed_matmul_outputs: set[str] = set()
+    lowp_plugin_outputs: set[str] = set()
+    boundary_dtype = _w8a8_plugin_boundary_dtype()
+    boundary_tensorproto = _onnx_dtype_for_plugin_boundary(TensorProto, boundary_dtype)
+    cast_nodes_inserted = []
 
     for node in model.graph.node:
         # Skip nodes whose output has already been consumed by a previous
@@ -2126,32 +2648,67 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
         do_convrot = bool(rotated_by_name.get(weight_source, False)) and in_features % group_size == 0
         plugin_group_size = int(group_size) if do_convrot else 0
 
+        # v2 plugin I/O contract: FP16 by default. Set
+        # HOTSTEP_W8A8_PLUGIN_IO_DTYPE=BF16 to test a BF16 activation path; in
+        # that mode proj_out also remains BF16 so the plugin output is BF16 too.
+        input_dtype = boundary_dtype
+        output_dtype = boundary_dtype if boundary_dtype == "BF16" else ("FP32" if "proj_out" in weight_source else boundary_dtype)
+
+        plugin_x_name = x_name
+        if input_dtype != "FP32" and x_name not in lowp_plugin_outputs:
+            plugin_x_name = f"{out}_convrot_x_{input_dtype.lower()}"
+            cast_node = helper.make_node(
+                "Cast",
+                [x_name],
+                [plugin_x_name],
+                name=f"{node_name}/CastInputTo{input_dtype}",
+                to=boundary_tensorproto,
+            )
+            new_nodes.append(cast_node)
+            cast_nodes_inserted.append({"node": cast_node.name, "to": input_dtype, "reason": "plugin_input"})
+
+        # Sane quantization rule: folded 1D bias tensors stay FP32. The plugin
+        # epilogue reads FP32 bias regardless of activation/output boundary dtype.
+        plugin_bias_name = bias_name
+
         custom_node = _make_node(
             helper_module=helper,
             tensor_proto_module=TensorProto,
-            x_name=x_name,
+            x_name=plugin_x_name,
             weight_q_name=weight_source,
             weight_scale_name=quant_report["scale_names"][weight_source],
             H_name=H_name,
-            bias_name=bias_name,
+            bias_name=plugin_bias_name,
             output_name=out,
             node_name=f"{node_name}/ConvRotInt8Linear",
             group_size=plugin_group_size,
             in_features=in_features,
             out_features=out_features,
             has_bias=has_bias,
+            input_dtype=input_dtype,
+            output_dtype=output_dtype,
+            preferred_format="HWC8",
         )
         new_nodes.append(custom_node)
+        if output_dtype == boundary_dtype and boundary_dtype != "FP32":
+            lowp_plugin_outputs.add(out)
         rewritten.append({
             "op_type": node.op_type,
             "node": node.name,
             "weights": [weight_source],
             "plugin": _OP_NAME,
             "convrot_applied": do_convrot,
+            "input_dtype": input_dtype,
+            "output_dtype": output_dtype,
         })
 
     del model.graph.node[:]
     model.graph.node.extend(new_nodes)
+    fp16_island_report = (
+        _rewrite_w8a8_fp16_islands(model, lowp_plugin_outputs, boundary_dtype)
+        if boundary_dtype != "FP32"
+        else {"lowp_boundary_casts_inserted": [], "lowp_tensor_count": 0}
+    )
     return {
         "rewritten_nodes": rewritten,
         "plugin_op": _OP_NAME,
@@ -2159,6 +2716,10 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
         "convrot_rotated_weights": sum(1 for v in rotated_by_name.values() if v),
         "convrot_group_size": group_size,
         "convrot_h_name": H_name,
+        "casts_inserted": cast_nodes_inserted,
+        "fp16_plugin_outputs": sorted(lowp_plugin_outputs),
+        "plugin_boundary_dtype": boundary_dtype,
+        "fp16_island_rewrite": fp16_island_report,
     }
 
 

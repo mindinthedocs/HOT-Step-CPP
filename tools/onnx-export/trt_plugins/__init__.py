@@ -15,8 +15,8 @@ Build-time flow
    site). See ``_rewrite_w8a8_weight_ops_with_plugin`` in export_dit.py.
 2. ``build-trt-engine.py --precision-policy w8a8`` parses the ONNX with
    TRT's OnnxParser. The parser looks up the custom op in TRT's plugin
-   registry — the registry entry was created by the static
-   ``REGISTER_TENSORRT_PLUGIN`` macro in
+   registry — the registry entry is created by the explicit
+   ``hotstep_register_plugins()`` entry point in
    ``engine/src/plugins/convrot_int8_linear_plugin.cpp``.
 3. TRT compiles the graph (including the plugin) into a serialized
    engine. The plugin kernel is JIT-compiled to PTX/CUBIN by TRT's
@@ -31,7 +31,13 @@ ONNX custom-op identity
   * op_type: ``ConvRotInt8Linear``
   * inputs: [x, weight_q, weight_scale, H, (bias)]
   * outputs: [y]
-  * attributes: group_size, in_features, out_features, has_bias
+  * attributes: group_size, in_features, out_features, has_bias,
+    input_dtype, output_dtype, plugin_version, plugin_namespace, preferred_format
+
+The v2 contract defaults to FP16 plugin I/O. Kernel-side tactic and layout
+optimizations are intentionally decoupled from ONNX export: the ONNX node emits
+the stable dtype/shape contract once, and TRT selects any current or future
+plugin tactic during engine build.
 
 When ``tensorrt`` is not installed (unit-test environments), the
 ``register_plugins()`` function returns False and the NumPy reference
@@ -42,6 +48,7 @@ exercised. The reference mirrors the C++ kernel math exactly.
 from .convrot_int8_plugin import (
     CONVROT_INT8_LINEAR_OP_NAME,
     CONVROT_INT8_LINEAR_OP_NAMESPACE,
+    CONVROT_INT8_LINEAR_PLUGIN_VERSION,
     conv_rot_int8_linear_reference,
     make_convrot_int8_linear_onnx_node,
     register_plugins,
@@ -51,6 +58,7 @@ from .convrot_int8_plugin import (
 __all__ = [
     "CONVROT_INT8_LINEAR_OP_NAME",
     "CONVROT_INT8_LINEAR_OP_NAMESPACE",
+    "CONVROT_INT8_LINEAR_PLUGIN_VERSION",
     "conv_rot_int8_linear_reference",
     "make_convrot_int8_linear_onnx_node",
     "register_plugins",

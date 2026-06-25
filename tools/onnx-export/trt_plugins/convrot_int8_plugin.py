@@ -23,9 +23,9 @@ custom op:
   2. Per-row dynamic INT8 quantization of x_rot
   3. INT8 × INT8 → INT32 matmul against the pre-rotated, per-output-channel
      INT8 weight
-  4. Dequantize to FP32 via the per-row activation scale and
-     per-output-channel weight scale
-  5. Add bias (if present)
+  4. Dequantize via the per-row activation scale and per-output-channel
+     weight scale
+  5. Add bias (if present) and return FP16 by default
 
 The kernel is a direct port of the ComfyUI-INT8-Fast Triton kernel
 (``int8_fused_kernel.triton_int8_linear_per_row`` + ``convrot.rotate_activation``)
@@ -37,12 +37,12 @@ Op signature
 ::
 
     ConvRotInt8Linear(
-        x            : FP32[..., in_features]            # activation
+        x            : FP16[..., in_features]            # activation (default)
         weight_q     : INT8[out_features, in_features]   # ConvRot-rotated, per-channel INT8
         weight_scale : FP32[out_features]                # per-output-channel symmetric scale
-        H            : FP32[group_size, group_size]      # shared regular Hadamard matrix
-        bias         : FP32[out_features] (optional)     # additive bias
-    ) -> FP32[..., out_features]
+        H            : FP16[group_size, group_size]      # shared regular Hadamard matrix
+        bias         : FP32[out_features] (optional)     # additive bias; 1D tensors stay FP32
+    ) -> FP16[..., out_features]
 
 Attributes (carried as ONNX op attributes, surfaced to the plugin at build
 time):
@@ -51,6 +51,9 @@ time):
   * ``in_features``  : int   — K dimension of the matmul
   * ``out_features`` : int   — N dimension of the matmul
   * ``has_bias``     : bool  — whether the bias input is present
+  * ``input_dtype``  : str   — ``FP16`` by default, ``FP32`` fallback
+  * ``output_dtype`` : str   — ``FP16`` by default, ``FP32`` fallback
+  * ``preferred_format`` : str — layout hint for future packed-format kernels
 
 Fusion notes
 ------------
@@ -63,10 +66,12 @@ pipeline emits (e.g. a final Cast to FP32 to satisfy the graph I/O
 policy) will fuse with the plugin's output naturally via TRT's
 pointwise fusion.
 
-The plugin supports only ``kLINEAR`` format (no vectorized layouts)
-because the ConvRot rotation requires element-wise access patterns that
-don't align with HWNC/CHWN32 etc. TensorRT will still tile the GEMM
-internally via cuBLASLt INT8 paths.
+The v2 ONNX contract is independent of kernel optimization choices: the graph
+emits dtype and layout-preference attributes once, while TensorRT chooses plugin
+tactics during engine build. The current C++ kernel accepts contiguous
+``kLINEAR`` tensors and exposes a stable tactic surface; future packed-format
+kernels can consume the existing ``preferred_format`` attribute without another
+ONNX rewrite.
 """
 
 from __future__ import annotations
@@ -82,6 +87,7 @@ import numpy as np
 # op and by build-trt-engine.py when verifying the plugin is registered.
 CONVROT_INT8_LINEAR_OP_NAMESPACE = "hotstep"
 CONVROT_INT8_LINEAR_OP_NAME = "ConvRotInt8Linear"
+CONVROT_INT8_LINEAR_PLUGIN_VERSION = "2"
 
 # Module-level flag set by register_plugins(). Used by is_registered() to
 # avoid re-registering on every call (TRT logs a warning otherwise).
@@ -102,6 +108,7 @@ def conv_rot_int8_linear_reference(
     in_features: int,
     out_features: int,
     has_bias: bool,
+    output_dtype: str = "FP16",
 ) -> np.ndarray:
     """NumPy reference implementation of the ConvRotInt8Linear op.
 
@@ -136,7 +143,8 @@ def conv_rot_int8_linear_reference(
         has_bias: Whether the bias input is present (must match the bias arg).
 
     Returns:
-        FP32 output, shape ``[..., out_features]``.
+        Output with dtype selected by ``output_dtype`` (FP16 by default), shape
+        ``[..., out_features]``.
     """
     if x.shape[-1] != in_features:
         raise ValueError(
@@ -208,27 +216,37 @@ def conv_rot_int8_linear_reference(
         bias_f32 = np.ascontiguousarray(bias, dtype=np.float32)
         out_2d = out_2d + bias_f32.reshape(1, out_features)
 
-    # Reshape back to [..., out_features].
-    return out_2d.reshape(*orig_shape[:-1], out_features)
+    # Reshape back to [..., out_features] and apply the v2 plugin output
+    # contract. Accumulation and scaling stay FP32; only the boundary tensor
+    # is narrowed, matching the CUDA epilogue.
+    out = out_2d.reshape(*orig_shape[:-1], out_features)
+    if output_dtype.upper() in {"FP16", "FLOAT16", "HALF"}:
+        return out.astype(np.float16)
+    if output_dtype.upper() in {"FP32", "FLOAT", "FLOAT32"}:
+        return out.astype(np.float32)
+    raise ValueError(f"unsupported output_dtype {output_dtype!r}; expected FP16 or FP32")
 
 
 def _find_plugin_library() -> str | None:
     """Locate the hotstep_plugins shared library on disk.
 
-    Search order:
-      1. Same directory as this Python file (editable install / dev)
-      2. ``engine/build/`` relative to the repo root (CMake build dir)
-      3. ``engine/buildcuda/`` (alternative CMake build dir)
-      4. ``PATH`` / ``LD_LIBRARY_PATH`` (system paths)
-    Returns the path as a string, or None if not found.
+    This function is used by the Python TensorRT engine builder before parsing
+    a w8a8 ONNX graph. Be deliberately generous about build layouts: Windows
+    users may build from ``engine/buildcuda.cmd`` (``engine/build``), from an IDE
+    multi-config directory (``Release/`` or ``Debug/``), or place the DLL on
+    ``PATH``. ``ctypes.util.find_library`` is not reliable for arbitrary DLLs on
+    Windows, so PATH is scanned explicitly.
+
+    Environment overrides:
+      * ``HOTSTEP_PLUGIN_LIBRARY`` — full path to the DLL/.so/.dylib
+      * ``HOTSTEP_PLUGINS_PATH`` — one or more directories/files (os.pathsep)
     """
     import ctypes.util
-    import glob
 
     this_dir = Path(__file__).resolve().parent
-    # Walk up to find the repo root (directory containing engine/)
+    # Walk up to find the repo root (directory containing engine/).
     repo_root = this_dir
-    for _ in range(6):
+    for _ in range(8):
         if (repo_root / "engine" / "CMakeLists.txt").is_file():
             break
         repo_root = repo_root.parent
@@ -240,28 +258,88 @@ def _find_plugin_library() -> str | None:
     else:
         lib_name = "libhotstep_plugins.so"
 
-    # Candidate directories to search
-    candidates = [
-        this_dir,                          # same dir as this .py
-        repo_root / "engine" / "build",    # standard CMake build dir
-        repo_root / "engine" / "buildcuda",# alternative build dir
-    ]
-    # Also add any directory from the TRT bin/ path if TENSORRT_ROOT is set
-    trt_root = os.environ.get("TENSORRT_ROOT", os.environ.get("TRT_ROOT", ""))
-    if trt_root:
-        candidates.append(Path(trt_root) / "bin")
-
-    for d in candidates:
-        p = d / lib_name
+    # Exact-file override.
+    explicit = os.environ.get("HOTSTEP_PLUGIN_LIBRARY", "").strip()
+    if explicit:
+        p = Path(explicit)
         if p.is_file():
             return str(p)
-        # On Windows, CMake may put DLLs in Release/ or Debug/ subdirs
-        for sub in ("Release", "Debug", ""):
-            hit = d / sub / lib_name
+
+    candidates: list[Path] = []
+
+    def add_candidate(path_like) -> None:
+        if not path_like:
+            return
+        try:
+            p = Path(path_like)
+        except TypeError:
+            return
+        if p not in candidates:
+            candidates.append(p)
+
+    # Directory/file override list.
+    for entry in os.environ.get("HOTSTEP_PLUGINS_PATH", "").split(os.pathsep):
+        if entry:
+            add_candidate(entry)
+
+    # Common in-tree build/output directories.
+    for d in (
+        this_dir,
+        repo_root / "engine" / "build",
+        repo_root / "engine" / "buildcuda",
+        repo_root / "engine" / "build-cuda",
+        repo_root / "engine" / "build-trt",
+        repo_root / "build",
+        repo_root / "buildcuda",
+        repo_root / "build-trt",
+        Path.cwd(),
+    ):
+        add_candidate(d)
+
+    # TRT/CUDA and process library search paths.
+    trt_root = os.environ.get("TENSORRT_ROOT", os.environ.get("TRT_ROOT", ""))
+    if trt_root:
+        for sub in ("bin", "lib", "lib64", ""):
+            add_candidate(Path(trt_root) / sub if sub else Path(trt_root))
+
+    path_env = "PATH" if sys.platform == "win32" else "LD_LIBRARY_PATH"
+    for entry in os.environ.get(path_env, "").split(os.pathsep):
+        if entry:
+            add_candidate(entry)
+
+    # Direct checks plus common config subdirectories. If a candidate itself is
+    # a file, accept it only if it has the expected library basename.
+    subdirs = ("", "Release", "Debug", "RelWithDebInfo", "MinSizeRel", "bin", "lib", "lib64")
+    for d in candidates:
+        if d.is_file() and d.name == lib_name:
+            return str(d)
+        if not d.is_dir():
+            continue
+        for sub in subdirs:
+            hit = (d / sub / lib_name) if sub else (d / lib_name)
             if hit.is_file():
                 return str(hit)
 
-    # Last resort: let the OS find it via PATH / LD_LIBRARY_PATH
+    # Bounded recursive fallback under likely local build roots. This catches
+    # multi-config generators that append extra target/config directories while
+    # avoiding a full repository scan unless the directory exists.
+    recursive_roots = [
+        repo_root / "engine" / "build",
+        repo_root / "engine" / "buildcuda",
+        repo_root / "engine" / "build-cuda",
+        repo_root / "build",
+    ]
+    for root in recursive_roots:
+        if root.is_dir():
+            try:
+                for hit in root.rglob(lib_name):
+                    if hit.is_file():
+                        return str(hit)
+            except OSError:
+                pass
+
+    # Last resort: let the OS/Python try to resolve it. On Windows this often
+    # returns None for project-local DLLs, hence the explicit PATH scan above.
     sys_name = ctypes.util.find_library("hotstep_plugins")
     if sys_name:
         return sys_name
@@ -393,6 +471,15 @@ def is_registered() -> bool:
 # ONNX custom-op emission helpers
 # =============================================================================
 
+def _dtype_attr_id(tensor_proto_module, dtype: str) -> int:
+    value = str(dtype).upper()
+    if value in {"BF16", "BFLOAT16"}:
+        return tensor_proto_module.BFLOAT16
+    if value in {"FP32", "FLOAT", "FLOAT32"}:
+        return tensor_proto_module.FLOAT
+    return tensor_proto_module.FLOAT16
+
+
 def make_convrot_int8_linear_onnx_node(
     helper_module,
     tensor_proto_module,
@@ -407,13 +494,19 @@ def make_convrot_int8_linear_onnx_node(
     in_features: int,
     out_features: int,
     has_bias: bool,
+    input_dtype: str = "FP16",
+    output_dtype: str = "FP16",
+    preferred_format: str = "HWC8",
 ):
     """Build an ONNX custom-op node that maps to the ConvRotInt8Linear plugin.
 
     The node uses domain ``hotstep`` and op type ``ConvRotInt8Linear``. The
     build-time constants (group_size, in_features, out_features, has_bias)
     are carried as ONNX attributes so the TRT plugin creator can read them
-    at parse time via the PluginFieldCollection.
+    at parse time via the PluginFieldCollection. TensorRT's fallback plugin
+    importer does not use the ONNX domain opset as the plugin version, so the
+    v2 creator version/namespace are also emitted explicitly as
+    ``plugin_version`` and ``plugin_namespace`` attributes.
 
     Args:
         helper_module: ``onnx.helper`` module (passed in to avoid a hard
@@ -423,6 +516,9 @@ def make_convrot_int8_linear_onnx_node(
             output_name, node_name: ONNX tensor / node names.
         group_size, in_features, out_features: build-time constants.
         has_bias: whether the bias input is present.
+        input_dtype: activation/H dtype requested from the plugin. Bias remains FP32.
+        output_dtype: output dtype requested from the plugin (FP16 by default).
+        preferred_format: layout hint reserved for future packed-format kernels.
 
     Returns:
         An ``onnx.NodeProto`` for the custom op.
@@ -436,6 +532,19 @@ def make_convrot_int8_linear_onnx_node(
         "in_features": int(in_features),
         "out_features": int(out_features),
         "has_bias": int(1 if has_bias else 0),
+        "input_dtype": str(input_dtype).upper(),
+        "output_dtype": str(output_dtype).upper(),
+        # Redundant integer dtype attrs make TensorRT PluginField parsing
+        # robust across parser builds that report string attrs differently.
+        # Values are ONNX TensorProto enum IDs: FLOAT=1, FLOAT16=10.
+        "input_dtype_id": _dtype_attr_id(tensor_proto_module, input_dtype),
+        "output_dtype_id": _dtype_attr_id(tensor_proto_module, output_dtype),
+        # TensorRT ONNX parser fallback-plugin lookup keys. Without these it
+        # defaults to plugin version "1" and empty namespace, which cannot find
+        # the v2 creator registered as (ConvRotInt8Linear, "2", "hotstep").
+        "plugin_version": CONVROT_INT8_LINEAR_PLUGIN_VERSION,
+        "plugin_namespace": CONVROT_INT8_LINEAR_OP_NAMESPACE,
+        "preferred_format": str(preferred_format).upper(),
     }
 
     return helper_module.make_node(

@@ -85,6 +85,97 @@ def require_builder_flag(trt, config, flag_name: str) -> bool:
     return True
 
 
+def _trt_enum_member(enum_cls, name: str):
+    """Resolve TensorRT Python enum member across naming variants.
+
+    C++ headers use kFAST/kNONE style, while Python bindings usually expose
+    FAST/NONE. Some point releases expose __members__, some don't.
+    """
+    if enum_cls is None:
+        return None
+    candidates = [name, name.upper(), "k" + name.upper(), name.lower()]
+    for cand in candidates:
+        if hasattr(enum_cls, cand):
+            return getattr(enum_cls, cand)
+    members = getattr(enum_cls, "__members__", {}) or {}
+    for cand in candidates:
+        if cand in members:
+            return members[cand]
+    return None
+
+
+def configure_max_aux_streams(config, value: int) -> bool:
+    """Set TensorRT maximum auxiliary streams robustly across Python APIs."""
+    if value < 0:
+        raise SystemExit("--max-aux-streams must be >= 0")
+    # TRT Python historically exposes both properties and snake_case setters
+    # depending on version. Try explicit setter first because it returns a bool
+    # in C++ and may validate the value.
+    for method_name in ("set_max_aux_streams", "setMaxAuxStreams"):
+        method = getattr(config, method_name, None)
+        if method is not None:
+            ok = method(int(value))
+            if ok is False:
+                raise SystemExit(f"TensorRT rejected max aux streams value {value}")
+            return True
+    for prop_name in ("max_aux_streams", "maxAuxStreams"):
+        if hasattr(config, prop_name):
+            setattr(config, prop_name, int(value))
+            return True
+    return False
+
+
+def configure_tiling_optimization(trt, config, level_name: str) -> tuple[bool, str]:
+    """Set TensorRT tiling optimization level if the API exposes it."""
+    requested = (level_name or "none").strip().lower().replace("-", "_")
+    aliases = {
+        "off": "none",
+        "0": "none",
+        "1": "fast",
+        "2": "moderate",
+        "3": "full",
+    }
+    requested = aliases.get(requested, requested)
+    valid = {"none", "fast", "moderate", "full"}
+    if requested not in valid:
+        raise SystemExit(f"--tiling-level must be one of {sorted(valid)}, got {level_name!r}")
+
+    enum_cls = getattr(trt, "TilingOptimizationLevel", None)
+    level = _trt_enum_member(enum_cls, requested)
+    if level is None:
+        if requested != "none":
+            print("[TRT Build] WARNING: TensorRT Python API does not expose TilingOptimizationLevel; "
+                  f"cannot set requested tiling level {requested!r}.")
+        return False, "unsupported"
+
+    for method_name in ("set_tiling_optimization_level", "setTilingOptimizationLevel"):
+        method = getattr(config, method_name, None)
+        if method is not None:
+            ok = method(level)
+            if ok is False:
+                raise SystemExit(f"TensorRT rejected tiling optimization level {requested!r}")
+            return True, requested
+    for prop_name in ("tiling_optimization_level", "tilingOptimizationLevel"):
+        if hasattr(config, prop_name):
+            setattr(config, prop_name, level)
+            return True, requested
+
+    if requested != "none":
+        print("[TRT Build] WARNING: TensorRT Python API exposes TilingOptimizationLevel "
+              "but not a setter/property on IBuilderConfig.")
+    return False, "unsupported"
+
+
+def get_config_value(config, *names, default=None):
+    for name in names:
+        if hasattr(config, name):
+            try:
+                return getattr(config, name)
+            except Exception:
+                pass
+    return default
+
+
 def network_bindings(network) -> list[dict]:
     bindings: list[dict] = []
     for i in range(network.num_inputs):
@@ -258,8 +349,10 @@ def build_engine(args) -> tuple[Path, Path, Path]:
                 raise SystemExit(
                     "trt_plugins.register_plugins() failed — the hotstep_plugins "
                     "C++ shared library (.dll/.so) could not be loaded. "
-                    "Build it first (engine/buildcuda.cmd) and ensure it's on "
-                    "PATH or in engine/build/ or engine/buildcuda/."
+                    "Build it first with TensorRT enabled (set TRT_ROOT or "
+                    "TENSORRT_ROOT, then run engine/buildcuda.cmd). The builder "
+                    "searches engine/build*, PATH/LD_LIBRARY_PATH, and the "
+                    "HOTSTEP_PLUGIN_LIBRARY or HOTSTEP_PLUGINS_PATH overrides."
                 )
         print(f"[TRT Build] Registered HOT-Step plugin: {CONVROT_INT8_LINEAR_OP_NAME}")
 
@@ -275,6 +368,17 @@ def build_engine(args) -> tuple[Path, Path, Path]:
         config.builder_optimization_level = args.builder_optimization_level
     if args.workspace_gb > 0:
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(args.workspace_gb * (1024**3)))
+
+    max_aux_streams_set = configure_max_aux_streams(config, args.max_aux_streams)
+    if max_aux_streams_set:
+        print(f"[TRT Build] Max auxiliary streams: {args.max_aux_streams}")
+    else:
+        print("[TRT Build] WARNING: TensorRT Python API does not expose max auxiliary stream control.")
+
+    tiling_set, tiling_level_effective = configure_tiling_optimization(trt, config, args.tiling_level)
+    if tiling_set:
+        print(f"[TRT Build] Tiling optimization level: {tiling_level_effective}")
+
     refit_identical_enabled = require_builder_flag(trt, config, "REFIT_IDENTICAL")
     weight_streaming_enabled = False
     if args.weight_streaming:
@@ -306,6 +410,22 @@ def build_engine(args) -> tuple[Path, Path, Path]:
     # ─────────────────────────────────────────────────────────────────────────
 
     add_profile(builder, config, network, trt, args.profile)
+
+    tactic_sources = None
+    try:
+        tactic_sources = config.get_tactic_sources()
+    except Exception:
+        pass
+    try:
+        workspace_limit = config.get_memory_pool_limit(trt.MemoryPoolType.WORKSPACE)
+    except Exception:
+        workspace_limit = None
+    print(f"[TRT Build] Builder optimization level: {args.builder_optimization_level}")
+    if workspace_limit is not None:
+        print(f"[TRT Build] Workspace pool: {workspace_limit / (1024**3):.2f} GiB")
+    if tactic_sources is not None:
+        print(f"[TRT Build] Tactic sources bitset: {tactic_sources}")
+    print(f"[TRT Build] Profiling verbosity: DETAILED")
 
     # The ONNX graph carries the precision policy through typed initializers
     # and Cast nodes. TensorRT 11 removed blanket per-precision builder flags.
@@ -371,6 +491,11 @@ def build_engine(args) -> tuple[Path, Path, Path]:
         "global_bf16_builder_flag": False,
         "workspace_gb": args.workspace_gb,
         "builder_optimization_level": args.builder_optimization_level,
+        "max_aux_streams": args.max_aux_streams,
+        "max_aux_streams_set": max_aux_streams_set,
+        "tiling_level": args.tiling_level,
+        "tiling_level_effective": tiling_level_effective,
+        "tiling_level_set": tiling_set,
         "strip_plan": False,
         "refit_identical": refit_identical_enabled,
         "weight_streaming": weight_streaming_enabled,
@@ -391,6 +516,10 @@ def main() -> int:
     parser.add_argument("--workspace-gb", type=float, default=3,
                         help="Workspace size in GB (default: 3). w8a8 DiT builds need ~5GB.")
     parser.add_argument("--builder-optimization-level", type=int, default=5, choices=range(0, 6), metavar="{0..5}")
+    parser.add_argument("--max-aux-streams", type=int, default=0,
+                        help="Maximum TensorRT auxiliary streams. Default 0 minimizes activation memory on small GPUs.")
+    parser.add_argument("--tiling-level", choices=["none", "fast", "moderate", "full"], default="FULL",
+                        help="TensorRT 11 tiling optimization level. Default 'fast' enables on-chip caching search with modest build-time cost.")
     parser.add_argument("--strip-plan", action="store_true", default=False,
                         help="(Deprecated, ignored) Engines now always embed weights.")
     parser.add_argument("--no-strip-plan", action="store_false", dest="strip_plan")
