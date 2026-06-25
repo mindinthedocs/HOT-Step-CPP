@@ -29,6 +29,7 @@
 #include <cuda_runtime.h>
 #include "NvInfer.h"
 #include "NvInferPluginBase.h"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -108,9 +109,11 @@ bool run_kernel_test(const TestVector& tv) {
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
-    // Phase 1: ConvRot activation quant
+    // Phase 1: ConvRot activation quant. The current launcher no longer takes
+    // the Hadamard matrix pointer (the regular H4 butterflies are hard-coded in
+    // the CUDA kernel) and expects a kernel dtype code: 0=FP32, 1=FP16, 2=BF16.
     if (!hotstep::launch_convrot_activation_quant(
-            d_x, d_xq, d_xs, d_H, tv.M, tv.K, tv.group_size, false, stream)) {
+            d_x, d_xq, d_xs, tv.M, tv.K, tv.group_size, /*input_dtype=*/0, stream)) {
         fprintf(stderr, "launch_convrot_activation_quant failed\n");
         return false;
     }
