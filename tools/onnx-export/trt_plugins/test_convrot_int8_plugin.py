@@ -91,7 +91,6 @@ class ConvRotInt8PluginV2Tests(unittest.TestCase):
             x_name="x_fp16",
             weight_q_name="w_q",
             weight_scale_name="w_scale",
-            H_name="convrot.hadamard",
             bias_name="bias_fp16",
             output_name="y",
             node_name="linear/ConvRotInt8Linear",
@@ -103,7 +102,7 @@ class ConvRotInt8PluginV2Tests(unittest.TestCase):
 
         self.assertEqual(node["domain"], "hotstep")
         self.assertEqual(node["op_type"], "ConvRotInt8Linear")
-        self.assertEqual(node["inputs"], ["x_fp16", "w_q", "w_scale", "convrot.hadamard", "bias_fp16"])
+        self.assertEqual(node["inputs"], ["x_fp16", "w_q", "w_scale", "bias_fp16"])
         self.assertEqual(node["outputs"], ["y"])
         self.assertEqual(node["attrs"]["input_dtype"], "FP16")
         self.assertEqual(node["attrs"]["output_dtype"], "FP16")
@@ -120,7 +119,6 @@ class ConvRotInt8PluginV2Tests(unittest.TestCase):
             x_name="x_fp16",
             weight_q_name="proj_out.weight",
             weight_scale_name="proj_out.weight.w8a8_scale",
-            H_name="convrot.hadamard",
             bias_name="",
             output_name="velocity",
             node_name="proj_out/ConvRotInt8Linear",
@@ -130,7 +128,7 @@ class ConvRotInt8PluginV2Tests(unittest.TestCase):
             has_bias=False,
             output_dtype="FP32",
         )
-        self.assertEqual(node["inputs"], ["x_fp16", "proj_out.weight", "proj_out.weight.w8a8_scale", "convrot.hadamard"])
+        self.assertEqual(node["inputs"], ["x_fp16", "proj_out.weight", "proj_out.weight.w8a8_scale"])
         self.assertEqual(node["attrs"]["output_dtype"], "FP32")
         self.assertEqual(node["attrs"]["output_dtype_id"], _FakeTensorProto.FLOAT)
 
@@ -168,7 +166,6 @@ class ConvRotInt8PluginV2Tests(unittest.TestCase):
             x_name="x_bf16",
             weight_q_name="w_q",
             weight_scale_name="w_scale",
-            H_name="convrot.hadamard",
             bias_name="",
             output_name="y_bf16",
             node_name="linear/ConvRotInt8Linear",

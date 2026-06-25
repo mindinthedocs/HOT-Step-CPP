@@ -20,8 +20,7 @@
  *   inputs[0]: x              FP16 [..., in_features] by default
  *   inputs[1]: weight_q       INT8 [out_features, in_features]
  *   inputs[2]: weight_scale   FP32 [out_features]
- *   inputs[3]: H              FP16 [group_size, group_size] by default
- *   inputs[4]: bias           FP32 [out_features]  (optional; 1D tensors stay FP32)
+ *   inputs[3]: bias           FP32 [out_features]  (optional; 1D tensors stay FP32)
  *
  *   output[0]: y              FP16 [..., out_features] by default
  *

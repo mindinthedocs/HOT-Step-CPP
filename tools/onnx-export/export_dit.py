@@ -83,15 +83,13 @@ class PatchEmbedLinear(nn.Module):
             self.linear.bias.data = conv.bias.data.clone()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C_in, T] (from Lambda transpose in proj_in)
-        B, C, T = x.shape
+        # x: [B, T, C] (surrounding Lambda transposes replaced with Identity)
+        B, T, C = x.shape
         K = self.kernel_size
-        # Unfold patches: [B, C, T] → [B, T//K, C*K]
-        x = x.reshape(B, C, T // K, K)       # [B, C, T//K, K]
-        x = x.permute(0, 2, 1, 3)             # [B, T//K, C, K]
-        x = x.reshape(B, T // K, C * K)       # [B, T//K, C*K]
+        # Unfold patches: [B, T, C] → [B, T//K, K, C] → [B, T//K, C, K] → [B, T//K, C*K]
+        x = x.reshape(B, T // K, K, C).transpose(2, 3).reshape(B, T // K, C * K)
         out = self.linear(x)                   # [B, T//K, C_out]
-        return out.transpose(1, 2)             # [B, C_out, T//K]
+        return out
 
 
 class UnPatchLinear(nn.Module):
@@ -122,14 +120,12 @@ class UnPatchLinear(nn.Module):
             self.linear.bias.data = deconv.bias.data.repeat_interleave(K).clone()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C_in, T//K] (from Lambda transpose in proj_out)
-        B, C, T_small = x.shape
+        # x: [B, T//K, C_in] (surrounding Lambda transposes replaced with Identity)
+        B, T_small, C_in = x.shape
         K = self.kernel_size
-        x = x.transpose(1, 2)                              # [B, T//K, C_in]
         x = self.linear(x)                                  # [B, T//K, C_out*K]
-        x = x.reshape(B, T_small, self.C_out, K)            # [B, T//K, C_out, K]
-        x = x.permute(0, 2, 1, 3)                           # [B, C_out, T//K, K]
-        x = x.reshape(B, self.C_out, T_small * K)           # [B, C_out, T]
+        # Fold patches: [B, T//K, C_out*K] → [B, T//K, C_out, K] → [B, T//K, K, C_out] → [B, T_small*K, C_out]
+        x = x.reshape(B, T_small, self.C_out, K).transpose(2, 3).reshape(B, T_small * K, self.C_out)
         return x
 
 
@@ -217,12 +213,18 @@ def replace_conv_with_linear(dit_model):
             if isinstance(mod, nn.Conv1d):
                 dit_model.proj_in[i] = PatchEmbedLinear(mod)
                 print(f"[export_dit] Conv→Linear: proj_in[{i}] Conv1d → PatchEmbedLinear")
+        if len(dit_model.proj_in) == 3:
+            dit_model.proj_in[0] = nn.Identity()
+            dit_model.proj_in[2] = nn.Identity()
     
     if hasattr(dit_model, 'proj_out') and isinstance(dit_model.proj_out, nn.Sequential):
         for i, mod in enumerate(dit_model.proj_out):
             if isinstance(mod, nn.ConvTranspose1d):
                 dit_model.proj_out[i] = UnPatchLinear(mod)
                 print(f"[export_dit] Conv→Linear: proj_out[{i}] ConvTranspose1d → UnPatchLinear")
+        if len(dit_model.proj_out) == 3:
+            dit_model.proj_out[0] = nn.Identity()
+            dit_model.proj_out[2] = nn.Identity()
     
     return dit_model
 
@@ -2651,8 +2653,24 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
         # v2 plugin I/O contract: FP16 by default. Set
         # HOTSTEP_W8A8_PLUGIN_IO_DTYPE=BF16 to test a BF16 activation path; in
         # that mode proj_out also remains BF16 so the plugin output is BF16 too.
-        input_dtype = boundary_dtype
-        output_dtype = boundary_dtype if boundary_dtype == "BF16" else ("FP32" if "proj_out" in weight_source else boundary_dtype)
+        if any(t in weight_source for t in ["q_proj", "k_proj", "v_proj"]):
+            input_dtype = "FP32"
+            output_dtype = "BF16"
+        elif "o_proj" in weight_source:
+            input_dtype = "BF16"
+            output_dtype = "FP32"
+        elif any(t in weight_source for t in ["gate_proj", "up_proj"]):
+            input_dtype = "FP32"
+            output_dtype = "BF16"
+        elif "down_proj" in weight_source:
+            input_dtype = "BF16"
+            output_dtype = "FP32"
+        elif "proj_out" in weight_source:
+            input_dtype = boundary_dtype
+            output_dtype = "FP32"
+        else:
+            input_dtype = boundary_dtype
+            output_dtype = boundary_dtype
 
         plugin_x_name = x_name
         if input_dtype != "FP32" and x_name not in lowp_plugin_outputs:
@@ -2662,7 +2680,7 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
                 [x_name],
                 [plugin_x_name],
                 name=f"{node_name}/CastInputTo{input_dtype}",
-                to=boundary_tensorproto,
+                to=_onnx_dtype_for_plugin_boundary(TensorProto, input_dtype),
             )
             new_nodes.append(cast_node)
             cast_nodes_inserted.append({"node": cast_node.name, "to": input_dtype, "reason": "plugin_input"})
@@ -2677,7 +2695,6 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
             x_name=plugin_x_name,
             weight_q_name=weight_source,
             weight_scale_name=quant_report["scale_names"][weight_source],
-            H_name=H_name,
             bias_name=plugin_bias_name,
             output_name=out,
             node_name=f"{node_name}/ConvRotInt8Linear",
@@ -2690,7 +2707,7 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
             preferred_format="HWC8",
         )
         new_nodes.append(custom_node)
-        if output_dtype == boundary_dtype and boundary_dtype != "FP32":
+        if output_dtype != "FP32":
             lowp_plugin_outputs.add(out)
         rewritten.append({
             "op_type": node.op_type,
@@ -2705,8 +2722,8 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
     del model.graph.node[:]
     model.graph.node.extend(new_nodes)
     fp16_island_report = (
-        _rewrite_w8a8_fp16_islands(model, lowp_plugin_outputs, boundary_dtype)
-        if boundary_dtype != "FP32"
+        _rewrite_w8a8_fp16_islands(model, lowp_plugin_outputs, boundary_dtype if boundary_dtype != "FP32" else "BF16")
+        if lowp_plugin_outputs
         else {"lowp_boundary_casts_inserted": [], "lowp_tensor_count": 0}
     )
     return {

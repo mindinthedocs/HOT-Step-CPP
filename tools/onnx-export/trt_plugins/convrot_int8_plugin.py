@@ -486,7 +486,6 @@ def make_convrot_int8_linear_onnx_node(
     x_name: str,
     weight_q_name: str,
     weight_scale_name: str,
-    H_name: str,
     bias_name: str,
     output_name: str,
     node_name: str,
@@ -512,7 +511,7 @@ def make_convrot_int8_linear_onnx_node(
         helper_module: ``onnx.helper`` module (passed in to avoid a hard
             import dependency at module load time).
         tensor_proto_module: ``onnx.TensorProto`` module.
-        x_name, weight_q_name, weight_scale_name, H_name, bias_name,
+        x_name, weight_q_name, weight_scale_name, bias_name,
             output_name, node_name: ONNX tensor / node names.
         group_size, in_features, out_features: build-time constants.
         has_bias: whether the bias input is present.
@@ -523,7 +522,7 @@ def make_convrot_int8_linear_onnx_node(
     Returns:
         An ``onnx.NodeProto`` for the custom op.
     """
-    inputs = [x_name, weight_q_name, weight_scale_name, H_name]
+    inputs = [x_name, weight_q_name, weight_scale_name]
     if has_bias:
         inputs.append(bias_name)
 

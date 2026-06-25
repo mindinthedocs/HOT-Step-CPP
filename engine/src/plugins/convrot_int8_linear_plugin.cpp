@@ -260,8 +260,7 @@ bool ConvRotInt8LinearPlugin::supportsFormatCombination(
             case 0: return type == inputType;                        // x
             case 1: return type == nvinfer1::DataType::kINT8;        // weight_q
             case 2: return type == nvinfer1::DataType::kFLOAT;       // weight_scale
-            case 3: return type == inputType;                        // H (ignored by butterfly impl)
-            case 4: return m_has_bias && type == nvinfer1::DataType::kFLOAT; // bias stays FP32 (1D sane rule)
+            case 3: return m_has_bias && type == nvinfer1::DataType::kFLOAT; // bias stays FP32 (1D sane rule)
             default: return false;
         }
     }
@@ -272,7 +271,7 @@ int32_t ConvRotInt8LinearPlugin::configurePlugin(
     nvinfer1::DynamicPluginTensorDesc const* in, int32_t nbInputs,
     nvinfer1::DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept {
     (void)out;
-    if (nbInputs < (m_has_bias ? 5 : 4) || nbOutputs < 1) return -1;
+    if (nbInputs < (m_has_bias ? 4 : 3) || nbOutputs < 1) return -1;
     int64_t optM = flattenedRows(in[0].opt);
     int32_t optK = lastDim(in[0].opt);
     if (optM <= 0 || optK <= 0 || optK != m_in_features) return -1;
@@ -360,7 +359,7 @@ int32_t ConvRotInt8LinearPlugin::setTactic(int32_t tactic) noexcept {
 int32_t ConvRotInt8LinearPlugin::onShapeChange(
     nvinfer1::PluginTensorDesc const* in, int32_t nbInputs,
     nvinfer1::PluginTensorDesc const* out, int32_t nbOutputs) noexcept {
-    if (nbInputs < (m_has_bias ? 5 : 4) || nbOutputs < 1) return -1;
+    if (nbInputs < (m_has_bias ? 4 : 3) || nbOutputs < 1) return -1;
     // Extract M, K, N from the descriptors.
     (void)out;
     auto const& x_desc = in[0].dims;
@@ -394,8 +393,7 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         void const* x_ptr      = inputs[0];
         int8_t const* wq_ptr   = static_cast<int8_t const*>(inputs[1]);
         float const* ws_ptr    = static_cast<float const*>(inputs[2]);
-        void const* H_ptr      = inputs[3];
-        void const* bias_ptr   = m_has_bias ? inputs[4] : nullptr;
+        void const* bias_ptr   = m_has_bias ? inputs[3] : nullptr;
         void* y_ptr            = outputs[0];
 
         if (workspace == nullptr) return -1;
@@ -423,11 +421,11 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         void* cublas_workspace = cursor;
 
         int32_t const input_dtype = kernelDtypeFromTrt(inputDesc[0].type);
-        int32_t const bias_dtype = m_has_bias ? kernelDtypeFromTrt(inputDesc[4].type) : input_dtype;
+        int32_t const bias_dtype = m_has_bias ? kernelDtypeFromTrt(inputDesc[3].type) : input_dtype;
         int32_t const output_dtype = kernelDtypeFromTrt(outputDesc[0].type);
 
         // Phase 1: ConvRot rotation + per-row INT8 quantization
-        if (!launch_convrot_activation_quant(x_ptr, xq_w, xs_w, H_ptr,
+        if (!launch_convrot_activation_quant(x_ptr, xq_w, xs_w,
                                              M, K, m_group_size, input_dtype,
                                              stream)) {
             std::fprintf(stderr, "[ConvRotInt8Linear] convrot_activation_quant failed\n");

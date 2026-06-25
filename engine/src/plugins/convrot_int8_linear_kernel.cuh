@@ -52,7 +52,6 @@ __global__ void convrot_activation_quant_kernel(
     X_T const* __restrict__ x_ptr,         // [M, K] FP16/FP32
     int8_t* __restrict__ x_q_ptr,          // [M, K] INT8 (output)
     float* __restrict__ x_scale_ptr,       // [M] FP32 (output)
-    void const* __restrict__ H_ptr,        // [GROUP_SIZE, GROUP_SIZE] FP16/FP32 (ignored by butterfly impl)
     int32_t M, int32_t K);
 
 /*
@@ -76,7 +75,7 @@ __global__ void dequant_bias_epilogue_kernel(
 // ── Launch helpers ──────────────────────────────────────────────────
 
 bool launch_convrot_activation_quant(
-    void const* x, int8_t* x_q, float* x_scale, void const* H,
+    void const* x, int8_t* x_q, float* x_scale,
     int32_t M, int32_t K, int32_t group_size, int32_t input_dtype,
     cudaStream_t stream);
 
