@@ -31,7 +31,13 @@ export const GlobalParamBar: React.FC = () => {
   // Polls the engine until it returns a model list, then auto-selects
   // the first available model for any empty slot. Runs independently
   // of the Model Manager modal state.
+
+  // showModelManager — auto-open path (no models on first launch)
   const [showModelManager, setShowModelManager] = useState(false);
+  // showModelManagerFromDropdown — opened explicitly via "Get More Models" button.
+  // Kept here (not inside ModelsDropdown) so we can pass `locked` to BarSection
+  // and prevent the hover-close from dismissing the dropdown while the modal is up.
+  const [showModelManagerFromDropdown, setShowModelManagerFromDropdown] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -233,8 +239,13 @@ export const GlobalParamBar: React.FC = () => {
             isOpen={openSection === 'models'}
             onOpen={() => handleOpen('models')}
             onClose={() => handleClose('models')}
+            locked={showModelManagerFromDropdown}
           >
-            <ModelsDropdown />
+            <ModelsDropdown
+              showModelManager={showModelManagerFromDropdown}
+              onModelManagerOpen={() => setShowModelManagerFromDropdown(true)}
+              onModelManagerClose={() => setShowModelManagerFromDropdown(false)}
+            />
           </BarSection>
           </DiscoPulseWrapper>
 

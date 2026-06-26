@@ -35,6 +35,9 @@ interface BarSectionProps {
   isOpen: boolean;
   onOpen: () => void;
   onClose: () => void;
+  /** When true, mouse-leave will not schedule a close — used when a child
+   *  modal (e.g. Model Manager) is open and the dropdown must stay visible. */
+  locked?: boolean;
   /** Optional toggle rendered in the header bar (e.g. LM on/off, Mastering on/off).
    *  The element handles its own onClick and should call e.stopPropagation(). */
   headerToggle?: React.ReactNode;
@@ -44,7 +47,7 @@ const HOVER_CLOSE_DELAY = 400; // ms
 
 export const BarSection: React.FC<BarSectionProps> = ({
   id, label, icon, badge, accentColor = 'pink', children,
-  isOpen, onOpen, onClose, headerToggle,
+  isOpen, onOpen, onClose, locked = false, headerToggle,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -71,8 +74,10 @@ export const BarSection: React.FC<BarSectionProps> = ({
   }, [onOpen, cancelClose]);
 
   const handleMouseLeave = useCallback(() => {
+    // Do not schedule close while a child modal is pinned open.
+    if (locked) return;
     scheduleClose();
-  }, [scheduleClose]);
+  }, [scheduleClose, locked]);
 
   const handleClick = useCallback(() => {
     if (isOpen) {

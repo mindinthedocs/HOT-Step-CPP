@@ -12,12 +12,24 @@ import { ModelManagerModal } from '../model-manager/ModelManagerModal';
 import { ModelSelect } from './ModelSelect';
 import type { AceModels } from '../../types';
 
-export const ModelsDropdown: React.FC = () => {
+interface ModelsDropdownProps {
+  /** Whether the Model Manager modal is currently open. Controlled by parent
+   *  so the parent can keep the BarSection locked (prevent hover-close) while
+   *  the modal is visible. */
+  showModelManager: boolean;
+  onModelManagerOpen: () => void;
+  onModelManagerClose: () => void;
+}
+
+export const ModelsDropdown: React.FC<ModelsDropdownProps> = ({
+  showModelManager,
+  onModelManagerOpen,
+  onModelManagerClose,
+}) => {
   const gp = useGlobalParams();
   const { t } = useTranslation();
   const [models, setModels] = useState<AceModels | null>(null);
   const [trtBundles, setTrtBundles] = useState<string[]>([]);
-  const [showModelManager, setShowModelManager] = useState(false);
 
   useEffect(() => {
     modelApi.list()
@@ -141,7 +153,7 @@ export const ModelsDropdown: React.FC = () => {
       {/* Get More Models */}
       <div className="border-t border-zinc-200 dark:border-white/5 pt-3 mt-1">
         <button
-          onClick={() => setShowModelManager(true)}
+          onClick={onModelManagerOpen}
           className="w-full px-3 py-2 rounded-xl bg-pink-500/10 border border-pink-500/20
                      text-sm text-pink-400 hover:bg-pink-500/20 hover:text-pink-300
                      transition-colors flex items-center justify-center gap-2"
@@ -151,10 +163,10 @@ export const ModelsDropdown: React.FC = () => {
         </button>
       </div>
 
-      {/* Model Manager Modal */}
+      {/* Model Manager Modal — rendered by parent; shown here via showModelManager prop */}
       {showModelManager && (
         <ModelManagerModal onClose={() => {
-          setShowModelManager(false);
+          onModelManagerClose();
           sessionStorage.setItem('mm-auto-dismissed', '1');
           loadTrtBundles();
         }} />
