@@ -59,7 +59,7 @@ from acestep_trt_common import (
 
 class PatchEmbedLinear(nn.Module):
     """Replace Conv1d(C_in, C_out, K, stride=K) with reshape + Linear.
-    
+
     TensorRT has historically lacked reliable kernels for these 1D convolution
     patch shapes in some precision modes. This is mathematically equivalent:
       Conv1d: input[B, C_in, T] → output[B, C_out, T//K]
@@ -94,7 +94,7 @@ class PatchEmbedLinear(nn.Module):
 
 class UnPatchLinear(nn.Module):
     """Replace ConvTranspose1d(C_in, C_out, K, stride=K) with Linear + reshape.
-    
+
     TensorRT has historically lacked reliable kernels for these 1D transposed
     convolution patch shapes. This is mathematically equivalent:
       ConvTranspose1d: input[B, C_in, T//K] → output[B, C_out, T]
@@ -202,10 +202,10 @@ class DiTForwardWrapper(nn.Module):
 
 def replace_conv_with_linear(dit_model):
     """Replace Conv1d/ConvTranspose1d with equivalent Linear ops.
-    
+
     PatchEmbedLinear/UnPatchLinear reformulate patch convolutions as
     reshape+matmul, which TensorRT handles more consistently.
-    
+
     Must be called for all supported precision recipes.
     """
     if hasattr(dit_model, 'proj_in') and isinstance(dit_model.proj_in, nn.Sequential):
@@ -216,7 +216,7 @@ def replace_conv_with_linear(dit_model):
         if len(dit_model.proj_in) == 3:
             dit_model.proj_in[0] = nn.Identity()
             dit_model.proj_in[2] = nn.Identity()
-    
+
     if hasattr(dit_model, 'proj_out') and isinstance(dit_model.proj_out, nn.Sequential):
         for i, mod in enumerate(dit_model.proj_out):
             if isinstance(mod, nn.ConvTranspose1d):
@@ -225,7 +225,7 @@ def replace_conv_with_linear(dit_model):
         if len(dit_model.proj_out) == 3:
             dit_model.proj_out[0] = nn.Identity()
             dit_model.proj_out[2] = nn.Identity()
-    
+
     return dit_model
 
 
@@ -1510,7 +1510,7 @@ def _externalize_initializers_from_safetensors(
         # typed parsing does not see Add/Mul/etc. with mixed dtypes.
         rewrite_report["fp16_island_rewrite_after_sequence"] = _rewrite_w8a8_fp16_islands(model_proto, set(), w8a8_boundary_dtype)
     # Attention rewrite: replace decomposed SDPA (MatMul+Softmax+MatMul)
-    # with a single ONNX Attention-23 op running in BF16 internally.
+    # with a single ONNX Attention-23 op running in FP16 internally.
     # This is mandatory for the attention block — matches GGML Q8_0's
     # flash-attention precision and lets TRT dispatch to its FMHA kernel.
     # Must run AFTER the w8a8 plugin rewrite (so Q/K/V come from
@@ -2049,7 +2049,7 @@ def _quantize_w8a8_initializers_with_convrot(
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Attention rewrite: decomposed SDPA → ONNX Attention-23 op (BF16 mandatory)
+# Attention rewrite: decomposed SDPA → ONNX Attention-23 op (FP16 lowp island)
 # ──────────────────────────────────────────────────────────────────────────
 # Ported from tools/onnx-export/optimize_dit_onnx.py. Replaces the manually
 # decomposed ``MatMul(Q,Kᵀ) → Mul(scale) → Add(mask) → Softmax → MatMul(.,V)``
@@ -2058,7 +2058,7 @@ def _quantize_w8a8_initializers_with_convrot(
 # built-in FMHA kernel instead of the current FP32 MatMul+Softmax+MatMul
 # chain, which is ~30% of total inference time.
 #
-# The attention island runs in BF16 (mandatory — matches GGML Q8_0's
+# The attention island runs in FP16 for sm_75/T4 compatibility (T4 has no BF16 support).
 # flash-attention precision). TRT's Attention op handles softmax
 # precision internally (always FP32 accumulation) — the
 # ``softmax_precision`` attribute is NOT supported by TRT's parser.
@@ -2129,7 +2129,7 @@ def _trace_untranspose_k(name: str, prod: dict):
 
 
 def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
-    """Rewrite decomposed SDPA islands to ONNX ``Attention`` op (opset 23, fp16).
+    """Rewrite decomposed SDPA islands to ONNX ``Attention`` op (opset 23, FP16).
 
     Pattern matched::
 
@@ -2144,11 +2144,11 @@ def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
                   is_causal=0)
         Cast output → FP32 (reuses the original AV MatMul output name)
 
-    The attention island **must** run in fp16 — this matches GGML Q8_0's
-    flash-attention precision and is the whole point of the rewrite. The
-    TRT's Attention op handles softmax precision internally (always FP32
-    accumulation) — the ``softmax_precision`` attribute is rejected by TRT's
-    ONNX parser (``!hasSoftmaxPrecision`` assertion). The surrounding graph stays
+    The attention island runs in FP16 in this export variant. This is required
+    for sm_75/T4 compatibility because T4 has no BF16 support. TensorRT handles
+    softmax precision internally (FP32 accumulation by default); the
+    ``softmax_precision`` attribute is rejected by TRT's ONNX parser
+    (``!hasSoftmaxPrecision`` assertion). The surrounding residual graph stays
     in its current dtype (FP32 for the baseline); Casts are inserted at the
     attention I/O boundary.
 
@@ -2236,13 +2236,13 @@ def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
 
         new_nodes = [
             helper.make_node("Cast", [q_name], [q_fp16],
-                             name=base + "/CastQTofp16", to=TensorProto.BFLOAT16),
+                             name=base + "/CastQTofp16", to=TensorProto.FLOAT16),
             helper.make_node("Cast", [k_name], [k_fp16],
-                             name=base + "/CastKTofp16", to=TensorProto.BFLOAT16),
+                             name=base + "/CastKTofp16", to=TensorProto.FLOAT16),
             helper.make_node("Cast", [v_name], [v_fp16],
-                             name=base + "/CastVTofp16", to=TensorProto.BFLOAT16),
+                             name=base + "/CastVTofp16", to=TensorProto.FLOAT16),
             helper.make_node("Cast", [mask], [mask_fp16],
-                             name=base + "/CastMaskTofp16", to=TensorProto.BFLOAT16),
+                             name=base + "/CastMaskTofp16", to=TensorProto.FLOAT16),
             helper.make_node(
                 "Attention",
                 [q_fp16, k_fp16, v_fp16, mask_fp16],
@@ -2315,8 +2315,8 @@ def _string_attr(node, name: str, default: str = "") -> str:
 def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_name: str = "FP16") -> dict:
     """Make TensorRT strongly-typed elementwise islands agree on the plugin lowp dtype.
 
-    ConvRotInt8Linear v2 emits FP16 by default and can be switched to BF16 for
-    overflow testing. In a strongly typed TRT network, elementwise nodes such as
+    ConvRotInt8Linear v2 emits FP16 in this T4-compatible variant. In a
+    strongly typed TRT network, elementwise nodes such as
     Add/Mul are not allowed to mix FP32 and lowp tensors. This pass propagates
     the target lowp dtype through dtype-preserving ONNX ops and inserts casts
     only on the non-lowp side of mixed arithmetic islands.
@@ -2650,20 +2650,18 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
         do_convrot = bool(rotated_by_name.get(weight_source, False)) and in_features % group_size == 0
         plugin_group_size = int(group_size) if do_convrot else 0
 
-        # v2 plugin I/O contract: FP16 by default. Set
-        # HOTSTEP_W8A8_PLUGIN_IO_DTYPE=BF16 to test a BF16 activation path; in
-        # that mode proj_out also remains BF16 so the plugin output is BF16 too.
+        # Using FP32 for accuracy. It's worse with BF16 and catastrophic with FP16 here
         if any(t in weight_source for t in ["q_proj", "k_proj", "v_proj"]):
             input_dtype = "FP32"
-            output_dtype = "BF16"
+            output_dtype = "FP32"
         elif "o_proj" in weight_source:
-            input_dtype = "BF16"
+            input_dtype = "FP32"
             output_dtype = "FP32"
         elif any(t in weight_source for t in ["gate_proj", "up_proj"]):
             input_dtype = "FP32"
-            output_dtype = "BF16"
+            output_dtype = "FP32"
         elif "down_proj" in weight_source:
-            input_dtype = "BF16"
+            input_dtype = "FP32"
             output_dtype = "FP32"
         elif "proj_out" in weight_source:
             input_dtype = boundary_dtype
@@ -2722,7 +2720,7 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
     del model.graph.node[:]
     model.graph.node.extend(new_nodes)
     fp16_island_report = (
-        _rewrite_w8a8_fp16_islands(model, lowp_plugin_outputs, boundary_dtype if boundary_dtype != "FP32" else "BF16")
+        _rewrite_w8a8_fp16_islands(model, lowp_plugin_outputs, boundary_dtype if boundary_dtype != "FP32" else "FP16")
         if lowp_plugin_outputs
         else {"lowp_boundary_casts_inserted": [], "lowp_tensor_count": 0}
     )
@@ -2747,13 +2745,13 @@ def load_dit_model(
 ):
     """Load the AceStepDiTModel from a safetensors checkpoint."""
     model_dir = Path(model_dir)
-    
+
     # Fix Windows encoding issues with transformers emoji output
     if sys.platform == "win32":
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
-    
+
     # Monkey-patch transformers auto_docstring to avoid lookup failure
     # for custom model types not registered in HF model registry
     try:
@@ -2762,7 +2760,7 @@ def load_dit_model(
         _ad.auto_docstring = lambda *a, **kw: (lambda cls: cls)  # no-op decorator
     except Exception:
         pass
-    
+
     # Add model dir to sys.path so we can import the model code.
     # Also add the Demon app root — model config files are re-export stubs
     # that import from the acestep package (from Demon).
@@ -2785,16 +2783,16 @@ def load_dit_model(
 
     from modeling_acestep_v15_xl_base import AceStepDiTModel # only xl for now, it IS the same for all xl
     from configuration_acestep_v15 import AceStepConfig
-    
+
     # Load config
     import json
     with open(model_dir / "config.json") as f:
         config_dict = json.load(f)
-    
+
     config = AceStepConfig(**config_dict)
     # Force SDPA for ONNX export (no flash attention)
     config._attn_implementation = "sdpa"
-    
+
     if device != "cpu":
         raise SystemExit("low-memory export keeps weights CPU-mapped; use --device cpu")
 
@@ -2802,11 +2800,11 @@ def load_dit_model(
     print(f"[export_dit] Precision recipe: {precision}")
     print("[export_dit] Low-memory export: meta init only; weights stream after graph export")
     t0 = time.time()
-    
+
     with torch.device("meta"):
         dit_model = AceStepDiTModel(config)
     dit_model = dit_model.to(dtype=torch.float32)
-    
+
     # Supported handoff policies keep the PyTorch export in FP32. q8map-fp16
     # and w8a8 transform selected ONNX initializers after export according to
     # the hardcoded Q8_0-equivalent map.
@@ -2814,16 +2812,16 @@ def load_dit_model(
         raise ValueError(
             f"Unknown precision: {precision}. Use 'q8map-fp16', 'w8a8', or 'fp32'."
         )
-    
+
     # Replace Conv1d/ConvTranspose1d with Linear equivalents for ALL precision modes.
     # TensorRT handles the patch path more reliably as reshape+matmul.
     dit_model = replace_conv_with_linear(dit_model)
     dit_model.eval()
-    
+
     t1 = time.time()
     print(f"[export_dit] Model loaded in {t1-t0:.1f}s")
     print(f"[export_dit] DiT: {sum(p.numel() for p in dit_model.parameters())/1e9:.2f}B params")
-    
+
     # Log dtype distribution
     dtypes = {}
     for p in dit_model.parameters():
@@ -2831,7 +2829,7 @@ def load_dit_model(
         dtypes[dt] = dtypes.get(dt, 0) + p.numel()
     for dt, count in sorted(dtypes.items()):
         print(f"[export_dit]   {dt}: {count/1e6:.1f}M params")
-    
+
     return dit_model, config
 
 
@@ -2840,16 +2838,16 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
                 model_dir: str = "", stream_chunk_mb: int = 16):
     """Export the DiT forward pass to ONNX."""
     device = next(dit_model.parameters()).device
-    
+
     if precision not in {"q8map-fp16", "w8a8", "fp32"}:
         raise SystemExit(f"unknown precision policy: {precision}")
 
     # The hardcoded policy is applied to ONNX initializers after FP32 export.
     tensor_dtype = torch.float32
-    
+
     wrapper = DiTForwardWrapper(dit_model, precision=precision)
     wrapper.eval()
-    
+
     # Create dummy inputs for tracing.
     #
     # WARNING — symbolic-dimension aliasing trap:
@@ -2870,7 +2868,7 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
         f"dummy trace shapes alias symbolic dims (T={T}, T//patch_size={T // patch_size}, "
         f"S={S}); choose S so that T, T//patch_size and S are pairwise distinct"
     )
-    
+
     dummy_input_latents = torch.randn(B, T, 192, device=device, dtype=tensor_dtype)
     dummy_enc_hidden = torch.randn(B, S, 2048, device=device, dtype=tensor_dtype)
     dummy_t = torch.tensor([0.5], device=device, dtype=torch.float32)  # always fp32
@@ -2883,19 +2881,19 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
     # ignores any latent padding beyond real_S[b].
     dummy_attention_mask = torch.ones(B, T, device=device, dtype=torch.long)
     dummy_encoder_attention_mask = torch.ones(B, S, device=device, dtype=torch.long)
-    
+
     print(f"[export_dit] Tracing with shapes: input_latents={list(dummy_input_latents.shape)}, "
           f"enc_hidden={list(dummy_enc_hidden.shape)}, t={list(dummy_t.shape)}, "
           f"attention_mask={list(dummy_attention_mask.shape)}, "
           f"encoder_attention_mask={list(dummy_encoder_attention_mask.shape)}")
     print(f"[export_dit] Input dtype: {tensor_dtype}, t/t_r dtype: fp32, masks dtype: int64")
-    
+
     print("[export_dit] Skipping PyTorch forward preflight for low-memory export")
-    
+
     # Export to ONNX
     print(f"[export_dit] Exporting to ONNX (opset {opset})...")
     t0 = time.time()
-    
+
     # Dynamo requires dynamic_shapes (not dynamic_axes)
     # Each input gets a dict mapping dim index → Dim object.
     # attention_mask shares the same seq_len Dim as input_latents (axis 1 == T),
@@ -2930,7 +2928,7 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
         "attention_mask":         {0: batch, 1: seq_len},
         "encoder_attention_mask": {0: batch, 1: enc_seq_len},
     }
-    
+
     onnx_program = torch.onnx.export(
         wrapper,
         (dummy_input_latents, dummy_enc_hidden, dummy_t, dummy_t_r,
@@ -3038,34 +3036,34 @@ def main():
     args = parser.parse_args()
     if args.convrot_group_size is not None:
         os.environ["HOTSTEP_CONVROT_GROUP_SIZE"] = str(args.convrot_group_size)
-    
+
     # Default output path
     if args.output is None:
         model_name = Path(args.model_dir).name
         onnx_dir = Path(args.model_dir).parent.parent / "models" / "onnx"
         onnx_dir.mkdir(parents=True, exist_ok=True)
         args.output = str(onnx_dir / f"dit_{model_name}.onnx")
-    
+
     # Ensure output directory exists
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    
+
     # Skip if output already exists (resumable builds)
     if not args.force and os.path.isfile(args.output):
         print(f"[export_dit] Output already exists: {args.output} (use --force to re-export)")
         return
-    
+
     # Load model
     dit_model, config = load_dit_model(
         args.model_dir,
         device=args.device,
         precision=args.precision,
     )
-    
+
     # Export
     export_onnx(dit_model, config, args.output, opset=args.opset,
                 precision=args.precision, source_model=args.model_dir,
                 model_dir=args.model_dir, stream_chunk_mb=args.stream_chunk_mb)
-    
+
     print("[export_dit] Done!")
 
 

@@ -384,6 +384,14 @@ def build_engine(args) -> tuple[Path, Path, Path]:
     if args.weight_streaming:
         weight_streaming_enabled = require_builder_flag(trt, config, "WEIGHT_STREAMING")
         
+    detailed_tactics_enabled = False
+    if args.detailed_tactics:
+        detailed_tactics_enabled = maybe_set_builder_flag(trt, config, "EDITABLE_TIMING_CACHE")
+        if detailed_tactics_enabled:
+            print("[TRT Build] EDITABLE_TIMING_CACHE flag enabled for detailed tactic logging.")
+        else:
+            print("[TRT Build] WARNING: TensorRT Python API does not expose BuilderFlag.EDITABLE_TIMING_CACHE.")
+
     if hasattr(trt.BuilderFlag, "TF32"):
         config.clear_flag(trt.BuilderFlag.TF32)
 
@@ -431,14 +439,19 @@ def build_engine(args) -> tuple[Path, Path, Path]:
     # and Cast nodes. TensorRT 11 removed blanket per-precision builder flags.
 
     print("[TRT Build] Starting engine build...")
-    spinner = _Spinner("[TRT Build] Building engine")
-    spinner.start()
+    spinner = None
+    if not args.detailed_tactics:
+        spinner = _Spinner("[TRT Build] Building engine")
+        spinner.start()
+    else:
+        print("[TRT Build] Spinner disabled to allow clean detailed tactic logging to console.")
 
     serialized = None
     try:
         serialized = builder.build_serialized_network(network, config)
     finally:
-        spinner.stop()
+        if spinner:
+            spinner.stop()
 
         # ── Persist timing cache (Moved to ensure it saves even on failure/OOM) ──
         try:
@@ -499,6 +512,7 @@ def build_engine(args) -> tuple[Path, Path, Path]:
         "strip_plan": False,
         "refit_identical": refit_identical_enabled,
         "weight_streaming": weight_streaming_enabled,
+        "detailed_tactics_logged": detailed_tactics_enabled,
         "model_defaults": DIT_DEFAULTS,
         "profile_shapes": profile_shapes(args.profile),
     }
@@ -536,6 +550,8 @@ def main() -> int:
                              "Shared across builds on the same GPU/driver.")
     parser.add_argument("--force", action="store_true", default=False,
                         help="Rebuild even if the engine + metadata already exist on disk (default: skip).")
+    parser.add_argument("--detailed-tactics", action="store_true", default=True,
+                        help="Enable EDITABLE_TIMING_CACHE and disable console spinner to dump detailed autotuning tactics to the build log.")
     args = parser.parse_args()
 
     engine_path, layers_path, metadata_path = build_engine(args)
