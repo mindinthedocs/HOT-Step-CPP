@@ -163,7 +163,7 @@ __global__ void convrot_activation_quant_kernel(
 
         regular_hadamard_transform<GROUP_SIZE>(s_x, s_tmp);
         
-        int8_t* s_q = reinterpret_cast<int8_t*>(s_x);
+        int8_t* s_q = reinterpret_cast<int8_t*>(s_tmp);
         for (int32_t i = tid; i < GROUP_SIZE; i += blockDim.x) {
             float v = s_x[i];
             float q = rintf(v * inv_scale);
