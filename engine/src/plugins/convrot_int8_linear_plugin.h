@@ -1,19 +1,29 @@
 /*
  * convrot_int8_linear_plugin.h — HOT-Step ConvRotInt8Linear TensorRT 11 plugin.
  *
- * Fuses the entire w8a8 + ConvRot path into a single TensorRT custom op:
+ * Fuses the entire w8a8 + ConvRot path into a single TensorRT custom op,
+ * backed by an AOT-compiled Triton kernel launched via the CUDA Driver API:
  *
- *   1. Online activation rotation: x_rot = x @ H_block (group-wise Hadamard)
- *   2. Per-row dynamic INT8 quantization of x_rot
- *   3. INT8 × INT8 → INT32 matmul via cuBLASLt
+ *   1. Online activation rotation via in-register H_4 Kronecker butterfly
+ *      (H_{GROUP_SIZE} = H_4 ⊗ H_4 ⊗ ... — no H matrix in shared memory)
+ *   2. Per-row dynamic INT8 quantization of rotated x
+ *   3. INT8 × INT8 → INT32 matmul on Tensor Cores (Triton tl.dot)
  *   4. Dequantize via per-row activation scale and per-output-channel
  *      weight scale
  *   5. Add bias (if present) and write FP16 by default
  *
- * This is the same architecture class as TRT-LLM's smooth_quant_gemm_plugin:
- *   - Custom CUDA kernel for ConvRot rotation + per-row quant (TRT can't do this natively)
- *   - cuBLASLt for the INT8 GEMM
- *   - Custom epilogue for dequant + bias
+ * Phase 1 architecture (cuBLASLt-free, butterfly rotation):
+ *   - Single Triton kernel `fused_convrot_gemm_rowwise_kernel` AOT-compiled
+ *     by tools/onnx-export/compile_triton_plugin.py into cubin variants keyed
+ *     by (tile, group_size, bias) and embedded as C++ byte arrays in
+ *     engine/src/plugins/assets/convrot_int8_kernel_cubin.h.
+ *   - Loaded at runtime via cuModuleLoadData / cuModuleGetFunction.
+ *   - Per-block shared-memory carveout opted in via cuFuncSetAttribute so
+ *     Triton's multi-stage pipelined GEMM tiles can use >48 KB of static
+ *     shared memory without cuLaunchKernel returning CUDA_ERROR_INVALID_VALUE.
+ *   - Rotation uses NO H matrix pointer — the butterfly is entirely
+ *     in-register. This avoids the 128 KB shared-memory cost of staging
+ *     H_{256} as a dense matrix (which exceeds the sm_86 99 KB limit).
  *
  * Op signature (ONNX custom op, domain "hotstep", type "ConvRotInt8Linear"):
  *
@@ -27,6 +37,10 @@
  * Attributes: group_size, in_features, out_features, has_bias,
  *             input_dtype={FP16,FP32}, output_dtype={FP16,FP32},
  *             preferred_format={LINEAR,HWC8,CHW32,HWC16}
+ *
+ * group_size contract: 0 (no rotation) or any power of 4 (4, 16, 64, 256, 1024).
+ * The butterfly kernel supports all of these uniformly. The default export
+ * uses group_size=256 (per tools/onnx-export/convrot.py).
  */
 
 #pragma once
@@ -37,7 +51,7 @@
 
 #ifdef HOT_STEP_TRT
 
-#include <cublasLt.h>
+#include <cuda.h>          // CUmodule / CUfunction (opaque as void* below)
 #include "NvInfer.h"
 #include "NvInferPluginBase.h"
 #include "NvInferRuntimePlugin.h"
@@ -59,15 +73,20 @@ constexpr char const* const kFIELD_OUTPUT_DTYPE_ID = "output_dtype_id";
 constexpr char const* const kFIELD_PREFERRED_FORMAT = "preferred_format";
 
 /*
- * ConvRotInt8LinearPlugin — IPluginV3 implementation around cuBLASLt.
+ * ConvRotInt8LinearPlugin — IPluginV3 implementation around an AOT-compiled
+ * Triton fused kernel launched via the CUDA Driver API.
  *
  * Build phase flow:
  *   1. configurePlugin() → store M/K/N from dynamic shape descriptors
  *   2. TRT allocates plugin workspace reported by getWorkspaceSize()
+ *      (returns 0 in Phase 1 — the Triton kernel uses no plugin workspace).
  *
  * Runtime phase flow:
- *   1. onShapeChange() → (re)create cuBLASLt matmul descriptor + layout
- *   2. enqueue() → ConvRot quant kernel + cuBLASLt GEMM + epilogue kernel
+ *   1. onShapeChange() → cuModuleLoadData the right cubin variant for
+ *      (group_size, has_bias) in the current sm86-first inventory,
+ *      cuModuleGetFunction for `fused_convrot_gemm_rowwise_kernel`, and
+ *      cuFuncSetAttribute to opt in to large per-block shared memory.
+ *   2. enqueue() → build the 14-arg kernel param block and cuLaunchKernel.
  */
 class ConvRotInt8LinearPlugin
     : public nvinfer1::IPluginV3,
@@ -115,7 +134,7 @@ public:
                             int32_t nbOutputs) const noexcept override;
     // Note: destroy() was removed in TRT 11. The destructor handles cleanup.
 
-    // ── Custom Tactics (stable tactic surface; tactic 0 is current implementation) ────
+    // ── Custom Tactics (sm86-first: only one custom tactic, plus implicit default 0) ────
     int32_t getNbTactics() noexcept override;
     int32_t getValidTactics(int32_t* tactics, int32_t nbTactics) noexcept override;
     char const* getTimingCacheID() noexcept override;
@@ -155,25 +174,40 @@ private:
     std::string m_namespace{kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE};
 
     // Runtime state
-    int32_t m_tactic{0};           // tactic requested by TRT (0 default, 1-4 advertised)
+    int32_t m_tactic{0};           // tactic requested by TRT (0 implicit default, 2 custom sm86 path)
     int32_t m_M{0};                 // rows (from onShapeChange)
     int32_t m_K{0};                 // in_features (from onShapeChange)
     int32_t m_N{0};                 // out_features (= m_out_features)
 
-    // cuBLASLt state (lazily initialized in onShapeChange)
-    cublasLtHandle_t m_cublasLt{nullptr};
-    cublasLtMatmulDesc_t m_matmulDesc{nullptr};
-    cublasLtMatrixLayout_t m_layoutA{nullptr};   // w_q as column-major [K, N]
-    cublasLtMatrixLayout_t m_layoutB{nullptr};   // x_q as column-major [K, M]
-    cublasLtMatrixLayout_t m_layoutC{nullptr};   // acc as column-major [N, M]
+    // Triton / CUDA module state (lazily initialized in onShapeChange)
+    void* m_module{nullptr};      // Cast to CUmodule in .cpp
+    void* m_kernelFunc{nullptr};  // Cast to CUfunction in .cpp
+    // No m_d_H — butterfly rotation uses no GPU-allocated Hadamard matrix.
+    // Dynamic shared-memory requirement (bytes) of the loaded cubin, as
+    // reported by Triton's compile metadata and embedded in the cubin header
+    // as kCONVROT_INT8_KERNEL_*_SHARED. Passed to cuLaunchKernel as
+    // sharedMemBytes. Critically, this is NOT the device's opt-in ceiling —
+    // it is the kernel's actual requirement, so cuLaunchKernel allocates
+    // exactly the right amount and the runtime check
+    //   m_shared_bytes <= getDeviceMaxDynamicSharedMem()
+    // is a real guard instead of a tautology.
+    size_t m_shared_bytes{0};
+    // Tile dimensions baked into the loaded cubin. Set by initTriton() from
+    // the kCONVROT_INT8_KERNEL_*_BLOCK_M / _BLOCK_N constants in the cubin
+    // header. The compile script may pick different BLOCK_M values per config
+    // to maximize num_stages within the device's shared-memory limit (e.g.
+    // G256 FP32IO uses BLOCK_M=64 with ns=2 instead of BLOCK_M=128 with ns=1
+    // to preserve software pipelining). Used by enqueue() for grid math.
+    int32_t m_block_m{128};
+    int32_t m_block_n{128};
 
     // Mutable field collection for serialization
     mutable std::vector<nvinfer1::PluginField> m_fields;
     mutable nvinfer1::PluginFieldCollection m_fc{};
 
     // ── Internal helpers ─────────────────────────────────────────────
-    bool initCublasLt();
-    void destroyCublasLt();
+    bool initTriton();
+    void destroyTriton();
 };
 
 /*

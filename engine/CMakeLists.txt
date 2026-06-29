@@ -422,6 +422,15 @@ if(TRT_ENABLED)
         src/plugins/convrot_int8_linear_kernel.cu
     )
     target_compile_definitions(hotstep_plugins PRIVATE HOT_STEP_TRT)
+    # Plugin diagnostic logging is OFF by default for zero runtime overhead.
+    # Enable at build time with: cmake -DHOTSTEP_PLUGIN_DEBUG=1 ...
+    # This compiles in the full RAM-buffered logging subsystem (controlled
+    # at runtime via the HOTSTEP_PLUGIN_DEBUG env var). Without it, all
+    # log() calls are compiled to no-ops.
+    option(HOTSTEP_PLUGIN_DEBUG "Enable HotStep plugin diagnostic logging" OFF)
+    if(HOTSTEP_PLUGIN_DEBUG)
+        target_compile_definitions(hotstep_plugins PRIVATE HOTSTEP_PLUGIN_DEBUG)
+    endif()
     # On Windows, export hotstep_register_plugins via __declspec(dllexport)
     # (defined in the plugin .cpp via HOTSTEP_PLUGIN_EXPORT). On Linux/macOS
     # the default visibility is sufficient.
@@ -438,11 +447,8 @@ if(TRT_ENABLED)
     target_link_libraries(hotstep_plugins PRIVATE
         "${_TRT_NVINFER_LIB}"
         CUDA::cudart
+        CUDA::cuda_driver
     )
-    # cuBLASLt is used for the INT8 GEMM in production builds.
-    if(TARGET CUDA::cublasLt)
-        target_link_libraries(hotstep_plugins PRIVATE CUDA::cublasLt)
-    endif()
     # Install the shared library next to the engine binary so dlopen/LoadLibrary
     # finds it via $ORIGIN (Linux/macOS) or same-directory search (Windows).
     set_target_properties(hotstep_plugins PROPERTIES
