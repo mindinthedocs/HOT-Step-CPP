@@ -1771,13 +1771,14 @@ def _rewrite_fp16_weight_ops(model, fp16_initializer_names: set[str]) -> dict:
 
 
 def _detect_max_convrot_group_size() -> int:
-    """Return the default group_size for the fixed TRT ConvRot kernel.
+    """Return the default group_size for the current Triton plugin path.
 
-    The CUDA kernel applies the regular Hadamard as H4 Kronecker butterflies,
-    not by staging dense H in shared memory, so the PyTorch-reference group
-    size 256 is safe on Ampere-class GPUs.
+    The two-kernel Triton implementation quantizes activations one reusable
+    K-group at a time. Exporting with ``group_size == 64`` keeps the rotation
+    group, the activation quantization group, and the GEMM dequant group all
+    aligned to the same 64-wide chunk.
     """
-    return 256
+    return 64
 
 
 def _convrot_default_group_size() -> int:
@@ -1801,11 +1802,11 @@ def _convrot_default_group_size() -> int:
 
     if not is_valid_group_size(value):
         raise SystemExit(
-            f"HOTSTEP_CONVROT_GROUP_SIZE must be a power of 4 (4, 16, 64, 256, ...), got {value}"
+            f"HOTSTEP_CONVROT_GROUP_SIZE must be a power of 4, got {value}"
         )
-    if value not in {4, 16, 64, 256, 1024}:
+    if value != 64:
         raise SystemExit(
-            f"HOTSTEP_CONVROT_GROUP_SIZE {value} is not compiled into the TRT plugin; supported values are 4, 16, 64, 256, 1024"
+            f"HOTSTEP_CONVROT_GROUP_SIZE {value} is not compiled into the TRT plugin; supported value is 64"
         )
     return value
 
@@ -1815,7 +1816,7 @@ def _emit_convrot_h_initializer(model, group_size: int, name: str) -> str:
 
     Returns the initializer name so callers can reference it from their MatMul
     nodes. Storing H once keeps the graph small (32 layers × 7 linears would
-    otherwise duplicate the same 256×256 matrix 224 times).
+    otherwise duplicate the same 64×64 matrix 224 times).
     """
     import numpy as np
     from onnx import numpy_helper
@@ -1969,7 +1970,11 @@ def _quantize_w8a8_initializers_with_convrot(
 
     if not is_valid_group_size(group_size):
         raise SystemExit(
-            f"W8A8 ConvRot group_size must be a power of 4 (4, 16, 64, 256, ...), got {group_size}"
+            f"W8A8 ConvRot group_size must be a power of 4, got {group_size}"
+        )
+    if group_size != 64:
+        raise SystemExit(
+            f"W8A8 ConvRot group_size {group_size} is not compiled into the TRT plugin; supported value is 64"
         )
     H_np = build_hadamard(group_size).astype(np.float32)
 
@@ -2642,13 +2647,25 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
         weight_axis = axis_by_name[weight_source]
         out_features = int(weight_init.dims[weight_axis])
 
-        # The plugin only applies ConvRot when the weight was rotated offline.
-        # When ConvRot is skipped (in_features % group_size != 0), we still
-        # emit the custom op but pass group_size=0 as a sentinel — the plugin
-        # interprets this as "no rotation". (The H initializer is still
-        # referenced for graph-shape consistency but is a no-op at runtime.)
+        # The TensorRT plugin no longer compiles the group_size=0 no-rotation
+        # sentinel. Only rewrite layers whose weights were actually rotated
+        # offline with the compiled group size; leave incompatible MatMul/Gemm
+        # nodes in the graph instead of creating a plugin instance that cannot
+        # load a cubin at build time.
         do_convrot = bool(rotated_by_name.get(weight_source, False)) and in_features % group_size == 0
-        plugin_group_size = int(group_size) if do_convrot else 0
+        if not do_convrot:
+            # The weight has already been replaced by its INT8 initializer in
+            # the W8A8 quantization pass, so preserving the original MatMul/Gemm
+            # would leave an invalid graph. Older plugin builds used
+            # group_size=0 to cover this no-rotation W8A8 case, but that cubin
+            # is no longer generated. Fail loudly if a future model introduces
+            # a non-divisible K rather than emitting a plugin node that cannot
+            # be built by TensorRT.
+            raise SystemExit(
+                f"W8A8 plugin rewrite for {node_name} would require removed group_size=0 "
+                f"fallback (weight={weight_source}, in_features={in_features}, group_size={group_size})"
+            )
+        plugin_group_size = int(group_size)
 
         # Using FP32 for accuracy. It's worse with BF16 and catastrophic with FP16 here
         if any(t in weight_source for t in ["q_proj", "k_proj", "v_proj"]):
@@ -3028,8 +3045,8 @@ def main():
     parser.add_argument("--stream-chunk-mb", type=int, default=16,
                         help="Chunk size in MB for low-memory tensor streaming (default: 16)")
     parser.add_argument("--convrot-group-size", type=int, default=None,
-                        help="ConvRot Hadamard group size for w8a8 (default: 256). "
-                             "Must be a power of 4 (4, 16, 64, 256, 1024). "
+                        help="ConvRot Hadamard group size for w8a8 (default: 64). "
+                             "Only 64 is compiled into the TensorRT plugin. "
                              "Overrides the HOTSTEP_CONVROT_GROUP_SIZE env var.")
     parser.add_argument("--force", action="store_true",
                         help="Re-export even if the output ONNX already exists")

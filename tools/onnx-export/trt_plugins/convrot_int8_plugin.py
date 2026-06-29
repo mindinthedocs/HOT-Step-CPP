@@ -1,77 +1,43 @@
 """ConvRotInt8Linear TensorRT plugin — Python helpers.
 
-The actual IPluginV3 + IPluginCreatorV3 implementation lives in C++:
-  engine/src/plugins/convrot_int8_linear_plugin.{h,cpp}
-  engine/src/plugins/convrot_int8_linear_kernel.{cuh,cu}
+The production implementation lives in C++/Triton:
+  * ``engine/src/plugins/convrot_int8_linear_plugin.{h,cpp}``
+  * ``tools/onnx-export/trt_plugins/convrot_int8_kernel.py``
 
-This module provides:
-  * ``conv_rot_int8_linear_reference`` — NumPy reference implementation
-    used by unit tests to validate the C++ kernel's math without
-    requiring a TRT install.
-  * ``make_convrot_int8_linear_onnx_node`` — emits the ONNX custom-op
-    node with the correct domain, op_type, inputs, outputs, and
-    attributes. Called by ``export_dit._rewrite_w8a8_weight_ops_with_plugin``.
-  * ``register_plugins`` / ``is_registered`` — thin shims that return
-    False when the C++ .so isn't loaded (unit-test environments) and
-    True when it is (production builds, after the engine runtime
-    dlopens ``libhotstep_plugins.so``).
+This module keeps the Python-side glue in one place:
 
-The plugin fuses the entire w8a8 + ConvRot path into a single TensorRT
-custom op:
+* ``conv_rot_int8_linear_reference`` mirrors the plugin math in NumPy so unit
+  tests can validate correctness without requiring TensorRT.
+* ``make_convrot_int8_linear_onnx_node`` emits the ONNX custom-op node used by
+  the exporter.
+* ``register_plugins`` / ``is_registered`` load the compiled TensorRT plugin
+  library when one is available.
 
-  1. Online activation rotation: x_rot = x @ H_block (group-wise Hadamard)
-  2. Per-row dynamic INT8 quantization of x_rot
-  3. INT8 × INT8 → INT32 matmul against the pre-rotated, per-output-channel
-     INT8 weight
-  4. Dequantize via the per-row activation scale and per-output-channel
-     weight scale
-  5. Add bias (if present) and return FP16 by default
-
-The kernel is a direct port of the ComfyUI-INT8-Fast Triton kernel
-(``int8_fused_kernel.triton_int8_linear_per_row`` + ``convrot.rotate_activation``)
-to the TensorRT 11 IPluginV3 API.
-
-Op signature
-------------
+Plugin contract
+---------------
+The exported ONNX custom op has three mandatory inputs and one optional input:
 
 ::
 
     ConvRotInt8Linear(
-        x            : FP16[..., in_features]            # activation (default)
-        weight_q     : INT8[out_features, in_features]   # ConvRot-rotated, per-channel INT8
-        weight_scale : FP32[out_features]                # per-output-channel symmetric scale
-        H            : FP16[group_size, group_size]      # shared regular Hadamard matrix
-        bias         : FP32[out_features] (optional)     # additive bias; 1D tensors stay FP32
-    ) -> FP16[..., out_features]
+        x            : FP16/FP32[..., in_features]
+        weight_q     : INT8[out_features, in_features]
+        weight_scale : FP32[out_features]
+        bias         : FP32[out_features] (optional)
+    ) -> FP16/FP32[..., out_features]
 
-Attributes (carried as ONNX op attributes, surfaced to the plugin at build
-time):
+The ConvRot Hadamard matrix is *not* an ONNX input. It is only used in Python
+reference code and in the offline weight-rotation/export flow. Runtime rotation
+inside the Triton kernels is implemented directly as an in-register butterfly.
 
-  * ``group_size``   : int   — ConvRot block size (power of 4); 0 = skip rotation
-  * ``in_features``  : int   — K dimension of the matmul
-  * ``out_features`` : int   — N dimension of the matmul
-  * ``has_bias``     : bool  — whether the bias input is present
-  * ``input_dtype``  : str   — ``FP16`` by default, ``FP32`` fallback
-  * ``output_dtype`` : str   — ``FP16`` by default, ``FP32`` fallback
-  * ``preferred_format`` : str — layout hint for future packed-format kernels
+For every M, including M==1, the runtime plugin uses the same two-kernel Triton
+path:
 
-Fusion notes
-------------
-The plugin is a single TRT layer, so TRT's standard fusion passes treat
-it as an atomic op. Surrounding pointwise ops (Cast, Add, Mul, etc.)
-that TRT would normally fuse into a MatMul epilogue are NOT fused into
-this plugin — that's intentional, because the plugin already includes
-the dequant + bias epilogue. Any residual pointwise ops the export
-pipeline emits (e.g. a final Cast to FP32 to satisfy the graph I/O
-policy) will fuse with the plugin's output naturally via TRT's
-pointwise fusion.
+1. Rotate each activation K-group and quantize it once into workspace.
+2. Reuse that INT8 workspace across all output-channel tiles.
 
-The v2 ONNX contract is independent of kernel optimization choices: the graph
-emits dtype and layout-preference attributes once, while TensorRT chooses plugin
-tactics during engine build. The current C++ kernel accepts contiguous
-``kLINEAR`` tensors and exposes a stable tactic surface; future packed-format
-kernels can consume the existing ``preferred_format`` attribute without another
-ONNX rewrite.
+The former dedicated M==1 fused kernel was removed after profiling showed the
+two-kernel BK64/BM128/BN128 path wins on the real M==1 workload too.
 """
 
 from __future__ import annotations
@@ -112,113 +78,72 @@ def conv_rot_int8_linear_reference(
 ) -> np.ndarray:
     """NumPy reference implementation of the ConvRotInt8Linear op.
 
-    Mirrors the math of the C++ kernel in
-    ``engine/src/plugins/convrot_int8_linear_kernel.cu`` line-for-line:
+    The runtime plugin uses the two-kernel path for all M: rotate/quantize
+    activations into reusable workspace, then run an INT8 GEMM that dequantizes
+    one K-group at a time. This reference follows that math:
 
-      1. Reshape x from ``[..., in_features]`` to ``[..., n_groups, group_size]``
-         and apply the shared regular Hadamard matrix H (ConvRot rotation).
-         When ``group_size == 0`` the rotation is skipped (the plugin
-         treats 0 as a "no rotation" sentinel for layers where
-         in_features % group_size != 0).
-      2. Per-row symmetric INT8 quantization of the rotated activation:
-         scale = max(|x_rot|, -1) / 127; q = round(x_rot / scale);
-         clip to [-127, 127].
-      3. INT8 × INT8 → INT32 matmul against weight_q^T (which is already
-         ConvRot-rotated offline and per-output-channel quantized).
-      4. Dequantize: y = int32_acc * x_scale[..., None] * weight_scale[None, :]
-      5. Add bias if present.
+      1. Apply the activation-side ConvRot transform group-wise. The compiled
+         TensorRT plugin supports only ``group_size == 64``; the Python
+         reference still checks the attribute explicitly so invalid test inputs
+         fail near the source.
+      2. Split K into 64-wide quantization groups.
+      3. For each group, compute one activation scale per row, quantize the
+         group to INT8, form the INT32 dot product against the matching weight
+         slice, and immediately dequantize that partial sum.
+      4. Add bias once after all K-groups have been accumulated.
 
-    Args:
-        x: FP32 activation, shape ``[..., in_features]``.
-        weight_q: INT8 weight in canonical ``[out_features, in_features]``
-            layout, already ConvRot-rotated offline and per-output-channel
-            quantized.
-        weight_scale: FP32 per-output-channel weight scale, shape ``[out_features]``.
-        H: FP32 normalized regular Hadamard matrix, shape
-            ``[group_size, group_size]``. May be empty when ``group_size == 0``.
-        bias: FP32 bias, shape ``[out_features]``, or None if ``has_bias`` is False.
-        group_size: ConvRot block size (power of 4). 0 = skip rotation.
-        in_features: K dimension of the matmul.
-        out_features: N dimension of the matmul.
-        has_bias: Whether the bias input is present (must match the bias arg).
-
-    Returns:
-        Output with dtype selected by ``output_dtype`` (FP16 by default), shape
-        ``[..., out_features]``.
+    ``H`` is only used here for reference math. The runtime Triton kernels do
+    not receive H as an input; they implement the Hadamard as an in-register
+    butterfly.
     """
     if x.shape[-1] != in_features:
-        raise ValueError(
-            f"x last dim {x.shape[-1]} != in_features {in_features}"
-        )
+        raise ValueError(f"x last dim {x.shape[-1]} != in_features {in_features}")
     if weight_q.shape != (out_features, in_features):
-        raise ValueError(
-            f"weight_q shape {weight_q.shape} != ({out_features}, {in_features})"
-        )
+        raise ValueError(f"weight_q shape {weight_q.shape} != ({out_features}, {in_features})")
     if weight_scale.shape != (out_features,):
-        raise ValueError(
-            f"weight_scale shape {weight_scale.shape} != ({out_features},)"
-        )
-    if group_size != 0:
-        if H.shape != (group_size, group_size):
-            raise ValueError(
-                f"H shape {H.shape} != ({group_size}, {group_size})"
-            )
-        if in_features % group_size != 0:
-            raise ValueError(
-                f"in_features {in_features} not divisible by group_size {group_size}"
-            )
+        raise ValueError(f"weight_scale shape {weight_scale.shape} != ({out_features},)")
+    if group_size != 64:
+        raise ValueError(f"ConvRotInt8Linear plugin supports only group_size=64, got {group_size}")
+    if H.shape != (group_size, group_size):
+        raise ValueError(f"H shape {H.shape} != ({group_size}, {group_size})")
+    if in_features % group_size != 0:
+        raise ValueError(f"in_features {in_features} not divisible by group_size {group_size}")
     if has_bias:
         if bias is None:
             raise ValueError("has_bias=True but bias is None")
         if bias.shape != (out_features,):
-            raise ValueError(
-                f"bias shape {bias.shape} != ({out_features},)"
-            )
+            raise ValueError(f"bias shape {bias.shape} != ({out_features},)")
     elif bias is not None:
         raise ValueError("has_bias=False but bias is not None")
 
     x_f32 = np.ascontiguousarray(x, dtype=np.float32)
     orig_shape = x_f32.shape
 
-    # 1. ConvRot activation rotation: x_rot = x @ H_block.
-    #    Skipped when group_size == 0 (the "no rotation" sentinel).
-    if group_size != 0:
-        n_groups = in_features // group_size
-        x_grouped = x_f32.reshape(*orig_shape[:-1], n_groups, group_size)
-        H_f32 = np.ascontiguousarray(H, dtype=np.float32)
-        x_rot_grouped = np.matmul(x_grouped, H_f32)
-        x_rot = x_rot_grouped.reshape(*orig_shape[:-1], in_features)
-    else:
-        x_rot = x_f32
+    n_groups = in_features // group_size
+    x_grouped = x_f32.reshape(*orig_shape[:-1], n_groups, group_size)
+    H_f32 = np.ascontiguousarray(H, dtype=np.float32)
+    x_rot = np.matmul(x_grouped, H_f32).reshape(*orig_shape[:-1], in_features)
 
-    # 2. Per-row symmetric INT8 quantization of x_rot.
-    abs_max = np.max(np.abs(x_rot), axis=-1, keepdims=True)
-    abs_max_clamped = np.maximum(abs_max, np.float32(1e-30))
-    x_scale = (abs_max_clamped / np.float32(127.0)).astype(np.float32)
-    x_scaled = x_rot / x_scale
-    x_q = np.clip(np.rint(x_scaled), -127, 127).astype(np.int8)
+    block_k = 64
+    x_rot_2d = x_rot.reshape(-1, in_features)
+    weight_scale_2d = weight_scale.reshape(1, out_features)
+    out_2d = np.zeros((x_rot_2d.shape[0], out_features), dtype=np.float32)
 
-    # 3. INT8 × INT8 → INT32 matmul.
-    x_q_2d = x_q.reshape(-1, in_features)
-    acc = np.matmul(
-        x_q_2d.astype(np.int32),
-        weight_q.astype(np.int32).T,
-    )
+    for start in range(0, in_features, block_k):
+        end = min(start + block_k, in_features)
+        x_rot_g = x_rot_2d[:, start:end]
+        group_max = np.max(np.abs(x_rot_g), axis=1, keepdims=True)
+        group_scale = np.maximum(group_max, np.float32(1e-30)) / np.float32(127.0)
+        x_q_g = np.clip(np.rint(x_rot_g / group_scale), -127, 127).astype(np.int8)
 
-    # 4. Dequantize: acc * x_scale[M, 1] * weight_scale[None, N]
-    x_scale_2d = x_scale.reshape(-1, 1)
-    out_2d = (acc.astype(np.float32)
-              * x_scale_2d
-              * weight_scale.reshape(1, out_features))
+        w_q_g = weight_q[:, start:end].astype(np.int32)
+        partial = np.matmul(x_q_g.astype(np.int32), w_q_g.T)
+        out_2d += partial.astype(np.float32) * group_scale * weight_scale_2d
 
-    # 5. Add bias if present.
     if has_bias:
         bias_f32 = np.ascontiguousarray(bias, dtype=np.float32)
-        out_2d = out_2d + bias_f32.reshape(1, out_features)
+        out_2d += bias_f32.reshape(1, out_features)
 
-    # Reshape back to [..., out_features] and apply the v2 plugin output
-    # contract. Accumulation and scaling stay FP32; only the boundary tensor
-    # is narrowed, matching the CUDA epilogue.
     out = out_2d.reshape(*orig_shape[:-1], out_features)
     if output_dtype.upper() in {"FP16", "FLOAT16", "HALF"}:
         return out.astype(np.float16)
