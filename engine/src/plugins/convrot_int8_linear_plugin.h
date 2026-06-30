@@ -148,19 +148,19 @@ private:
     int32_t m_N{0};
 
 
-    // M>1 kernel 1: activation rotation + quantization
+    // Kernel 1: activation rotation + quantization. m_desc_quant points to a
+    // generated launch descriptor in convrot_int8_kernel_cubin.h; the plugin
+    // treats it opaquely so this public header need not include the large
+    // generated cubin inventory.
     void* m_module_quant{nullptr};
     void* m_kernelFunc_quant{nullptr};
-    size_t m_shared_bytes_quant{0};
-    int32_t m_block_m_quant{128};
-    int32_t m_block_k_quant{64};
+    void const* m_desc_quant{nullptr};
 
-    // M>1 kernel 2: INT8 GEMM + per-group dequant
+    // Kernel 2: INT8 GEMM + per-group dequant. Launch geometry, dynamic shared
+    // memory, and Triton ABI details live in the generated descriptor/stub.
     void* m_module_gemm{nullptr};
     void* m_kernelFunc_gemm{nullptr};
-    size_t m_shared_bytes_gemm{0};
-    int32_t m_block_m_gemm{128};
-    int32_t m_block_n_gemm{128};
+    void const* m_desc_gemm{nullptr};
 
     // Mutable field collection for serialization
     mutable std::vector<nvinfer1::PluginField> m_fields;

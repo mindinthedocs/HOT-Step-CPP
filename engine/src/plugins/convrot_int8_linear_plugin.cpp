@@ -54,16 +54,21 @@
 // Version 2: added _SHARED constants (shared-mem pre-flight check)
 // Version 3: added _BLOCK_M / _BLOCK_N (per-cubin tile selection)
 // Version 4: G64-only two-kernel inventory; M==1 uses the two-kernel path
+// Version 5: generated launch descriptors/stubs.  The C++ plugin no longer
+//            reconstructs Triton launch geometry from loose macros.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
-#  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/compile_triton_plugin_sm86.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 4
-#  error "Cubin header version >= 4 required (G64-only two-kernel inventory). Re-run tools/onnx-export/compile_triton_plugin_sm86.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 5
+#  error "Cubin header version >= 5 required (with generated launch metadata). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#endif
+#ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
+#  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #else
 // The generated cubin header is intentionally not committed because it is very
 // large. This branch still compiles for host-side checks without it; runtime
 // cubin lookup helpers below return empty payloads until the header is generated
-// with tools/onnx-export/compile_triton_plugin_sm86.py.
+// with tools/onnx-export/extract_jit_cubins_autotune.py.
 #endif
 #include <algorithm>
 #include <cctype>
@@ -80,6 +85,46 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+
+#if !CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
+namespace hotstep::convrot_int8_generated {
+enum class ConvRotKernelStage : int32_t { kQuant = 1, kGemm = 2 };
+struct ConvRotCubinDesc {
+    char const* logical_name{};
+    unsigned char const* data{};
+    size_t size{};
+    char const* function_name{};
+    ConvRotKernelStage stage{};
+    int32_t group_size{};
+    bool has_bias{};
+    int32_t input_dtype_id{};
+    int32_t output_dtype_id{};
+    int32_t block_m{1};
+    int32_t block_n{1};
+    int32_t block_k{1};
+    int32_t group_m{1};
+    uint32_t block_x{1};
+    uint32_t block_y{1};
+    uint32_t block_z{1};
+    size_t shared_bytes{};
+    int32_t num_warps{};
+    int32_t num_stages{};
+    int32_t maxnreg{};
+};
+inline constexpr ConvRotCubinDesc const* findConvRotCubin(
+    ConvRotKernelStage, int32_t, bool, int32_t, int32_t) { return nullptr; }
+inline uint32_t ceilDivU32(int32_t x, int32_t y) {
+    return static_cast<uint32_t>((x + y - 1) / y);
+}
+inline CUresult launchConvRotQuant(ConvRotCubinDesc const&, CUfunction, CUstream,
+    void const*, void*, void*, int32_t, int32_t, int32_t, int32_t, int32_t,
+    int32_t, int32_t, int32_t) { return CUDA_ERROR_INVALID_VALUE; }
+inline CUresult launchConvRotGemm(ConvRotCubinDesc const&, CUfunction, CUstream,
+    void*, void*, int8_t const*, float const*, void const*, void*, int32_t,
+    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+    int32_t, int32_t) { return CUDA_ERROR_INVALID_VALUE; }
+} // namespace hotstep::convrot_int8_generated
+#endif
 
 #if defined(_WIN32)
 #  define WIN32_LEAN_AND_MEAN 1
@@ -439,9 +484,6 @@ unsigned int getDeviceMaxDynamicSharedMem() {
 struct CachedModule {
     CUmodule module;
     CUfunction func;
-    size_t shared_bytes;
-    int block_m;
-    int block_n;
 };
 
 std::mutex& moduleCacheMutex() {
@@ -721,7 +763,7 @@ int32_t ConvRotInt8LinearPlugin::configurePlugin(
     // cubin header. The DiT exporter (tools/onnx-export/export_dit.py) emits
     // both FP16 and FP32 plugin boundary dtypes depending on the layer and
     // the HOTSTEP_W8A8_PLUGIN_IO_DTYPE env var, so the cubin header MUST
-    // contain both FP16IO and FP32IO variants (see compile_triton_plugin_sm86.py).
+    // contain both FP16IO and FP32IO variants (see extract_jit_cubins_autotune.py).
     destroyTriton();
     if (!initTriton()) {
         hotstep::diag::log(
@@ -762,8 +804,12 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
 
     int32_t const scale_groups = activationScaleGroups(K, m_group_size);
     size_t x_q_size = alignUp(static_cast<size_t>(maxM) * static_cast<size_t>(K), 16);
+    // X_scale is now FP32 (was FP16/uint16_t) — FP16 storage caused measurable
+    // quality reduction vs the ggml/non-Triton baselines.  The per-group scale
+    // is applied to every element of the INT32 partial accumulator, so even
+    // small FP16 rounding errors compound across K_groups.
     size_t x_scale_size = alignUp(
-        static_cast<size_t>(maxM) * static_cast<size_t>(scale_groups) * sizeof(uint16_t),
+        static_cast<size_t>(maxM) * static_cast<size_t>(scale_groups) * sizeof(float),
         16);
     return x_q_size + x_scale_size;
 }
@@ -938,11 +984,8 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         int32_t stride_ym = N;
         int32_t stride_yn = 1;
 
-        // Triton 3.7.x appends two hidden scratch-pointer parameters to every
-        // compiled entry point. They are unused for these kernels, but the CUDA
-        // launch ABI still requires two trailing null pointers.
-        void* triton_scratch1 = nullptr;
-        void* triton_scratch2 = nullptr;
+        // Generated launch stubs in convrot_int8_kernel_cubin.h own the exact
+        // Triton launch ABI, including trailing scratch-pointer parameters.
 
         if (!m_kernelFunc_quant || !m_kernelFunc_gemm || workspace == nullptr) {
 #ifdef HOTSTEP_DIAGNOSTICS
@@ -962,32 +1005,25 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         int32_t stride_xsm = activationScaleGroups(K, m_group_size);
         int32_t stride_xsg = 1;
 
-        uint32_t const gridX1 = static_cast<uint32_t>((M + m_block_m_quant - 1) / m_block_m_quant);
-        uint32_t const gridY1 = static_cast<uint32_t>((K + m_block_k_quant - 1) / m_block_k_quant);
-        void* params1[] = {
-            &x_ptr,
-            &xq_ptr,
-            &xs_ptr,
-            &M,
-            &K,
-            &stride_xm,
-            &stride_xk,
-            &stride_xqm,
-            &stride_xqk,
-            &stride_xsm,
-            &stride_xsg,
-            &triton_scratch1,
-            &triton_scratch2,
-        };
+        auto const* quant_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
+        auto const* gemm_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
+        if (quant_desc == nullptr || gemm_desc == nullptr) return -1;
 
-        CUresult status = cuLaunchKernel(
+        CUresult status = hotstep::convrot_int8_generated::launchConvRotQuant(
+            *quant_desc,
             static_cast<CUfunction>(m_kernelFunc_quant),
-            gridX1, gridY1, 1,
-            128, 1, 1,
-            static_cast<unsigned int>(m_shared_bytes_quant),
-            stream,
-            params1,
-            nullptr);
+            static_cast<CUstream>(stream),
+            x_ptr,
+            xq_ptr,
+            xs_ptr,
+            M,
+            K,
+            stride_xm,
+            stride_xk,
+            stride_xqm,
+            stride_xqk,
+            stride_xsm,
+            stride_xsg);
         if (status != CUDA_SUCCESS) {
 #ifdef HOTSTEP_DIAGNOSTICS
             char const* err_str = "unknown";
@@ -1006,14 +1042,15 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
                                static_cast<CUfunction>(m_kernelFunc_quant));
             hotstep::diag::log(
                          "[ConvRotInt8Linear] enqueue FAILURE: quant cuLaunchKernel failed: %s "
-                         "(code=%d, tactic=%d, group_size=%d, grid=(%u,%u,%u), block=(%u,%u,%u), "
-                         "shared_mem_requested=%u, shared_mem_static=%d bytes, num_regs=%d, "
-                         "max_threads_per_block=%d, cudaPeekAtLastError=%d (%s), M=%d, K=%d, N=%d, "
-                         "input_dtype=%s, output_dtype=%s)\n",
-                         err_str, status, m_tactic, m_group_size,
-                         gridX1, gridY1, 1u,
-                         128u, 1u, 1u,
-                         static_cast<unsigned int>(m_shared_bytes_quant), shared_bytes_static, num_regs, max_threads_per_block,
+                         "(code=%d, tactic=%d, group_size=%d, kernel=%s, grid=(%u,%u,%u), "
+                         "block=(%u,%u,%u), shared_mem_requested=%u, shared_mem_static=%d bytes, "
+                         "num_regs=%d, max_threads_per_block=%d, cudaPeekAtLastError=%d (%s), "
+                         "M=%d, K=%d, N=%d, input_dtype=%s, output_dtype=%s)\n",
+                         err_str, status, m_tactic, m_group_size, quant_desc->logical_name,
+                         hotstep::convrot_int8_generated::ceilDivU32(M, quant_desc->block_m),
+                         hotstep::convrot_int8_generated::ceilDivU32(K, quant_desc->block_k), 1u,
+                         quant_desc->block_x, quant_desc->block_y, quant_desc->block_z,
+                         static_cast<unsigned int>(quant_desc->shared_bytes), shared_bytes_static, num_regs, max_threads_per_block,
                          static_cast<int>(async_status), cudaGetErrorString(async_status),
                          M, K, N,
                          dtypeNameFromId(m_input_dtype_id),
@@ -1023,39 +1060,31 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             return -1;
         }
 
-        uint32_t const gridM2 = static_cast<uint32_t>((M + m_block_m_gemm - 1) / m_block_m_gemm);
-        uint32_t const gridN2 = static_cast<uint32_t>((N + m_block_n_gemm - 1) / m_block_n_gemm);
-        void* params2[] = {
-            &xq_ptr,
-            &xs_ptr,
-            &wq_ptr,
-            &ws_ptr,
-            &bias_ptr,
-            &y_ptr,
-            &M,
-            &N,
-            &K,
-            &stride_xqm,
-            &stride_xqk,
-            &stride_xsm,
-            &stride_xsg,
-            &stride_wn,
-            &stride_wk,
-            &stride_ym,
-            &stride_yn,
-            &triton_scratch1,
-            &triton_scratch2,
-        };
-
-        status = cuLaunchKernel(
+        status = hotstep::convrot_int8_generated::launchConvRotGemm(
+            *gemm_desc,
             static_cast<CUfunction>(m_kernelFunc_gemm),
-            gridM2 * gridN2, 1, 1,
-            128, 1, 1,
-            static_cast<unsigned int>(m_shared_bytes_gemm),
-            stream,
-            params2,
-            nullptr);
-        return status == CUDA_SUCCESS ? 0 : -1;
+            static_cast<CUstream>(stream),
+            xq_ptr,
+            xs_ptr,
+            wq_ptr,
+            ws_ptr,
+            bias_ptr,
+            y_ptr,
+            M,
+            N,
+            K,
+            stride_xqm,
+            stride_xqk,
+            stride_xsm,
+            stride_xsg,
+            stride_wn,
+            stride_wk,
+            stride_ym,
+            stride_yn);
+        if (status != CUDA_SUCCESS) {
+            return -1;
+        }
+        return 0;
     } catch (...) {
         return -1;
     }
@@ -1125,94 +1154,54 @@ namespace {
 // The current generated Triton inventory supports only group_size=64; there
 // is no no-rotation G0 cubin and no legacy G256 cubin.
 
-// Map (tile, group_size, has_bias, dtype_suffix) -> compiled cubin payload.
-// Returns {nullptr, 0} if no cubin was compiled for this combination.
-// IMPORTANT: this switch must stay in lock-step with compile_triton_plugin_sm86.py's
-// GROUP_SIZES, BIAS_CONFIGS, and DTYPE_CONFIGS lists. The current sm86-first
-// generator emits only group size 64: K1 G64 × {FP16IO, FP32IO} plus K2 G64 ×
-// {BIAS, NOBIAS} × {FP16IO, FP32IO}. Do not reference G0, G256, or M1 symbols
-// unless you also intentionally restore and regenerate those variants.
-struct CubinPayload {
+#if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
+using GeneratedCubinDesc = hotstep::convrot_int8_generated::ConvRotCubinDesc;
+
+GeneratedCubinDesc const* selectCubinK1(int32_t group_size,
+                                        int32_t input_dtype_id,
+                                        int32_t output_dtype_id) {
+    return hotstep::convrot_int8_generated::findConvRotCubin(
+        hotstep::convrot_int8_generated::ConvRotKernelStage::kQuant,
+        group_size,
+        false,
+        input_dtype_id,
+        output_dtype_id);
+}
+
+GeneratedCubinDesc const* selectCubinK2(int32_t group_size,
+                                        bool has_bias,
+                                        int32_t input_dtype_id,
+                                        int32_t output_dtype_id) {
+    return hotstep::convrot_int8_generated::findConvRotCubin(
+        hotstep::convrot_int8_generated::ConvRotKernelStage::kGemm,
+        group_size,
+        has_bias,
+        input_dtype_id,
+        output_dtype_id);
+}
+#else
+struct GeneratedCubinDesc {
+    char const* logical_name;
     unsigned char const* data;
     size_t size;
+    char const* function_name;
     size_t shared_bytes;
-    int32_t block_m;
-    int32_t block_n_or_k;
 };
-
-char const* dtypeSuffixFor(int32_t input_dtype_id, int32_t output_dtype_id) {
-    bool const in_fp16 = (input_dtype_id == 10);
-    bool const out_fp16 = (output_dtype_id == 10);
-    bool const in_fp32 = (input_dtype_id == 1);
-    bool const out_fp32 = (output_dtype_id == 1);
-    if (in_fp16 && out_fp16) return "FP16IO";
-    if (in_fp32 && out_fp32) return "FP32IO";
-    return nullptr;
-}
-
-#if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
-#define LOOKUP_K1(TILE, GS, DTYPE) \
-    return {kCONVROT_INT8_KERNEL1_K1_##TILE##_G##GS##_##DTYPE, \
-            kCONVROT_INT8_KERNEL1_K1_##TILE##_G##GS##_##DTYPE##_SIZE, \
-            kCONVROT_INT8_KERNEL1_K1_##TILE##_G##GS##_##DTYPE##_SHARED, \
-            kCONVROT_INT8_KERNEL1_K1_##TILE##_G##GS##_##DTYPE##_BLOCK_M, \
-            kCONVROT_INT8_KERNEL1_K1_##TILE##_G##GS##_##DTYPE##_BLOCK_K};
-
-#define LOOKUP_K2(TILE, GS, BIAS, DTYPE) \
-    return {kCONVROT_INT8_KERNEL2_K2_##TILE##_G##GS##_##BIAS##_##DTYPE, \
-            kCONVROT_INT8_KERNEL2_K2_##TILE##_G##GS##_##BIAS##_##DTYPE##_SIZE, \
-            kCONVROT_INT8_KERNEL2_K2_##TILE##_G##GS##_##BIAS##_##DTYPE##_SHARED, \
-            kCONVROT_INT8_KERNEL2_K2_##TILE##_G##GS##_##BIAS##_##DTYPE##_BLOCK_M, \
-            kCONVROT_INT8_KERNEL2_K2_##TILE##_G##GS##_##BIAS##_##DTYPE##_BLOCK_N};
-
-CubinPayload selectCubinK1(int32_t group_size, char const* dtype_suffix) {
-    if (!dtype_suffix) return {nullptr, 0, 0, 0, 0};
-    if (std::strcmp(dtype_suffix, "FP16IO") == 0) {
-        switch (group_size) {
-            case 64:  LOOKUP_K1(128X128, 64, FP16IO)
-        }
-    } else {
-        switch (group_size) {
-            case 64:  LOOKUP_K1(128X128, 64, FP32IO)
-        }
-    }
-    return {nullptr, 0, 0, 0, 0};
-}
-
-CubinPayload selectCubinK2(int32_t group_size, bool has_bias, char const* dtype_suffix) {
-    if (!dtype_suffix) return {nullptr, 0, 0, 0, 0};
-    if (std::strcmp(dtype_suffix, "FP16IO") == 0) {
-        switch (group_size) {
-            case 64:  if (has_bias) { LOOKUP_K2(128X128, 64, BIAS, FP16IO) } else { LOOKUP_K2(128X128, 64, NOBIAS, FP16IO) } break;
-        }
-    } else {
-        switch (group_size) {
-            case 64:  if (has_bias) { LOOKUP_K2(128X128, 64, BIAS, FP32IO) } else { LOOKUP_K2(128X128, 64, NOBIAS, FP32IO) } break;
-        }
-    }
-    return {nullptr, 0, 0, 0, 0};
-}
-
-#else
-CubinPayload selectCubinK1(int32_t, char const*) { return {nullptr, 0, 0, 0, 0}; }
-CubinPayload selectCubinK2(int32_t, bool, char const*) { return {nullptr, 0, 0, 0, 0}; }
+GeneratedCubinDesc const* selectCubinK1(int32_t, int32_t, int32_t) { return nullptr; }
+GeneratedCubinDesc const* selectCubinK2(int32_t, bool, int32_t, int32_t) { return nullptr; }
 #endif
 
-bool loadOrReuseKernel(CubinPayload const& cubin,
-                       char const* kernel_name,
+bool loadOrReuseKernel(GeneratedCubinDesc const* cubin,
                        void** module_out,
-                       void** func_out,
-                       size_t* shared_out,
-                       int32_t* block_m_out,
-                       int32_t* block_n_or_k_out) {
-    if (cubin.data == nullptr || cubin.size == 0) return false;
+                       void** func_out) {
+    if (cubin == nullptr || cubin->data == nullptr || cubin->size == 0) return false;
 
     unsigned int const device_max_smem = getDeviceMaxDynamicSharedMem();
-    if (cubin.shared_bytes > device_max_smem) {
+    if (cubin->shared_bytes > device_max_smem) {
         hotstep::diag::log(
             "[ConvRotInt8Linear] Triton cubin %s requires %zu bytes of dynamic shared memory, "
             "but the device only supports %u bytes.\n",
-            kernel_name, cubin.shared_bytes, device_max_smem);
+            cubin->logical_name, cubin->shared_bytes, device_max_smem);
         return false;
     }
 
@@ -1220,66 +1209,59 @@ bool loadOrReuseKernel(CubinPayload const& cubin,
     {
         std::lock_guard<std::mutex> lock(moduleCacheMutex());
         auto& cache = moduleCache();
-        auto it = cache.find(cubin.data);
+        auto it = cache.find(cubin->data);
         if (it == cache.end()) {
             CUmodule new_module = nullptr;
-            CUresult status = cuModuleLoadData(&new_module, cubin.data);
+            CUresult status = cuModuleLoadData(&new_module, cubin->data);
             if (status != CUDA_SUCCESS) {
                 char const* err_str = "unknown";
                 cuGetErrorString(status, &err_str);
                 hotstep::diag::log("[ConvRotInt8Linear] cuModuleLoadData(%s) failed: %s (%d).\n",
-                                   kernel_name, err_str, static_cast<int>(status));
+                                   cubin->logical_name, err_str, static_cast<int>(status));
                 return false;
             }
 
             CUfunction new_func = nullptr;
-            status = cuModuleGetFunction(&new_func, new_module, kernel_name);
+            status = cuModuleGetFunction(&new_func, new_module, cubin->function_name);
             if (status != CUDA_SUCCESS) {
                 char const* err_str = "unknown";
                 cuGetErrorString(status, &err_str);
-                hotstep::diag::log("[ConvRotInt8Linear] cuModuleGetFunction(%s) failed: %s (%d).\n",
-                                   kernel_name, err_str, static_cast<int>(status));
+                hotstep::diag::log("[ConvRotInt8Linear] cuModuleGetFunction(%s/%s) failed: %s (%d).\n",
+                                   cubin->logical_name, cubin->function_name, err_str, static_cast<int>(status));
                 cuModuleUnload(new_module);
                 return false;
             }
 
-            if (cubin.shared_bytes > 48 * 1024) {
+            if (cubin->shared_bytes > 48 * 1024) {
                 status = cuFuncSetAttribute(
                     new_func,
                     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    static_cast<int>(cubin.shared_bytes));
+                    static_cast<int>(cubin->shared_bytes));
                 if (status != CUDA_SUCCESS) {
                     char const* err_str = "unknown";
                     cuGetErrorString(status, &err_str);
                     hotstep::diag::log(
                         "[ConvRotInt8Linear] cuFuncSetAttribute(%s, %zu) failed: %s (%d).\n",
-                        kernel_name, cubin.shared_bytes, err_str, static_cast<int>(status));
+                        cubin->logical_name, cubin->shared_bytes, err_str, static_cast<int>(status));
                     cuModuleUnload(new_module);
                     return false;
                 }
             }
 
-            it = cache.emplace(cubin.data,
-                               CachedModule{new_module, new_func, cubin.shared_bytes,
-                                            static_cast<int>(cubin.block_m),
-                                            static_cast<int>(cubin.block_n_or_k)}).first;
+            it = cache.emplace(cubin->data, CachedModule{new_module, new_func}).first;
         }
         cached = it->second;
     }
 
     if (module_out) *module_out = cached.module;
     if (func_out) *func_out = cached.func;
-    if (shared_out) *shared_out = cached.shared_bytes;
-    if (block_m_out) *block_m_out = cached.block_m;
-    if (block_n_or_k_out) *block_n_or_k_out = cached.block_n;
     return true;
 }
 
 } // namespace
 
 bool ConvRotInt8LinearPlugin::initTriton() {
-    char const* dtype_suffix = dtypeSuffixFor(m_input_dtype_id, m_output_dtype_id);
-    if (!dtype_suffix) {
+    if (!isSupportedPluginBoundaryDtypePair(m_input_dtype_id, m_output_dtype_id)) {
         hotstep::diag::log(
             "[ConvRotInt8Linear] No compiled Triton cubin for input_dtype=%s, output_dtype=%s. "
             "Only exact FP16->FP16 and FP32->FP32 plugin boundary dtypes are supported.\n",
@@ -1287,41 +1269,47 @@ bool ConvRotInt8LinearPlugin::initTriton() {
         return false;
     }
 
-    if (m_kernelFunc_quant != nullptr && m_kernelFunc_gemm != nullptr) return true;
+    if (m_kernelFunc_quant != nullptr && m_kernelFunc_gemm != nullptr &&
+        m_desc_quant != nullptr && m_desc_gemm != nullptr) {
+        return true;
+    }
 
-    CubinPayload const quant_cubin = selectCubinK1(m_group_size, dtype_suffix);
-    CubinPayload const gemm_cubin = selectCubinK2(m_group_size, m_has_bias != 0, dtype_suffix);
+    GeneratedCubinDesc const* quant_cubin = selectCubinK1(
+        m_group_size, m_input_dtype_id, m_output_dtype_id);
+    GeneratedCubinDesc const* gemm_cubin = selectCubinK2(
+        m_group_size, m_has_bias != 0, m_input_dtype_id, m_output_dtype_id);
+    if (quant_cubin == nullptr || gemm_cubin == nullptr) {
+        hotstep::diag::log(
+            "[ConvRotInt8Linear] Missing generated cubin descriptor for group_size=%d, "
+            "has_bias=%d, input_dtype=%s, output_dtype=%s.\n",
+            m_group_size, m_has_bias,
+            dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id));
+        return false;
+    }
 
-    return loadOrReuseKernel(
-               quant_cubin,
-               "kernel1_convrot_quant",
-               &m_module_quant,
-               &m_kernelFunc_quant,
-               &m_shared_bytes_quant,
-               &m_block_m_quant,
-               &m_block_k_quant) &&
-           loadOrReuseKernel(
-               gemm_cubin,
-               "kernel2_gemm_dequant",
-               &m_module_gemm,
-               &m_kernelFunc_gemm,
-               &m_shared_bytes_gemm,
-               &m_block_m_gemm,
-               &m_block_n_gemm);
+    bool const ok_quant = loadOrReuseKernel(
+        quant_cubin,
+        &m_module_quant,
+        &m_kernelFunc_quant);
+    bool const ok_gemm = ok_quant && loadOrReuseKernel(
+        gemm_cubin,
+        &m_module_gemm,
+        &m_kernelFunc_gemm);
+    if (!ok_gemm) return false;
+
+    m_desc_quant = quant_cubin;
+    m_desc_gemm = gemm_cubin;
+    return true;
 }
 
 void ConvRotInt8LinearPlugin::destroyTriton() {
     m_module_quant = nullptr;
     m_kernelFunc_quant = nullptr;
-    m_shared_bytes_quant = 0;
-    m_block_m_quant = 128;
-    m_block_k_quant = 64;
+    m_desc_quant = nullptr;
 
     m_module_gemm = nullptr;
     m_kernelFunc_gemm = nullptr;
-    m_shared_bytes_gemm = 0;
-    m_block_m_gemm = 128;
-    m_block_n_gemm = 128;
+    m_desc_gemm = nullptr;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1428,7 +1416,7 @@ HOTSTEP_PLUGIN_EXPORT int hotstep_register_plugins() {
         // (via hotstep_plugin_diag.log) which dtype variants are actually
         // compiled into the DLL. This catches the common failure mode where
         // the user updated the C++ source but forgot to re-run
-        // compile_triton_plugin_sm86.py to regenerate the header with the
+        // extract_jit_cubins_autotune.py to regenerate the header with the
         // new DTYPE_CONFIGS — in that case the CONVROT_INT8_HAS_DTYPE_*
         // markers below will be missing and dtypeSuffixFor() will return
         // nullptr for every plugin invocation.
@@ -1445,7 +1433,7 @@ HOTSTEP_PLUGIN_EXPORT int hotstep_register_plugins() {
         hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = UNDEFINED (no FP32-in/FP32-out cubins)\n");
 #endif
         hotstep::diag::log("If both are UNDEFINED, you forgot to re-run "
-                         "tools/onnx-export/compile_triton_plugin_sm86.py to regenerate "
+                         "tools/onnx-export/extract_jit_cubins_autotune.py to regenerate "
                          "engine/src/plugins/assets/convrot_int8_kernel_cubin.h after "
                          "updating the C++ plugin source.\n");
         hotstep::diag::log("Log file path: %s (override with HOTSTEP_PLUGIN_LOG env var)\n",

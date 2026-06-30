@@ -123,7 +123,7 @@ def kernel1_convrot_quant(
     mask = (rm[:, None] < M) & (rk[None, :] < K)
 
     x_ptr_block = X_ptr + ram[:, None] * stride_xm + rk[None, :] * stride_xk
-    x_block = tl.load(x_ptr_block, mask=mask, other=0.0)
+    x_block = tl.load(x_ptr_block, mask=mask, other=0.0, eviction_policy="evict_first")
     if INPUT_FP16:
         x_block = x_block.to(tl.float32)
 
@@ -141,7 +141,11 @@ def kernel1_convrot_quant(
 
     group_idx = pid_k // BLOCK_K
     xs_ptr_block = X_scale_ptr + rm * stride_xsm + group_idx * stride_xsg
-    tl.store(xs_ptr_block, scale.to(tl.float16), mask=rm < M)
+    # Store scale as FP32 (not FP16) — FP16 storage caused measurable quality
+    # reduction vs the ggml/non-Triton baselines.  The per-group scale is
+    # applied to every element of the INT32 partial accumulator, so even
+    # small FP16 rounding errors compound across K_groups.
+    tl.store(xs_ptr_block, scale, mask=rm < M)
 
 
 # ─── Kernel 2: INT8 GEMM + per-group dequant ───────────────────────────────
@@ -168,17 +172,42 @@ def kernel2_gemm_dequant(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     OUTPUT_FP16: tl.constexpr,
 ):
-    """Consume quantized activations and accumulate dequantized FP32 output."""
+    """Consume quantized activations and accumulate dequantized FP32 output.
+
+    Includes L2-cache-friendly program swizzle (super-grouping) and eviction
+    policy hints.  GROUP_M controls how many M-tiles are grouped together in
+    the launch order — programs within a group share X_q L2 residency.
+
+    On 2 MB L2 (GA107M / RTX 3050 Laptop): GROUP_M=4 with BLOCK_M=128, K=2560
+    → 4 × 128 × 2560 = 1.28 MB, fits in L2 with room for W streaming.
+    GROUP_M=8 would be 2.56 MB — thrashes the cache.
+    """
     tl.static_assert(BLOCK_K == 64, "Kernel 2 expects 64-wide activation quant groups")
 
     pid = tl.program_id(0)
+    # NOTE: num_pid_m / num_pid_n must NOT be `tl.constexpr` — M and N are
+    # runtime int32 parameters, so tl.cdiv returns a runtime value.  The
+    # swizzle math below works fine at runtime; it does not need compile-time
+    # constants.  Forcing `: tl.constexpr` here raises
+    # "_semantic argument must be provided outside of JIT functions".
     num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
 
-    pid_m = (pid % num_pid_m) * BLOCK_M
-    pid_n = (pid // num_pid_m) * BLOCK_N
+    # L2 swizzle: super-group M-tiles so adjacent pids share X_q L2 residency.
+    # This is the canonical Triton matmul tutorial swizzle (03-matrix-multiplication).
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    pid_m = pid_m * BLOCK_M
+    pid_n = pid_n * BLOCK_N
 
     rm = pid_m + tl.arange(0, BLOCK_M)
     rn = pid_n + tl.arange(0, BLOCK_N)
@@ -186,22 +215,32 @@ def kernel2_gemm_dequant(
     rbn = rn % N
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # W_scale is per-channel [N] — load once, reuse across all K-groups.
     ws = tl.load(W_scale_ptr + rn, mask=rn < N, other=0.0)
 
     for k_offset in tl.range(0, K, BLOCK_K):
         cols_k = k_offset + tl.arange(0, BLOCK_K)
 
+        # X_q is reused across K-groups within one program → evict_last (keep in L2).
         xq_ptr_block = X_q_ptr + ram[:, None] * stride_xqm + cols_k[None, :] * stride_xqk
-        xq = tl.load(xq_ptr_block, mask=(rm[:, None] < M) & (cols_k[None, :] < K), other=0)
+        xq = tl.load(xq_ptr_block,
+                     mask=(rm[:, None] < M) & (cols_k[None, :] < K),
+                     other=0,
+                     eviction_policy="evict_last")
 
+        # W_q is streamed once per K-group, not reused → evict_first (don't pollute L2).
         wq_ptr_block = W_q_ptr + rbn[:, None] * stride_wn + cols_k[None, :] * stride_wk
-        wq = tl.load(wq_ptr_block, mask=(rn[:, None] < N) & (cols_k[None, :] < K), other=0)
+        wq = tl.load(wq_ptr_block,
+                     mask=(rn[:, None] < N) & (cols_k[None, :] < K),
+                     other=0,
+                     eviction_policy="evict_first")
 
         partial = tl.dot(xq, tl.trans(wq), allow_tf32=False)
 
         group_idx = k_offset // BLOCK_K
         xs_ptr_block = X_scale_ptr + ram * stride_xsm + group_idx * stride_xsg
-        xs = tl.load(xs_ptr_block, mask=rm < M, other=0.0).to(tl.float32)
+        # X_scale is now stored as FP32 (was FP16) — no upcast needed.
+        xs = tl.load(xs_ptr_block, mask=rm < M, other=0.0)
 
         acc += partial.to(tl.float32) * xs[:, None] * ws[None, :]
 
