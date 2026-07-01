@@ -83,18 +83,19 @@ def conv_rot_int8_linear_reference(
     one K-group at a time. This reference follows that math:
 
       1. Apply the activation-side ConvRot transform group-wise. The compiled
-         TensorRT plugin supports only ``group_size == 64``; the Python
-         reference still checks the attribute explicitly so invalid test inputs
-         fail near the source.
-      2. Split K into 64-wide quantization groups.
+         TensorRT plugin supports ``group_size == 256`` (per
+         CONVROT_OPTIMAL_TWO_KERNEL_SPEC.md).  ``group_size == 0`` is also
+         accepted as a no-rotation sentinel for testing with small inputs.
+      2. Split K into ``group_size``-wide quantization groups.
       3. For each group, compute one activation scale per row, quantize the
          group to INT8, form the INT32 dot product against the matching weight
          slice, and immediately dequantize that partial sum.
       4. Add bias once after all K-groups have been accumulated.
 
-    ``H`` is only used here for reference math. The runtime Triton kernels do
-    not receive H as an input; they implement the Hadamard as an in-register
-    butterfly.
+    ``H`` is only used here for reference math. The runtime Triton kernels
+    generate a 16x16 regular-Hadamard factor in registers and compute the
+    full ``H_256`` via a separable ``tl.dot``-based Kronecker transform (not
+    a dense matrix multiply).
     """
     if x.shape[-1] != in_features:
         raise ValueError(f"x last dim {x.shape[-1]} != in_features {in_features}")
@@ -102,11 +103,11 @@ def conv_rot_int8_linear_reference(
         raise ValueError(f"weight_q shape {weight_q.shape} != ({out_features}, {in_features})")
     if weight_scale.shape != (out_features,):
         raise ValueError(f"weight_scale shape {weight_scale.shape} != ({out_features},)")
-    if group_size != 64:
-        raise ValueError(f"ConvRotInt8Linear plugin supports only group_size=64, got {group_size}")
-    if H.shape != (group_size, group_size):
+    if group_size not in (0, 256):
+        raise ValueError(f"ConvRotInt8Linear plugin supports group_size=256 (or 0 for no-rotation test), got {group_size}")
+    if group_size != 0 and H.shape != (group_size, group_size):
         raise ValueError(f"H shape {H.shape} != ({group_size}, {group_size})")
-    if in_features % group_size != 0:
+    if group_size != 0 and in_features % group_size != 0:
         raise ValueError(f"in_features {in_features} not divisible by group_size {group_size}")
     if has_bias:
         if bias is None:
@@ -119,12 +120,18 @@ def conv_rot_int8_linear_reference(
     x_f32 = np.ascontiguousarray(x, dtype=np.float32)
     orig_shape = x_f32.shape
 
-    n_groups = in_features // group_size
-    x_grouped = x_f32.reshape(*orig_shape[:-1], n_groups, group_size)
-    H_f32 = np.ascontiguousarray(H, dtype=np.float32)
-    x_rot = np.matmul(x_grouped, H_f32).reshape(*orig_shape[:-1], in_features)
+    if group_size == 0:
+        # No-rotation sentinel (testing only): skip the Hadamard, treat the
+        # entire row as one quantization group.
+        x_rot = x_f32
+        block_k = in_features if in_features > 0 else 1
+    else:
+        n_groups = in_features // group_size
+        x_grouped = x_f32.reshape(*orig_shape[:-1], n_groups, group_size)
+        H_f32 = np.ascontiguousarray(H, dtype=np.float32)
+        x_rot = np.matmul(x_grouped, H_f32).reshape(*orig_shape[:-1], in_features)
+        block_k = group_size
 
-    block_k = 64
     x_rot_2d = x_rot.reshape(-1, in_features)
     weight_scale_2d = weight_scale.reshape(1, out_features)
     out_2d = np.zeros((x_rot_2d.shape[0], out_features), dtype=np.float32)

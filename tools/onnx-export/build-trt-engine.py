@@ -392,8 +392,6 @@ def build_engine(args) -> tuple[Path, Path, Path]:
         else:
             print("[TRT Build] WARNING: TensorRT Python API does not expose BuilderFlag.EDITABLE_TIMING_CACHE.")
 
-    if hasattr(trt.BuilderFlag, "TF32"):
-        config.clear_flag(trt.BuilderFlag.TF32)
 
     attach_progress_monitor(trt, config)
 

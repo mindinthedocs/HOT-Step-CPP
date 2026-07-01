@@ -162,6 +162,11 @@ private:
     void* m_kernelFunc_gemm{nullptr};
     void const* m_desc_gemm{nullptr};
 
+    // Device SM count — queried once at initTriton() for persistent-kernel
+    // grid computation (min(NUM_SMS, num_tiles)).  Passed as a runtime int32
+    // arg to both kernels.
+    int32_t m_num_sms{0};
+
     // Mutable field collection for serialization
     mutable std::vector<nvinfer1::PluginField> m_fields;
     mutable nvinfer1::PluginFieldCollection m_fc{};

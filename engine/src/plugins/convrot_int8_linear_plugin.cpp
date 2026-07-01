@@ -46,7 +46,7 @@
 // ── Cubin header version guard ─────────────────────────────────────────────
 // The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 4.
 // Version 3 added per-cubin tile dimensions; version 4 additionally reflects
-// the intentionally smaller cubin inventory: G64 only, and no specialized M1
+// the intentionally smaller cubin inventory: G256 only (plus optional G0 sentinel), and no specialized M1
 // cubins. Referencing removed G0/G256/M1 symbols here would make the plugin
 // silently depend on an oversized stale generated header.
 //
@@ -56,10 +56,12 @@
 // Version 4: G64-only two-kernel inventory; M==1 uses the two-kernel path
 // Version 5: generated launch descriptors/stubs.  The C++ plugin no longer
 //            reconstructs Triton launch geometry from loose macros.
+// Version 6: GROUP_SIZE=256, TC-based rotation (H_16⊗H_16), decoupled BLOCK_K,
+//            persistent grid-stride launch, transposed X_scale layout.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 5
-#  error "Cubin header version >= 5 required (with generated launch metadata). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 6
+#  error "Cubin header version >= 6 required (GROUP_SIZE=256, TC rotation, persistent launch). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -467,7 +469,7 @@ unsigned int getDeviceMaxDynamicSharedMem() {
 //     when the process exits.
 //
 // With this cache, the first DiT step loads only the unique two-kernel cubins
-// needed by the engine (for example, K1_G64_FP32IO plus the G64 FP32IO K2
+// needed by the engine (for example, K1_G256_FP32IO plus the G256 FP32IO K2
 // BIAS/NOBIAS variants when both bias modes occur).
 // Subsequent steps hit the cache — zero cuModuleLoadData calls, zero
 // cuModuleGetFunction calls, zero cuFuncSetAttribute calls. initTriton()
@@ -597,16 +599,15 @@ bool readPluginString(nvinfer1::PluginField const& f, char* dst, size_t dstSize)
 }
 
 bool validGroupSize(int32_t groupSize, int32_t K) {
-    // The generated Triton cubin inventory is intentionally G64-only. The
-    // current DiT TensorRT layer JSON had no group_size=0 plugins, and group
-    // size 256 is no longer exported, so accepting those values would only
-    // defer the failure until cubin lookup.
-    return groupSize == 64 && K > 0 && K % 64 == 0;
+    // Version 6 supports GROUP_SIZE=256 per CONVROT_OPTIMAL_TWO_KERNEL_SPEC.md.
+    // groupSize=0 is also accepted as a no-rotation sentinel for testing.
+    if (K <= 0) return false;
+    if (groupSize == 0) return true;
+    return groupSize == 256 && K % 256 == 0;
 }
 
 int32_t activationBlockKForGroupSize(int32_t groupSize) {
-    (void)groupSize;
-    return 64;
+    return (groupSize == 0) ? 1 : groupSize;
 }
 
 int32_t activationScaleGroups(int32_t K, int32_t groupSize) {
@@ -1002,8 +1003,12 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
 
         int32_t stride_xqm = K;
         int32_t stride_xqk = 1;
-        int32_t stride_xsm = activationScaleGroups(K, m_group_size);
-        int32_t stride_xsg = 1;
+        // X_scale workspace layout: TRANSPOSED [n_groups, M] row-major.
+        // (Per CONVROT_OPTIMAL_TWO_KERNEL_SPEC.md §1.3: makes per-row writes/reads
+        // coalesced — consecutive rm values become adjacent 4-byte floats.)
+        // stride_xsm = 1 (M is the inner stride), stride_xsg = M (group is outer).
+        int32_t stride_xsm = 1;
+        int32_t stride_xsg = M;
 
         auto const* quant_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
         auto const* gemm_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
@@ -1018,6 +1023,7 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             xs_ptr,
             M,
             K,
+            m_num_sms,              // NUM_SMS (persistent grid-stride loop)
             stride_xm,
             stride_xk,
             stride_xqm,
@@ -1042,13 +1048,19 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
                                static_cast<CUfunction>(m_kernelFunc_quant));
             hotstep::diag::log(
                          "[ConvRotInt8Linear] enqueue FAILURE: quant cuLaunchKernel failed: %s "
-                         "(code=%d, tactic=%d, group_size=%d, kernel=%s, grid=(%u,%u,%u), "
+                         "(code=%d, tactic=%d, group_size=%d, kernel=%s, "
+                         "persistent grid=(%u,1,1) [num_sms=%u, num_pid_m=%u, num_k_groups=%u], "
                          "block=(%u,%u,%u), shared_mem_requested=%u, shared_mem_static=%d bytes, "
                          "num_regs=%d, max_threads_per_block=%d, cudaPeekAtLastError=%d (%s), "
                          "M=%d, K=%d, N=%d, input_dtype=%s, output_dtype=%s)\n",
                          err_str, status, m_tactic, m_group_size, quant_desc->logical_name,
+                         hotstep::convrot_int8_generated::persistentGridU32(
+                             hotstep::convrot_int8_generated::ceilDivU32(M, quant_desc->block_m) *
+                             static_cast<uint32_t>(K / m_group_size),
+                             static_cast<uint32_t>(m_num_sms)),
+                         static_cast<uint32_t>(m_num_sms),
                          hotstep::convrot_int8_generated::ceilDivU32(M, quant_desc->block_m),
-                         hotstep::convrot_int8_generated::ceilDivU32(K, quant_desc->block_k), 1u,
+                         static_cast<uint32_t>(K / m_group_size),
                          quant_desc->block_x, quant_desc->block_y, quant_desc->block_z,
                          static_cast<unsigned int>(quant_desc->shared_bytes), shared_bytes_static, num_regs, max_threads_per_block,
                          static_cast<int>(async_status), cudaGetErrorString(async_status),
@@ -1073,6 +1085,7 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             M,
             N,
             K,
+            m_num_sms,              // NUM_SMS (persistent grid-stride loop)
             stride_xqm,
             stride_xqk,
             stride_xsm,
@@ -1151,8 +1164,8 @@ void ConvRotInt8LinearPlugin::serialize(void* buffer) const noexcept {
 namespace {
 
 // Compile-time-valid group sizes for the phase-1 butterfly kernel.
-// The current generated Triton inventory supports only group_size=64; there
-// is no no-rotation G0 cubin and no legacy G256 cubin.
+// The current generated Triton inventory supports group_size=256 (and optional G0 sentinel); there
+// is no legacy G64 cubin.
 
 #if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
 using GeneratedCubinDesc = hotstep::convrot_int8_generated::ConvRotCubinDesc;
@@ -1299,6 +1312,25 @@ bool ConvRotInt8LinearPlugin::initTriton() {
 
     m_desc_quant = quant_cubin;
     m_desc_gemm = gemm_cubin;
+
+    // ── Query device SM count for persistent-kernel grid computation ──
+    // H_16 is generated in-kernel (no host buffer needed).  NUM_SMS is passed
+    // as a runtime int32 arg to both kernels and used for the persistent
+    // grid-stride loop.
+    if (m_num_sms == 0) {
+        int32_t dev = 0;
+        cuCtxGetDevice(&dev);
+        int sms = 0;
+        CUresult const sm_rc = cuDeviceGetAttribute(
+            &sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev);
+        if (sm_rc != CUDA_SUCCESS || sms <= 0) {
+            hotstep::diag::log("[ConvRotInt8Linear] Failed to query SM count: %d, using 1\n", sm_rc);
+            m_num_sms = 1;
+        } else {
+            m_num_sms = static_cast<int32_t>(sms);
+        }
+    }
+
     return true;
 }
 
@@ -1310,6 +1342,8 @@ void ConvRotInt8LinearPlugin::destroyTriton() {
     m_module_gemm = nullptr;
     m_kernelFunc_gemm = nullptr;
     m_desc_gemm = nullptr;
+
+    m_num_sms = 0;
 }
 
 // ──────────────────────────────────────────────────────────────────────────

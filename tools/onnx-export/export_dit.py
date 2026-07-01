@@ -1773,12 +1773,12 @@ def _rewrite_fp16_weight_ops(model, fp16_initializer_names: set[str]) -> dict:
 def _detect_max_convrot_group_size() -> int:
     """Return the default group_size for the current Triton plugin path.
 
-    The two-kernel Triton implementation quantizes activations one reusable
-    K-group at a time. Exporting with ``group_size == 64`` keeps the rotation
-    group, the activation quantization group, and the GEMM dequant group all
-    aligned to the same 64-wide chunk.
+    The two-kernel Triton implementation (per CONVROT_OPTIMAL_TWO_KERNEL_SPEC.md)
+    uses GROUP_SIZE=256 with a Tensor-Core-based H_16⊗H_16 separable rotation.
+    The rotation group, the activation quantization group, and the GEMM dequant
+    group are all aligned to the same 256-wide chunk.
     """
-    return 64
+    return 256
 
 
 def _convrot_default_group_size() -> int:
@@ -1804,9 +1804,9 @@ def _convrot_default_group_size() -> int:
         raise SystemExit(
             f"HOTSTEP_CONVROT_GROUP_SIZE must be a power of 4, got {value}"
         )
-    if value != 64:
+    if value != 256:
         raise SystemExit(
-            f"HOTSTEP_CONVROT_GROUP_SIZE {value} is not compiled into the TRT plugin; supported value is 64"
+            f"HOTSTEP_CONVROT_GROUP_SIZE {value} is not compiled into the TRT plugin; supported value is 256"
         )
     return value
 
@@ -1972,9 +1972,9 @@ def _quantize_w8a8_initializers_with_convrot(
         raise SystemExit(
             f"W8A8 ConvRot group_size must be a power of 4, got {group_size}"
         )
-    if group_size != 64:
+    if group_size != 256:
         raise SystemExit(
-            f"W8A8 ConvRot group_size {group_size} is not compiled into the TRT plugin; supported value is 64"
+            f"W8A8 ConvRot group_size {group_size} is not compiled into the TRT plugin; supported value is 256"
         )
     H_np = build_hadamard(group_size).astype(np.float32)
 
