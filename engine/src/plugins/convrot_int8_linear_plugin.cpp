@@ -134,6 +134,69 @@ inline CUresult launchConvRotGemm(ConvRotCubinDesc const&, CUfunction, CUstream,
 #  include <windows.h>  // OutputDebugStringW, MultiByteToWideChar
 #endif
 
+// ── Runtime CUDA arch detection (global anonymous namespace) ───────────────
+//
+// queryDeviceComputeCapability() is declared in a *global* anonymous
+// namespace (not inside `namespace hotstep`) because it is called from both:
+//   * `namespace hotstep` members (initTriton, plugin class methods), and
+//   * the `extern "C"` `hotstep_register_plugins()` entry point at the
+//     bottom of this file, which lives at global scope.
+//
+// An anonymous-namespace member declared inside `namespace hotstep` is only
+// findable by unqualified lookup from *within* `namespace hotstep`. The
+// extern "C" entry point can't see it, which previously caused MSVC to emit
+// "identifier not found" at the DLL-load log site. A global anonymous
+// namespace is visible from every namespace in the TU, so both call sites
+// resolve correctly.
+//
+// The plugin's 16-bit I/O boundary dtype is selected at cubin-generation
+// time (BF16 on sm >= 80, FP16 on sm_75). At runtime we query the active
+// device's compute capability once and stash it in a function-local static
+// so we can:
+//   1. Log it at plugin-DLL load time for diagnostic visibility.
+//   2. Warn if the engine's serialized boundary dtype doesn't match the
+//      GPU's arch (e.g. an FP16 engine loaded on sm_80+ still works, but
+//      the user should re-export as BF16 for the wider exponent range).
+//
+// Returns the compute capability as major*10 + minor (e.g. 86 for sm_86),
+// or 0 if the device query failed (we treat 0 as "unknown arch" and skip
+// the arch/dtype mismatch warning rather than failing).
+namespace {
+int32_t queryDeviceComputeCapability() {
+    static int32_t cached = -1;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        int32_t dev = 0;
+        if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) {
+            // No active CUDA context — try cudaGetDevice as a fallback.
+            if (cudaGetDevice(&dev) != cudaSuccess) {
+                cached = 0;
+                return;
+            }
+        }
+        int major = 0, minor = 0;
+        CUresult const rc_major = cuDeviceGetAttribute(
+            &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+        CUresult const rc_minor = cuDeviceGetAttribute(
+            &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+        if (rc_major != CUDA_SUCCESS || rc_minor != CUDA_SUCCESS ||
+            major <= 0 || minor < 0) {
+            // Fall back to the runtime API if the driver API query failed.
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+                major = prop.major;
+                minor = prop.minor;
+            } else {
+                cached = 0;
+                return;
+            }
+        }
+        cached = static_cast<int32_t>(major) * 10 + static_cast<int32_t>(minor);
+    });
+    return cached;
+}
+}  // namespace
+
 namespace hotstep {
 
 // ── Diagnostic logging ──────────────────────────────────────────────────────
@@ -580,8 +643,11 @@ char const* dtypeNameFromId(int32_t dtypeId) {
 }
 
 bool isSupportedPluginBoundaryDtypePair(int32_t input_dtype_id, int32_t output_dtype_id) {
-    return (input_dtype_id == 10 && output_dtype_id == 10) ||
-           (input_dtype_id == 1 && output_dtype_id == 1);
+    // Only FP32IO (ONNX dtype id 1) is compiled by default. The 16-bit
+    // boundary cubin variants (FP16IO/BF16IO) were removed to simplify the
+    // build and because the default HOTSTEP_W8A8_PLUGIN_IO_DTYPE=FP32 uses
+    // FP32 everywhere anyway.
+    return (input_dtype_id == 1 && output_dtype_id == 1);  // FP32IO
 }
 
 bool readPluginString(nvinfer1::PluginField const& f, char* dst, size_t dstSize) {
@@ -762,9 +828,8 @@ int32_t ConvRotInt8LinearPlugin::configurePlugin(
     // output_dtype) combinations with a detailed message explaining which
     // combination was requested and which combinations are in the generated
     // cubin header. The DiT exporter (tools/onnx-export/export_dit.py) emits
-    // both FP16 and FP32 plugin boundary dtypes depending on the layer and
-    // the HOTSTEP_W8A8_PLUGIN_IO_DTYPE env var, so the cubin header MUST
-    // contain both FP16IO and FP32IO variants (see extract_jit_cubins_autotune.py).
+    // FP32 plugin boundary dtypes by default, so the cubin header MUST
+    // contain the FP32IO variant (see extract_jit_cubins_autotune.py).
     destroyTriton();
     if (!initTriton()) {
         hotstep::diag::log(
@@ -1277,7 +1342,7 @@ bool ConvRotInt8LinearPlugin::initTriton() {
     if (!isSupportedPluginBoundaryDtypePair(m_input_dtype_id, m_output_dtype_id)) {
         hotstep::diag::log(
             "[ConvRotInt8Linear] No compiled Triton cubin for input_dtype=%s, output_dtype=%s. "
-            "Only exact FP16->FP16 and FP32->FP32 plugin boundary dtypes are supported.\n",
+            "Only FP32->FP32 plugin boundary dtype is supported.\n",
             dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id));
         return false;
     }
@@ -1456,17 +1521,13 @@ HOTSTEP_PLUGIN_EXPORT int hotstep_register_plugins() {
         // nullptr for every plugin invocation.
         hotstep::diag::log("=== HotStep plugin DLL loaded ===\n");
         hotstep::diag::log("Cubin header state:\n");
-#if defined(CONVROT_INT8_HAS_DTYPE_FP16IO)
-        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP16IO = 1 (FP16-in/FP16-out cubins present)\n");
-#else
-        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP16IO = UNDEFINED (no FP16-in/FP16-out cubins)\n");
-#endif
 #if defined(CONVROT_INT8_HAS_DTYPE_FP32IO)
         hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = 1 (FP32-in/FP32-out cubins present)\n");
 #else
         hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = UNDEFINED (no FP32-in/FP32-out cubins)\n");
+#  error "Cubin header is missing CONVROT_INT8_HAS_DTYPE_FP32IO. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
-        hotstep::diag::log("If both are UNDEFINED, you forgot to re-run "
+        hotstep::diag::log("If FP32IO is UNDEFINED, you forgot to re-run "
                          "tools/onnx-export/extract_jit_cubins_autotune.py to regenerate "
                          "engine/src/plugins/assets/convrot_int8_kernel_cubin.h after "
                          "updating the C++ plugin source.\n");

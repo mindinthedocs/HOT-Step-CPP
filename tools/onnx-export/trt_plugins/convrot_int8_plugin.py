@@ -2,7 +2,7 @@
 
 The production implementation lives in C++/Triton:
   * ``engine/src/plugins/convrot_int8_linear_plugin.{h,cpp}``
-  * ``tools/onnx-export/trt_plugins/convrot_int8_kernel.py``
+  * ``tools/onnx-export/extract_jit_cubins_autotune.py``
 
 This module keeps the Python-side glue in one place:
 
