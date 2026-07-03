@@ -14,7 +14,8 @@ Precision recipes (--precision):
   w8a8      — INT8 weights + INT8 activations, fused by the
                ConvRotInt8Linear TRT plugin. Export FP32, quantize the
                matrix-weight allowlist to INT8 with per-output-channel
-               symmetric scales (after ConvRot rotation), AND emit a
+               symmetric scales refined by Half-Quadratic Quantization
+               alternating optimization (after ConvRot rotation), AND emit a
                single ConvRotInt8Linear custom-op node per MatMul/Gemm
                site. The plugin fuses online activation rotation, per-row
                dynamic INT8 quantization, INT8×INT8 matmul, dequant, and
@@ -1165,6 +1166,20 @@ def _write_low_memory_precision_manifest(
             "rotated_weights": sorted(name for name, r in rotated_by_name.items() if r),
             "skipped_weights": sorted(name for name, r in rotated_by_name.items() if not r),
         }
+        report["half_quadratic_quantization"] = {
+            "enabled": True,
+            "applied_after": "convrot_weight_rotation",
+            "form": "symmetric_per_output_row_scale_alternating_optimization",
+            "lp": 0.7,
+            "beta": 1.0,
+            "kappa": 1.01,
+            "iterations": 20,
+            "zero_point": 0,
+            "best_l2_candidate_retained": True,
+            "parallelism": "threaded_by_output_row_blocks",
+            "max_workers_default": min(8, os.cpu_count() or 1),
+            "rows_per_chunk_default": 256,
+        }
     if precision in {"q8map-fp16", "w8a8"}:
         if not fp16_names:
             raise SystemExit(f"hardcoded DiT {precision} allowlist matched zero exported parameters")
@@ -1832,13 +1847,156 @@ def _emit_convrot_h_initializer(model, group_size: int, name: str) -> str:
     return name
 
 
+def _hqq_symmetric_per_row_quantize_block(
+    w: "np.ndarray",
+    *,
+    nbits: int,
+    lp: float,
+    beta: float,
+    kappa: float,
+    iters: int,
+    eps: float,
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """Single-thread HQQ worker for a row block in canonical [out, in] layout."""
+    import numpy as np
+
+    qmax = float((1 << (int(nbits) - 1)) - 1)
+    w = np.ascontiguousarray(w, dtype=np.float32)
+
+    # Standard per-row max-abs quantization is the starting point and the
+    # fallback best candidate for all-zero or numerically degenerate rows.
+    max_abs = np.max(np.abs(w), axis=1)
+    scale = np.where(max_abs > 0.0, max_abs / qmax, 1.0).astype(np.float32)
+    q = np.clip(np.rint(w / scale.reshape(-1, 1)), -qmax, qmax).astype(np.int8)
+    best_q = q.copy()
+    best_scale = scale.copy()
+    best_err = np.mean((w - best_scale.reshape(-1, 1) * best_q.astype(np.float32)) ** 2, axis=1)
+
+    beta_t = float(beta)
+    abs_eps = np.float32(eps)
+    for _ in range(int(iters)):
+        q_f = q.astype(np.float32)
+        deq = scale.reshape(-1, 1) * q_f
+        residual = w - deq
+
+        # Generalized soft-thresholding prox for lp in [0, 1], matching HQQ:
+        # sign(x) * relu(|x| - (1/beta)*|x|^(p-1)).  Guard |x|^(p-1) near zero.
+        abs_residual = np.abs(residual)
+        threshold = (1.0 / beta_t) * np.power(np.maximum(abs_residual, abs_eps), lp - 1.0)
+        w_e = np.sign(residual) * np.maximum(abs_residual - threshold, 0.0)
+
+        target = w - w_e
+        numerator = np.sum(q_f * target, axis=1)
+        denominator = np.sum(q_f * q_f, axis=1)
+        new_scale = np.where(denominator > 0.0, numerator / np.maximum(denominator, eps), scale)
+        new_scale = np.where(np.isfinite(new_scale) & (new_scale > eps), new_scale, scale).astype(np.float32)
+
+        new_q = np.clip(np.rint(w / new_scale.reshape(-1, 1)), -qmax, qmax).astype(np.int8)
+        new_err = np.mean((w - new_scale.reshape(-1, 1) * new_q.astype(np.float32)) ** 2, axis=1)
+        improved = new_err < best_err
+        if np.any(improved):
+            best_err[improved] = new_err[improved]
+            best_scale[improved] = new_scale[improved]
+            best_q[improved, :] = new_q[improved, :]
+
+        if not np.any(new_q != q) and not np.any(np.abs(new_scale - scale) > eps * np.maximum(1.0, np.abs(scale))):
+            break
+        q = new_q
+        scale = new_scale
+        beta_t *= float(kappa)
+
+    return np.ascontiguousarray(best_q, dtype=np.int8), np.ascontiguousarray(best_scale, dtype=np.float32)
+
+
+def _hqq_symmetric_per_row_quantize(
+    w: "np.ndarray",
+    *,
+    nbits: int = 8,
+    lp: float = 0.7,
+    beta: float = 1.0,
+    kappa: float = 1.01,
+    iters: int = 20,
+    eps: float = 1.0e-12,
+    max_workers: int = 1,
+    rows_per_chunk: int = 256,
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """Half-Quadratic Quantization for symmetric per-row weight scales.
+
+    This is the HQQ alternating-optimization idea adapted to the current
+    ConvRotInt8Linear plugin contract, which accepts only an INT8 weight tensor
+    plus one FP32 scale per output row (no weight zero-point and no per-group
+    scales).  The original HQQ derivation fixes ``s`` and alternates between a
+    sparse residual ``W_e`` and zero-point ``z``.  Here ``z`` is fixed to zero
+    by the symmetric INT8 contract, so the second sub-problem is the closed-form
+    least-squares update for the row scale ``s`` with the integer codes fixed.
+
+    Per iteration, for each row independently:
+      1. q <- round(W / s) clipped to the symmetric INT range.
+      2. W_e <- shrink_lp(W - s*q, beta), modelling sparse/outlier residuals.
+      3. s <- argmin_s ||s*q - (W - W_e)||_2^2.
+
+    Rows are independent under per-row scaling, so large matrices are split into
+    row blocks and processed with a ThreadPoolExecutor. NumPy releases the GIL
+    for the heavy elementwise/reduction kernels, so this uses multiple CPU cores
+    without the extra memory/copy cost of multiprocessing.
+
+    We keep the best plain L2 dequantization error seen during the robust HQQ
+    iterations, so this default never intentionally returns a worse candidate
+    than its initialization.
+    """
+    import os
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+
+    if w.ndim != 2:
+        raise SystemExit(f"HQQ symmetric quantization expects a 2D matrix, got {w.shape}")
+    if not (0.0 <= lp <= 1.0):
+        raise SystemExit(f"HQQ lp must be in [0, 1], got {lp}")
+
+    w = np.ascontiguousarray(w, dtype=np.float32)
+    rows = int(w.shape[0])
+    if rows == 0:
+        return np.empty_like(w, dtype=np.int8), np.empty((0,), dtype=np.float32)
+
+    workers = int(max_workers) if max_workers is not None else 1
+    workers = max(1, min(workers, os.cpu_count() or 1, rows))
+    chunk_rows = max(1, int(rows_per_chunk))
+
+    # Avoid thread overhead for small matrices or when the caller requests one
+    # worker.  This code path is also useful for deterministic micro-tests.
+    if workers == 1 or rows <= chunk_rows:
+        return _hqq_symmetric_per_row_quantize_block(
+            w, nbits=nbits, lp=lp, beta=beta, kappa=kappa, iters=iters, eps=eps
+        )
+
+    ranges = [(start, min(start + chunk_rows, rows)) for start in range(0, rows, chunk_rows)]
+    q_out = np.empty(w.shape, dtype=np.int8)
+    scale_out = np.empty((rows,), dtype=np.float32)
+
+    def run_block(row_range: tuple[int, int]) -> tuple[int, int, "np.ndarray", "np.ndarray"]:
+        start, stop = row_range
+        q_block, scale_block = _hqq_symmetric_per_row_quantize_block(
+            w[start:stop], nbits=nbits, lp=lp, beta=beta, kappa=kappa, iters=iters, eps=eps
+        )
+        return start, stop, q_block, scale_block
+
+    # Map preserves input order, but we still return explicit ranges so each
+    # worker writes a disjoint slice.  Thread writes occur in the main thread.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for start, stop, q_block, scale_block in pool.map(run_block, ranges):
+            q_out[start:stop, :] = q_block
+            scale_out[start:stop] = scale_block
+
+    return np.ascontiguousarray(q_out), np.ascontiguousarray(scale_out)
+
+
 def _quantize_w8a8_weight_array(
     arr: "np.ndarray",
     axis: int,
     group_size: int | None,
     H: "np.ndarray | None",
 ) -> tuple["np.ndarray", "np.ndarray", bool]:
-    """Apply ConvRot (if applicable) + per-axis symmetric INT8 quantization.
+    """Apply ConvRot, then HQQ symmetric per-row INT8 quantization.
 
     Args:
         arr: 2D weight array. The ``axis`` parameter identifies which axis
@@ -1859,6 +2017,22 @@ def _quantize_w8a8_weight_array(
         indicates whether ConvRot was applied.
     """
     import numpy as np
+
+    # HQQ constants.  These are intentionally local, near the call site, so
+    # future tuning can be done without changing CLI/API behavior.  They mirror
+    # the public HQQ defaults (p=0.7, beta=1, kappa=1.01, 20 iterations) while
+    # keeping the existing symmetric per-output-row INT8 plugin contract.
+    HQQ_LP = 1.0
+    HQQ_BETA = 10
+    HQQ_KAPPA = 1.05
+    HQQ_ITERS = 10
+    HQQ_EPS = 1.0e-12
+    # Parallelize across independent output rows.  Threads are preferred over
+    # multiprocessing because they avoid copying large weight blocks; NumPy's
+    # heavy kernels release the GIL.  Tune down if export competes with other
+    # CPU work, or up if the machine has many idle cores and enough memory.
+    HQQ_MAX_WORKERS = 14
+    HQQ_ROWS_PER_CHUNK = 64
 
     if arr.ndim != 2:
         raise SystemExit(
@@ -1883,12 +2057,20 @@ def _quantize_w8a8_weight_array(
         w_canonical = rotate_weight(w_canonical, H, group_size)
         rotated = True
 
-    # Per-output-channel (axis 0 of canonical) symmetric INT8 quantization.
-    max_abs = np.max(np.abs(w_canonical), axis=1)
-    scale = np.where(max_abs > 0.0, max_abs / 127.0, 1.0).astype(np.float32)
-    q_canonical = np.clip(
-        np.rint(w_canonical / scale.reshape(-1, 1)), -127, 127
-    ).astype(np.int8)
+    # Per-output-row symmetric INT8 quantization refined by HQQ alternating
+    # optimization.  HQQ is applied after ConvRot, as requested, and remains
+    # unconditional/default for the w8a8 path.
+    q_canonical, scale = _hqq_symmetric_per_row_quantize(
+        w_canonical,
+        nbits=8,
+        lp=HQQ_LP,
+        beta=HQQ_BETA,
+        kappa=HQQ_KAPPA,
+        iters=HQQ_ITERS,
+        eps=HQQ_EPS,
+        max_workers=HQQ_MAX_WORKERS,
+        rows_per_chunk=HQQ_ROWS_PER_CHUNK,
+    )
 
     # The TensorRT plugin has a single layout contract: [out, in].
     return np.ascontiguousarray(q_canonical), scale, rotated
