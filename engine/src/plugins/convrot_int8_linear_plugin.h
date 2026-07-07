@@ -163,9 +163,20 @@ private:
     void const* m_desc_gemm{nullptr};
 
     // Device SM count — queried once at initTriton() for persistent-kernel
-    // grid computation (min(NUM_SMS, num_tiles)).  Passed as a runtime int32
-    // arg to both kernels.
+    // grid sizing (the generated launch stubs compute
+    // min(num_tiles, num_sms * max_active_ctas_per_sm)).  Not a kernel
+    // argument: the kernels stride their persistent loops by
+    // tl.num_programs(0).
     int32_t m_num_sms{0};
+
+    // Max resident CTAs/SM for each loaded cubin, from
+    // cuOccupancyMaxActiveBlocksPerMultiprocessor.  Queried ONCE per kernel
+    // in initTriton() and passed to the generated launch stubs on every
+    // enqueue() so the hot path never issues driver occupancy calls
+    // (the DiT loop calls enqueue() 359 times per step).  0 = query failed;
+    // the stubs then fall back to the legacy 1-CTA/SM grid.
+    uint32_t m_max_ctas_per_sm_quant{0};
+    uint32_t m_max_ctas_per_sm_gemm{0};
 
     // Mutable field collection for serialization
     mutable std::vector<nvinfer1::PluginField> m_fields;

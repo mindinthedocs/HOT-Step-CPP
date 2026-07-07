@@ -44,7 +44,7 @@
 
 #if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
 // ── Cubin header version guard ─────────────────────────────────────────────
-// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 4.
+// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 7.
 // Version 3 added per-cubin tile dimensions; version 4 additionally reflects
 // the intentionally smaller cubin inventory: G256 only (plus optional G0 sentinel), and no specialized M1
 // cubins. Referencing removed G0/G256/M1 symbols here would make the plugin
@@ -58,10 +58,22 @@
 //            reconstructs Triton launch geometry from loose macros.
 // Version 6: GROUP_SIZE=256, TC-based rotation (H_16⊗H_16), decoupled BLOCK_K,
 //            persistent grid-stride launch, transposed X_scale layout.
+// Version 7: Direct H4 Kronecker butterfly K1 rotation (in-register, ~2 KB/warp
+//            of shared mem from tl.split/tl.join — NOT zero shared as an earlier
+//            comment claimed), K1 CONTIG_XK constexpr toggle, occupancy-driven
+//            persistent grid (cuOccupancyMaxActiveBlocksPerMultiprocessor),
+//            evict_last on xs/ws/bias loads.  The K1 store mask is ALWAYS
+//            applied (the previous FAST_PATH toggle that dropped the mask on
+//            aligned-M tiles is gone).  K2 is the plain/unmasked hybrid_direct
+//            kernel with late per-group xs load, W_scale/bias epilogue-only, and
+//            the canonical [N, K] W_q layout consumed via tl.dot(xq, tl.trans(wq));
+//            the plugin pads/splits runtime M on the host side instead of
+//            shipping masked K2 variants.  Only the bias-enabled K2 cubin
+//            ships; no-bias plugin instances pass a workspace zero-bias vector.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 6
-#  error "Cubin header version >= 6 required (GROUP_SIZE=256, TC rotation, persistent launch). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 7
+#  error "Cubin header version >= 7 required (hybrid_direct K2, host-side M padding, single bias-enabled K2 cubin, direct H4 K1 rotation, occupancy-scaled persistent grid). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -118,13 +130,25 @@ inline constexpr ConvRotCubinDesc const* findConvRotCubin(
 inline uint32_t ceilDivU32(int32_t x, int32_t y) {
     return static_cast<uint32_t>((x + y - 1) / y);
 }
+inline uint32_t persistentGridU32(uint32_t num_tiles, uint32_t num_sms, uint32_t max_ctas_per_sm = 0) {
+    uint32_t const occ = max_ctas_per_sm ? max_ctas_per_sm : 1;
+    uint32_t const cap = num_sms ? num_sms * occ : num_tiles;
+    return (num_tiles < cap) ? num_tiles : cap;
+}
+inline uint32_t queryMaxActiveCtasPerSm(CUfunction, uint32_t, uint32_t) { return 0; }
 inline CUresult launchConvRotQuant(ConvRotCubinDesc const&, CUfunction, CUstream,
-    void const*, void*, void*, int32_t, int32_t, int32_t, int32_t, int32_t,
-    int32_t, int32_t, int32_t) { return CUDA_ERROR_INVALID_VALUE; }
+    void const*, void*, void*,
+    int32_t, int32_t, int32_t,  // M, K, NUM_SMS
+    int32_t, int32_t,           // stride_xm, stride_xk
+    int32_t, int32_t,           // stride_xqm, stride_xqk
+    int32_t, int32_t,           // stride_xsm, stride_xsg
+    uint32_t = 0) { return CUDA_ERROR_INVALID_VALUE; }
 inline CUresult launchConvRotGemm(ConvRotCubinDesc const&, CUfunction, CUstream,
-    void*, void*, int8_t const*, float const*, void const*, void*, int32_t,
-    int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
-    int32_t, int32_t) { return CUDA_ERROR_INVALID_VALUE; }
+    void*, void*, int8_t const*, float const*, void const*, void*,
+    int32_t, int32_t, int32_t, int32_t,  // M, N, K, NUM_SMS
+    int32_t, int32_t, int32_t, int32_t,  // xq/xs strides
+    int32_t, int32_t, int32_t, int32_t,  // w/y strides
+    uint32_t = 0) { return CUDA_ERROR_INVALID_VALUE; }
 } // namespace hotstep::convrot_int8_generated
 #endif
 
@@ -162,6 +186,13 @@ inline CUresult launchConvRotGemm(ConvRotCubinDesc const&, CUfunction, CUstream,
 // or 0 if the device query failed (we treat 0 as "unknown arch" and skip
 // the arch/dtype mismatch warning rather than failing).
 namespace {
+
+// K2 is intentionally plain/unmasked.  Workspace sizing therefore reserves
+// enough activation padding for any generated K2 BLOCK_M currently emitted by
+// extract_jit_cubins_autotune.py.  Runtime enqueue rejects a future cubin with
+// a larger tile instead of risking workspace overflow.
+constexpr int32_t kMaxK2WorkspacePadBlockM = 256;
+
 int32_t queryDeviceComputeCapability() {
     static int32_t cached = -1;
     static std::once_flag flag;
@@ -587,6 +618,11 @@ size_t alignUp(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
+int32_t roundUpInt32(int32_t value, int32_t multiple) {
+    if (value <= 0 || multiple <= 0) return value;
+    return ((value + multiple - 1) / multiple) * multiple;
+}
+
 char* alignPtr(char* ptr, size_t alignment) {
     uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
     raw = (raw + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
@@ -628,6 +664,11 @@ nvinfer1::DataType trtTypeFromDtypeId(int32_t dtypeId) {
     if (dtypeId == 10) return nvinfer1::DataType::kHALF;
     if (dtypeId == 16) return nvinfer1::DataType::kBF16;
     return nvinfer1::DataType::kFLOAT;
+}
+
+size_t dtypeSizeBytesFromId(int32_t dtypeId) {
+    if (dtypeId == 10 || dtypeId == 16) return 2;
+    return 4;
 }
 
 int32_t kernelDtypeFromTrt(nvinfer1::DataType dtype) {
@@ -868,16 +909,33 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
     if (K <= 0) K = m_in_features;
     if (K <= 0) return 0;
 
+    int64_t const maxMPadded64 =
+        ((maxM + kMaxK2WorkspacePadBlockM - 1) / kMaxK2WorkspacePadBlockM) *
+        static_cast<int64_t>(kMaxK2WorkspacePadBlockM);
+    if (maxMPadded64 <= 0 || maxMPadded64 > std::numeric_limits<int32_t>::max()) return 0;
+    int32_t const maxMPadded = static_cast<int32_t>(maxMPadded64);
+
     int32_t const scale_groups = activationScaleGroups(K, m_group_size);
-    size_t x_q_size = alignUp(static_cast<size_t>(maxM) * static_cast<size_t>(K), 16);
-    // X_scale is now FP32 (was FP16/uint16_t) — FP16 storage caused measurable
-    // quality reduction vs the ggml/non-Triton baselines.  The per-group scale
-    // is applied to every element of the INT32 partial accumulator, so even
-    // small FP16 rounding errors compound across K_groups.
+    size_t x_q_size = alignUp(static_cast<size_t>(maxMPadded) * static_cast<size_t>(K), 16);
+    // X_scale is now FP32 and uses the transposed [n_groups, M_padded]
+    // layout.  M is padded in workspace so the plain/unmasked K2 kernel can
+    // read complete BLOCK_M tiles without touching unallocated memory.
     size_t x_scale_size = alignUp(
-        static_cast<size_t>(maxM) * static_cast<size_t>(scale_groups) * sizeof(float),
+        static_cast<size_t>(maxMPadded) * static_cast<size_t>(scale_groups) * sizeof(float),
         16);
-    return x_q_size + x_scale_size;
+    // K2 writes the unaligned final M tile into this small padded tail buffer,
+    // then enqueue() copies only the real tail rows to TensorRT's output.  The
+    // main aligned prefix (if any) is written directly to the output tensor.
+    size_t y_tail_size = alignUp(
+        static_cast<size_t>(kMaxK2WorkspacePadBlockM) * static_cast<size_t>(m_out_features) *
+            dtypeSizeBytesFromId(m_output_dtype_id),
+        16);
+    // Version 7 ships only the bias-enabled K2 cubin.  No-bias layers pass this
+    // zero-filled FP32 vector as Bias_ptr so one K2 cubin handles both cases.
+    size_t zero_bias_size = m_has_bias ? 0 : alignUp(
+        static_cast<size_t>(m_out_features) * sizeof(float),
+        16);
+    return x_q_size + x_scale_size + y_tail_size + zero_bias_size;
 }
 
 // ── Custom Tactics (IPluginV3OneBuild) ──────────────────────────────────────
@@ -1040,11 +1098,14 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         void const* x_ptr = inputs[0];
         int8_t const* wq_ptr = static_cast<int8_t const*>(inputs[1]);
         float const* ws_ptr = static_cast<float const*>(inputs[2]);
-        void const* bias_ptr = m_has_bias ? inputs[3] : nullptr;
+        void const* input_bias_ptr = m_has_bias ? inputs[3] : nullptr;
         void* y_ptr = outputs[0];
 
         int32_t stride_xm = K;
         int32_t stride_xk = 1;
+        // W_q is the canonical Linear [out_features, in_features] = [N, K]
+        // row-major initializer.  K2 handles the transpose in-kernel via
+        // tl.trans(wq) (hybrid_direct variant).
         int32_t stride_wn = K;
         int32_t stride_wk = 1;
         int32_t stride_ym = N;
@@ -1062,22 +1123,76 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             return -1;
         }
 
-        size_t const x_q_size = alignUp(static_cast<size_t>(M) * static_cast<size_t>(K), 16);
-        void* xq_ptr = workspace;
-        void* xs_ptr = static_cast<char*>(workspace) + x_q_size;
-
-        int32_t stride_xqm = K;
-        int32_t stride_xqk = 1;
-        // X_scale workspace layout: TRANSPOSED [n_groups, M] row-major.
-        // (Per CONVROT_OPTIMAL_TWO_KERNEL_SPEC.md §1.3: makes per-row writes/reads
-        // coalesced — consecutive rm values become adjacent 4-byte floats.)
-        // stride_xsm = 1 (M is the inner stride), stride_xsg = M (group is outer).
-        int32_t stride_xsm = 1;
-        int32_t stride_xsg = M;
-
         auto const* quant_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
         auto const* gemm_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
         if (quant_desc == nullptr || gemm_desc == nullptr) return -1;
+
+        int32_t const gemm_block_m = gemm_desc->block_m > 0 ? gemm_desc->block_m : 1;
+        int32_t const gemm_block_n = gemm_desc->block_n > 0 ? gemm_desc->block_n : 1;
+        if (gemm_block_m > kMaxK2WorkspacePadBlockM || (N % gemm_block_n) != 0) {
+#ifdef HOTSTEP_DIAGNOSTICS
+            hotstep::diag::log(
+                "[ConvRotInt8Linear] enqueue REJECT: plain K2 requires BLOCK_M<=%d "
+                "and N divisible by BLOCK_N (M=%d, N=%d, BLOCK_M=%d, BLOCK_N=%d).\n",
+                kMaxK2WorkspacePadBlockM, M, N, gemm_block_m, gemm_block_n);
+            hotstep::diag::flush();
+#endif
+            return -1;
+        }
+
+        int32_t const M_padded = roundUpInt32(M, gemm_block_m);
+        int32_t const tail_rows = M_padded - M;
+        int32_t const scale_groups = activationScaleGroups(K, m_group_size);
+
+        size_t const x_q_size = alignUp(static_cast<size_t>(M_padded) * static_cast<size_t>(K), 16);
+        size_t const x_scale_size = alignUp(
+            static_cast<size_t>(M_padded) * static_cast<size_t>(scale_groups) * sizeof(float),
+            16);
+        size_t const y_tail_size = alignUp(
+            static_cast<size_t>(kMaxK2WorkspacePadBlockM) * static_cast<size_t>(N) *
+                dtypeSizeBytesFromId(m_output_dtype_id),
+            16);
+        void* xq_ptr = workspace;
+        void* xs_ptr = static_cast<char*>(workspace) + x_q_size;
+        void* y_tail_ptr = static_cast<char*>(xs_ptr) + x_scale_size;
+        void* zero_bias_ptr = static_cast<char*>(y_tail_ptr) + y_tail_size;
+        void const* bias_ptr = input_bias_ptr;
+        if (!m_has_bias) {
+            cudaError_t zb = cudaMemsetAsync(
+                zero_bias_ptr,
+                0,
+                static_cast<size_t>(N) * sizeof(float),
+                stream);
+            if (zb != cudaSuccess) return -1;
+            bias_ptr = zero_bias_ptr;
+        }
+
+        int32_t stride_xqm = K;
+        int32_t stride_xqk = 1;
+        // X_scale workspace layout: TRANSPOSED [n_groups, M_padded] row-major.
+        // K1 is launched with the real M (so it never reads padded input rows)
+        // but stores actual rows with stride_xsg=M_padded.  The padded tail
+        // rows are zeroed below and consumed only by the plain/unmasked K2
+        // tail launch.
+        int32_t stride_xsm = 1;
+        int32_t stride_xsg = M_padded;
+
+        if (tail_rows > 0) {
+            cudaError_t zq = cudaMemsetAsync(
+                static_cast<char*>(xq_ptr) + static_cast<size_t>(M) * static_cast<size_t>(K),
+                0,
+                static_cast<size_t>(tail_rows) * static_cast<size_t>(K),
+                stream);
+            if (zq != cudaSuccess) return -1;
+            cudaError_t zs = cudaMemset2DAsync(
+                static_cast<char*>(xs_ptr) + static_cast<size_t>(M) * sizeof(float),
+                static_cast<size_t>(M_padded) * sizeof(float),
+                0,
+                static_cast<size_t>(tail_rows) * sizeof(float),
+                static_cast<size_t>(scale_groups),
+                stream);
+            if (zs != cudaSuccess) return -1;
+        }
 
         CUresult status = hotstep::convrot_int8_generated::launchConvRotQuant(
             *quant_desc,
@@ -1088,13 +1203,14 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             xs_ptr,
             M,
             K,
-            m_num_sms,              // NUM_SMS (persistent grid-stride loop)
+            m_num_sms,              // host-side persistent grid sizing only
             stride_xm,
             stride_xk,
             stride_xqm,
             stride_xqk,
             stride_xsm,
-            stride_xsg);
+            stride_xsg,
+            m_max_ctas_per_sm_quant);  // occupancy cached in initTriton() (H1)
         if (status != CUDA_SUCCESS) {
 #ifdef HOTSTEP_DIAGNOSTICS
             char const* err_str = "unknown";
@@ -1137,30 +1253,60 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             return -1;
         }
 
-        status = hotstep::convrot_int8_generated::launchConvRotGemm(
-            *gemm_desc,
-            static_cast<CUfunction>(m_kernelFunc_gemm),
-            static_cast<CUstream>(stream),
-            xq_ptr,
-            xs_ptr,
-            wq_ptr,
-            ws_ptr,
-            bias_ptr,
-            y_ptr,
-            M,
-            N,
-            K,
-            m_num_sms,              // NUM_SMS (persistent grid-stride loop)
-            stride_xqm,
-            stride_xqk,
-            stride_xsm,
-            stride_xsg,
-            stride_wn,
-            stride_wk,
-            stride_ym,
-            stride_yn);
-        if (status != CUDA_SUCCESS) {
-            return -1;
+        auto launch_gemm = [&](void* xq_base, void* xs_base, void* y_base, int32_t launch_m) -> CUresult {
+            return hotstep::convrot_int8_generated::launchConvRotGemm(
+                *gemm_desc,
+                static_cast<CUfunction>(m_kernelFunc_gemm),
+                static_cast<CUstream>(stream),
+                xq_base,
+                xs_base,
+                wq_ptr,
+                ws_ptr,
+                bias_ptr,
+                y_base,
+                launch_m,
+                N,
+                K,
+                m_num_sms,              // NUM_SMS (host-side persistent grid sizing only)
+                stride_xqm,
+                stride_xqk,
+                stride_xsm,
+                stride_xsg,
+                stride_wn,
+                stride_wk,
+                stride_ym,
+                stride_yn,
+                m_max_ctas_per_sm_gemm);  // occupancy cached in initTriton() (H1)
+        };
+
+        // Plain K2 has no boundary masks.  Run the aligned prefix directly into
+        // TensorRT's output, then (only when needed) run the final padded tile
+        // into workspace and copy back the real tail rows.  This keeps the
+        // output tensor's public shape unchanged without a masked K2 variant.
+        int32_t const M_aligned = M - (M % gemm_block_m);
+        if (M_aligned > 0) {
+            status = launch_gemm(xq_ptr, xs_ptr, y_ptr, M_aligned);
+            if (status != CUDA_SUCCESS) return -1;
+        }
+        if (M_aligned < M) {
+            void* xq_tail = static_cast<char*>(xq_ptr) +
+                static_cast<size_t>(M_aligned) * static_cast<size_t>(K);
+            void* xs_tail = static_cast<char*>(xs_ptr) +
+                static_cast<size_t>(M_aligned) * sizeof(float);
+            status = launch_gemm(xq_tail, xs_tail, y_tail_ptr, gemm_block_m);
+            if (status != CUDA_SUCCESS) return -1;
+
+            size_t const output_elem_size = dtypeSizeBytesFromId(m_output_dtype_id);
+            size_t const tail_bytes = static_cast<size_t>(M - M_aligned) *
+                static_cast<size_t>(N) * output_elem_size;
+            cudaError_t copy_status = cudaMemcpyAsync(
+                static_cast<char*>(y_ptr) +
+                    static_cast<size_t>(M_aligned) * static_cast<size_t>(N) * output_elem_size,
+                y_tail_ptr,
+                tail_bytes,
+                cudaMemcpyDeviceToDevice,
+                stream);
+            if (copy_status != cudaSuccess) return -1;
         }
         return 0;
     } catch (...) {
@@ -1250,10 +1396,15 @@ GeneratedCubinDesc const* selectCubinK2(int32_t group_size,
                                         bool has_bias,
                                         int32_t input_dtype_id,
                                         int32_t output_dtype_id) {
+    (void)has_bias;
+    // Version 7 ships only the bias-enabled K2 cubin.  No-bias plugin
+    // instances pass a zero-filled FP32 bias vector from workspace, which is
+    // cheaper than duplicating the K2 cubin inventory for a branch that has no
+    // measurable resource difference on sm86.
     return hotstep::convrot_int8_generated::findConvRotCubin(
         hotstep::convrot_int8_generated::ConvRotKernelStage::kGemm,
         group_size,
-        has_bias,
+        true,
         input_dtype_id,
         output_dtype_id);
 }
@@ -1326,6 +1477,47 @@ bool loadOrReuseKernel(GeneratedCubinDesc const* cubin,
                 }
             }
 
+            // Patch review §8.3 — runtime register-spill check.
+            //
+            // CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES returns the per-thread
+            // thread-local stack size.  For a Triton kernel that declares no
+            // .local arrays, the ONLY source of nonzero stack is register
+            // spilling.  A nonzero value here means the cubin was compiled
+            // with a maxnreg cap that couldn't be honored — the kernel will
+            // produce correct output but at a fraction of the performance
+            // because spilled registers go through DRAM.
+            //
+            // This is a safety net: the extraction pipeline's spill gate
+            // (extract_jit_cubins_autotune.py) should have already rejected
+            // spilling cubins at build time.  This check catches the case
+            // where someone loads a stale cubin header that predates the
+            // spill gate.  Zero runtime cost in release builds (gated behind
+            // HOTSTEP_PLUGIN_DEBUG, same as the rest of the diag subsystem).
+#ifdef HOTSTEP_PLUGIN_DEBUG
+            int local_bytes_per_thread = 0;
+            CUresult const spill_rc = cuFuncGetAttribute(
+                &local_bytes_per_thread,
+                CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                new_func);
+            if (spill_rc == CUDA_SUCCESS && local_bytes_per_thread > 0) {
+                hotstep::diag::log(
+                    "[ConvRotInt8Linear] WARNING: cubin %s spills %d bytes/thread to local "
+                    "memory (CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES). This cubin should not have "
+                    "shipped — the extraction pipeline's spill gate should have rejected it.\n",
+                    cubin->logical_name, local_bytes_per_thread);
+            }
+            // Also log the register count for diagnostic visibility.
+            int num_regs = 0;
+            CUresult const reg_rc = cuFuncGetAttribute(
+                &num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, new_func);
+            if (reg_rc == CUDA_SUCCESS) {
+                hotstep::diag::log(
+                    "[ConvRotInt8Linear] cubin %s: regs=%d, shared=%zuB, local=%dB\n",
+                    cubin->logical_name, num_regs,
+                    cubin->shared_bytes, local_bytes_per_thread);
+            }
+#endif
+
             it = cache.emplace(cubin->data, CachedModule{new_module, new_func}).first;
         }
         cached = it->second;
@@ -1378,10 +1570,32 @@ bool ConvRotInt8LinearPlugin::initTriton() {
     m_desc_quant = quant_cubin;
     m_desc_gemm = gemm_cubin;
 
+    // ── Query per-cubin occupancy ONCE (patch review H1) ──
+    // cuOccupancyMaxActiveBlocksPerMultiprocessor is a driver call; issuing
+    // it per-enqueue() would add 2 driver round-trips to every one of the
+    // 359 plugin invocations per DiT step.  The value is a pure function of
+    // (cubin, device), both of which are fixed after this point, so cache it
+    // here and pass it through to the generated launch stubs.
+    {
+        auto const* qd = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
+        auto const* gd = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
+        m_max_ctas_per_sm_quant = hotstep::convrot_int8_generated::queryMaxActiveCtasPerSm(
+            static_cast<CUfunction>(m_kernelFunc_quant),
+            qd->block_x * qd->block_y * qd->block_z,
+            static_cast<uint32_t>(qd->shared_bytes));
+        m_max_ctas_per_sm_gemm = hotstep::convrot_int8_generated::queryMaxActiveCtasPerSm(
+            static_cast<CUfunction>(m_kernelFunc_gemm),
+            gd->block_x * gd->block_y * gd->block_z,
+            static_cast<uint32_t>(gd->shared_bytes));
+        hotstep::diag::log(
+            "[ConvRotInt8Linear] Occupancy (max CTAs/SM): quant=%u, gemm=%u "
+            "(0 = query failed; launch falls back to 1 CTA/SM grid).\n",
+            m_max_ctas_per_sm_quant, m_max_ctas_per_sm_gemm);
+    }
+
     // ── Query device SM count for persistent-kernel grid computation ──
-    // H_16 is generated in-kernel (no host buffer needed).  NUM_SMS is passed
-    // as a runtime int32 arg to both kernels and used for the persistent
-    // grid-stride loop.
+    // Used only for host-side grid sizing; the kernels stride their
+    // persistent loops by tl.num_programs(0), so no NUM_SMS kernel arg.
     if (m_num_sms == 0) {
         int32_t dev = 0;
         cuCtxGetDevice(&dev);
@@ -1393,6 +1607,26 @@ bool ConvRotInt8LinearPlugin::initTriton() {
             m_num_sms = 1;
         } else {
             m_num_sms = static_cast<int32_t>(sms);
+        }
+
+        // §4.5 — also query L2 cache size and log it for diagnostic visibility.
+        // The autotune script (extract_jit_cubins_autotune.py) derives L2 size
+        // and SM count directly from torch.cuda.get_device_properties() on the
+        // same device, so the cubins are always tuned for the exact GPU they
+        // run on.  We log the runtime values here so the user can verify the
+        // cubin header was generated on a matching device.
+        int l2_bytes = 0;
+        CUresult const l2_rc = cuDeviceGetAttribute(
+            &l2_bytes, CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, dev);
+        if (l2_rc == CUDA_SUCCESS && l2_bytes > 0) {
+            hotstep::diag::log(
+                "[ConvRotInt8Linear] Device: SMs=%d, L2=%d bytes (%.1f MB).\n",
+                sms, l2_bytes, static_cast<float>(l2_bytes) / (1024.0f * 1024.0f));
+        } else {
+            hotstep::diag::log(
+                "[ConvRotInt8Linear] Device: SMs=%d, L2 query failed (rc=%d). "
+                "GROUP_M cap will use the fallback (2 MB) value baked into the autotune script.\n",
+                sms, l2_rc);
         }
     }
 
@@ -1409,6 +1643,9 @@ void ConvRotInt8LinearPlugin::destroyTriton() {
     m_desc_gemm = nullptr;
 
     m_num_sms = 0;
+    // Cached occupancy is per-CUfunction; reset with the kernel handles.
+    m_max_ctas_per_sm_quant = 0;
+    m_max_ctas_per_sm_gemm = 0;
 }
 
 // ──────────────────────────────────────────────────────────────────────────

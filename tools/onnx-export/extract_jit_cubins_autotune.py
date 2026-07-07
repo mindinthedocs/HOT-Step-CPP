@@ -48,28 +48,91 @@ except ImportError as exc:
     print(f"ERROR: Triton is required to run this script: {exc}", file=sys.stderr)
     raise
 
+# Triton's CPU interpreter (TRITON_INTERPRET=1) is used by the unit tests in
+# tools/onnx-export/tests/.  It does not implement libdevice.rint, so the K1
+# kernel selects an arithmetically-explicit rounding fallback when this flag
+# is set.  The flag is captured at import time and baked into the kernel as a
+# constexpr global; production (GPU) extraction always sees False and compiles
+# the single-instruction rint path.
+#
+# Patch review §M2: wrap the value as a `tl.constexpr` so it can be accessed
+# from inside @triton.jit kernels.  Plain module-level globals are rejected
+# by the AOT compile path (Triton 3.7.1+) with NameError; the constexpr
+# wrapper makes it visible to both the interpreter and the GPU code path
+# without changing the kernel signature.
+_IS_TRITON_INTERPRETER = triton.language.constexpr(
+    os.environ.get("TRITON_INTERPRET", "").strip() == "1"
+)
+
 
 # ─── Device-specs-driven autotune config builder ───────────────────────────
 
 import math as _math
 
 def _estimate_k1_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes):
+    """Build the autotune config list for the K1 quant kernel.
+
+    Shared memory (measured via ptxas -v, patch review §2):
+      The butterfly K1 kernel uses 2 KB/warp of shared memory, caused by
+      tl.split/tl.join layout conversions inside _hadamard_butterfly_stage
+      (NOT by input-tile pipelining as previously claimed).  This is
+      independent of BLOCK_M, SUBCHUNK, and num_stages — it scales only
+      with num_warps:
+        num_warps=4 → 8 KB/CTA
+        num_warps=8 → 16 KB/CTA
+      This is still a large improvement over the old tensor-core kernel's
+      83-99 KB/CTA, but it is NOT zero.  The dominant shared-memory lever
+      is num_warps, not BLOCK_M or num_stages.
+
+    Register pressure (measured via ptxas -v, patch review §1):
+      SUBCHUNK=16 at num_warps=8 uses 64-128 regs/thread depending on BLOCK_M
+      and arch — well under the 255 cap, zero spills.  SUBCHUNK=64 spills on
+      every arch and should not be used.  maxnreg=128 gives a clean, uniform
+      2 CTA/SM floor on both sm75 and sm86.
+
+    See CONVROT_INT8_PATCH_REVIEW.md §1-§3 for the full measured data.
+    """
     min_prod_m = min((s[0] for s in autotune_shapes), default=1024)
-    block_m_candidates = [bm for bm in (32, 64, 128, 256) if bm % 16 == 0]
+    # §1.2: BLOCK_M = 16 is fully legal (rotation SUBCHUNK is now per-thread,
+    #       not 16×16) and is what unlocks 2 CTA/SM with num_stages=3.
+    block_m_candidates = [bm for bm in (16, 32, 64, 128, 256) if bm % 16 == 0]
     if num_sms <= 32:
         block_m_candidates = [bm for bm in block_m_candidates if bm <= 128]
+    # Prune BM≥128 for small-M shapes — a 128-row tile with M=64 is half empty.
+    if min_prod_m < 128:
+        block_m_candidates = [bm for bm in block_m_candidates if bm <= 64]
     block_m_candidates = [
         bm for bm in block_m_candidates
         if _math.ceil(min_prod_m / bm) >= 1
     ]
-    warps_stages = [(4, 2), (4, 3), (8, 2), (8, 3)]
-    maxnreg_vals = [None, 128]
+    # Drop num_stages ≥ 6 — the sm86 100 KB shared budget already blocks them
+    # on the DiT shapes.  Keep 2 and 3 everywhere; num_stages=4 is added ONLY
+    # for BLOCK_M=16 (16 KB × 4 = 64 KB fits with 2 CTA/SM headroom — larger
+    # BM tiles with 4 stages blow the budget and just waste autotune time).
+    base_warps_stages = [(4, 2), (4, 3), (8, 2), (8, 3)]
+    # Keep K1 explicitly register-capped.  On sm86 Triton 3.7.1 can autotune
+    # an uncapped BM=16/S=4 candidate that later reports an 8-byte stack spill
+    # in the exact cached winner cubin, even though the pre-filter compiled a
+    # spill-free-looking variant.  The capped MR=128 BM=16 candidates are clean
+    # and benchmark within noise of the best old/current K1 variants, so avoid
+    # uncapped K1 configs entirely and let the spill gate reject any shape that
+    # still spills under the cap.
+    maxnreg_vals = [128]
 
     configs = []
+    seen = set()
     for bm in block_m_candidates:
+        # num_stages=4 is a BM=16-only candidate (see comment above); the
+        # previous version appended it to the shared list whenever BM=16 was
+        # present, which also inflated the BM>=32 config space for no gain.
+        warps_stages = base_warps_stages + ([(4, 4), (8, 4)] if bm == 16 else [])
         for nw, ns in warps_stages:
             for mr in maxnreg_vals:
                 cfg_kwargs = {"BLOCK_M": bm}
+                key = (bm, nw, ns, mr)
+                if key in seen:
+                    continue
+                seen.add(key)
                 if mr is not None:
                     configs.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns, maxnreg=mr))
                 else:
@@ -77,102 +140,188 @@ def _estimate_k1_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes):
     return configs
 
 
-def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes):
-    prod_k_values = [s[2] for s in autotune_shapes] if autotune_shapes else [9728]
-    max_prod_k = max(prod_k_values) if prod_k_values else 9728
+def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, arch=86):
+    """Build the autotune config list for the K2 GEMM+dequant kernel.
 
-    tile_shapes = [
-        (64,  64,  4), (64,  64,  8),
-        (64,  128, 4), (64,  128, 8),
-        (64,  256, 4),
-        (128, 64,  4), (128, 64,  8),
-        (128, 128, 2), (128, 128, 4), (128, 128, 6), (128, 128, 8),
-        (128, 256, 2), (128, 256, 4),
-        (256, 64,  4),
-        (256, 128, 2), (256, 128, 4),
-        (256, 256, 2), (256, 256, 4),
-    ]
+    Arch-dispatched config builder.  The kernel body is identical across
+    sm75/sm80/sm86/sm89 — only the autotune candidate set differs because
+    each arch has a different smem budget, CTA cap, and L2 size.
 
-    if num_sms <= 32:
+    sm86/sm89 (RTX 30/40, 100 KB smem/SM, 1.5-6 MB L2):
+      Primary target.  128x128 BK=32 S=4 at 1 CTA/SM is the throughput
+      optimum for memory-bound K2 (IMMA at 9%, LSU at 59% in Nsight
+      profile).  The 2.75x Triton smem tax (calibrated from 99 KB actual
+      / 36 KB naive for BK=64 BM=64 BN=128 S=3) means 128x128 BK=32 S=4
+      uses ~88 KB — fits the 99 KB optin budget.
+
+      2 CTA/SM is NOT pursued: the (partial_int32 + acc_fp32) register
+      overlap during the per-group fold is 128 regs at W=8 for BM=BN=128,
+      which doesn't fit maxnreg=128.  Going to 64x128 to fit 2 CTA/SM
+      loses 50% on bandwidth tax (60 B/out vs 40 B/out) — a bad trade
+      for a memory-bound kernel.
+
+    sm80 (A100, 164 KB smem/SM, 4 MB L2):
+      Same 128x128 tile but deeper pipelining (S=6) enabled by the larger
+      smem budget.  BK=64 S=3 is also viable (halves MMA instruction
+      count) thanks to the 164 KB budget.
+
+    sm75 (Turing, 64 KB smem/SM, m8n8k32 IMMA):
+      128x128 BK=32 S=2 is the max that fits 48 KB optin smem (44 KB
+      after tax).  2 CTA/SM is not viable — the 24 KB budget forces
+      BM=16 tiles with 4.5x worse B/out.  Ship 1 CTA/SM with the big
+      tile and accept 25% occupancy.
+    """
+    # ── Per-arch tile shapes and pipeline depths ──────────────────────────
+    #
+    # All arches ship 128x128 as the primary tile — it gives 40 B/output
+    # (vs 60 B/output for 64x128), which is 33% less DRAM traffic for a
+    # memory-bound kernel.  The difference between arches is pipeline
+    # depth (S) and BK, driven by the smem budget.
+    #
+    # Smem tax: Triton's auto-layout for INT8 IMMA inflates the naive
+    # smem estimate (BK × (BM + BN) × S) by ~2.75× (calibrated from the
+    # post-autotune profile: 99 KB actual / 36 KB naive for BK=64 BM=64
+    # BN=128 S=3).  The filter below uses this factor to reject configs
+    # that won't fit the per-block optin smem budget.
+
+    if arch == 75:
+        # sm75 (Turing): 64 KB/SM, 48 KB/block optin.  S=2 only at 128x128.
         tile_shapes = [
-            (bm, bn, gm) for bm, bn, gm in tile_shapes
-            if not (bm >= 256 and bn >= 128)
+            (128, 128, 2),    # primary: 40 B/out, 44 KB at S=2 (fits 48 KB)
+            (128, 64,  2),    # wide-M for down_proj (N=2560)
+            (64,  128, 4),    # fallback: smaller tile, bigger GM
         ]
+        warps_stages = [(8, 2), (4, 2)]
+    elif arch == 80:
+        # sm80 (A100): 164 KB/SM, 163 KB/block optin.  Deep pipelining wins.
+        # S=6 at 128x128 BK=32 = 132 KB (fits 163 KB).
+        # BK=64 S=3 = 132 KB (also fits, halves MMA count).
+        tile_shapes = [
+            (128, 128, 4),    # primary: 40 B/out, S=6 fits
+            (128, 128, 2),    # smaller GM for K=9728 (down_proj)
+            (128, 256, 4),    # wide-N for gate_proj (N=9728)
+            (256, 128, 4),    # wide-M (if regs fit — borderline at 255)
+        ]
+        warps_stages = [(8, 2), (8, 3), (8, 4), (8, 5), (8, 6)]
+    else:
+        # sm86/sm89 (RTX 30/40): 100 KB/SM, 99 KB/block optin.
+        # S=4 at 128x128 BK=32 = 88 KB (fits 99 KB).
+        # S=5 = 110 KB (doesn't fit).  BK=64 S=2 = 88 KB (also fits).
+        tile_shapes = [
+            (128, 128, 2),    # primary: 40 B/out, S=4 fits 88 KB
+            (128, 64,  2),    # wide-M for down_proj (N=2560)
+            (64,  128, 4),    # fallback: smaller tile, bigger GM
+            (64,  256, 2),    # wide-N for gate_proj (N=9728)
+        ]
+        warps_stages = [(8, 2), (8, 3), (8, 4), (4, 2)]
 
-    l2_half = l2_bytes // 2
-    pruned_tile_shapes = []
-    for bm, bn, gm in tile_shapes:
-        super_group_bytes = gm * bm * max_prod_k
-        if super_group_bytes <= l2_half:
-            pruned_tile_shapes.append((bm, bn, gm))
-        elif gm > 2:
-            for try_gm in (4, 2):
-                if try_gm < gm and try_gm * bm * max_prod_k <= l2_half:
-                    pruned_tile_shapes.append((bm, bn, try_gm))
-                    break
-    if not pruned_tile_shapes:
-        pruned_tile_shapes = tile_shapes
-    tile_shapes = list(dict.fromkeys(pruned_tile_shapes))
+    # ── GROUP_M candidates (L2 pruning REMOVED) ──────────────────────────
+    #
+    # The old "L2-aware GROUP_M pruning" capped the super-group footprint
+    # (K × (GM × BM + BN)) at L2/2 and demoted every big tile to GROUP_M=1
+    # on small-L2 parts.  The ½ factor was a heuristic, the footprint used
+    # the worst-case K across all shapes, and GM only affects tile-scheduling
+    # order (not smem/registers) — so mispredicting it can never break a
+    # launch, only change L2 hit rates.  Real benchmarking decides now: keep
+    # the author-specified GM per tile and let autotune pick the winner.
+    tile_shapes = list(dict.fromkeys(tile_shapes))
 
-    block_k_candidates = [32, 64, 128]
-    warps_stages = [(4, 2), (4, 3), (4, 4), (8, 2), (8, 3), (8, 4)]
-    maxnreg_vals = [None, 128]
+    # ── BK candidates ────────────────────────────────────────────────────
+    # BK=32 is the primary (smaller swizzle atom, better bank-conflict
+    # behavior, fits deeper pipelining).  BK=64 is included for arches
+    # where the smem budget allows it (halves the sub-MMA count per group).
+    if arch == 80:
+        block_k_candidates = [32, 64]
+    else:
+        block_k_candidates = [32, 64]  # both, let the smem filter decide
 
     configs = []
+    seen = set()
     for bm, bn, gm in tile_shapes:
         for bk in block_k_candidates:
             if 256 % bk != 0:
                 continue
-            if bk == 128 and bm >= 128 and bn >= 128:
-                continue
-            if bk == 32 and (bm >= 256 or bn >= 256):
-                continue
 
             for nw, ns in warps_stages:
+                # Smem filter: reject configs that don't fit the per-block
+                # optin smem budget.  Uses the 2.75x calibrated Triton smem
+                # tax for INT8 IMMA.
                 smem_per_stage = bk * (bm + bn)
-                smem_total = smem_per_stage * ns
-                if smem_total > shared_mem_per_sm:
+                smem_total_naive = smem_per_stage * ns
+                smem_total_est = int(smem_total_naive * 2.75)
+                if smem_total_est > shared_mem_per_sm:
+                    continue
+
+                # 32x256 BK32 on small Ampere can exceed smem at S>=3.
+                if bm == 32 and bn >= 256 and bk == 32 and ns > 2:
                     continue
 
                 if num_sms <= 32 and bm >= 256 and nw == 4:
                     continue
 
-                for mr in maxnreg_vals:
-                    cfg_kwargs = {
-                        "BLOCK_M": bm,
-                        "BLOCK_N": bn,
-                        "BLOCK_K": bk,
-                        "GROUP_M": gm,
-                    }
-                    if mr is not None:
-                        configs.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns, maxnreg=mr))
-                    else:
-                        configs.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
+                cfg_kwargs = {
+                    "BLOCK_M": bm,
+                    "BLOCK_N": bn,
+                    "BLOCK_K": bk,
+                    "GROUP_M": gm,
+                }
+                key = (bm, bn, bk, gm, nw, ns)
+                if key in seen:
+                    continue
+                seen.add(key)
+                configs.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
     return configs
 
 
 def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
+    """Inject tile shapes whose wave count divides evenly into the SM count.
+
+    The candidate space here MUST stay a subset of the pruning decisions made
+    in _estimate_k2_configs: BLOCK_K=128 is pruned there (conflicts with
+    BM>=128 tiles and never won in profiling), and K2 configs are deliberately
+    uncapped.  A previous version of this function re-introduced BK=128 /
+    inconsistent register-cap configs through the back door; extras now use
+    the same BK space and no maxnreg caps.
+    """
+    # Deduplicate against base_configs on the full identity tuple.  Triton's
+    # Config does not define __eq__, so the previous `cfg not in base_configs`
+    # check compared object identity and never deduplicated anything.
+    def _cfg_key(c):
+        return (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
+                c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
+                c.num_warps, c.num_stages)
+
+    seen = {_cfg_key(c) for c in base_configs}
     extra = []
-    candidate_block_mns = [(64, 64), (64, 128), (128, 64), (128, 128), (128, 256), (256, 128)]
+    candidate_block_mns = [(32, 128), (32, 256),
+                           (64, 64), (64, 128),
+                           (128, 64), (128, 128), (128, 256), (256, 128)]
     for (M, N, K) in shapes:
         for bm, bn in candidate_block_mns:
             tiles = _math.ceil(M / bm) * _math.ceil(N / bn)
             if num_sms > 0 and tiles >= num_sms:
                 ratio = tiles / num_sms
                 if abs(ratio - round(ratio)) / ratio < 0.10:
-                    for bk in [64, 128]:
+                    # Same BK space as _estimate_k2_configs (BK=128 pruned).
+                    for bk in [32, 64]:
                         if 256 % bk != 0:
                             continue
+                        if bk == 32 and (bm >= 256 and bn >= 256):
+                            continue
                         for gm in [4, 8]:
-                            for nw, ns in [(4, 3), (8, 3)]:
-                                cfg = Config({
+                            extra_warps_stages = [(4, 2), (8, 2)] if (bm == 32 and bn >= 256 and bk == 32) else [(4, 3), (8, 3)]
+                            for nw, ns in extra_warps_stages:
+                                key = (bm, bn, bk, gm, nw, ns)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                cfg_kwargs = {
                                     "BLOCK_M": bm,
                                     "BLOCK_N": bn,
                                     "BLOCK_K": bk,
                                     "GROUP_M": gm,
-                                }, num_warps=nw, num_stages=ns)
-                                if cfg not in extra and cfg not in base_configs:
-                                    extra.append(cfg)
+                                }
+                                extra.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
     return base_configs + extra
 
 
@@ -180,12 +329,79 @@ _K1_CONFIGS: list = []
 _K2_CONFIGS: list = []
 
 
-# ─── H_4 butterfly primitive (used only to synthesize the 16x16 H factor) ──
+# ─── H_4 Kronecker butterfly (direct regular Hadamard transform) ──────────
+#
+# This is the K1 rotation primitive, revised per CONVROT_INT8_DEEP_DIVE_V2.md §3.
+#
+# The ConvRot regular Hadamard H_{256, regular} is the 4-fold Kronecker power of
+# the H4 base block:
+#
+#       | 1  1  1 -1 |
+#  H4 = | 1  1 -1  1 |        (every row/column sums to 2 — "regular")
+#       | 1 -1  1  1 |
+#       |-1  1  1  1 |
+#
+#  H_{256, regular} = H4 ⊗ H4 ⊗ H4 ⊗ H4    (normalized by 1/√256 = 1/16)
+#
+# The previous FWHT+sign-flip decomposition (CONVROT_INT8_PERFORMANCE_REPORT.md
+# §2) factored this as P256 · H_sylvester · D256 and required three constant
+# tables (D256, perm256, sign256) plus a tl.gather.  The v2 deep-dive showed
+# this is unnecessarily indirect: ``_hadamard_butterfly_stage`` — already in
+# the codebase, originally written only to synthesize the dense h16 matrix for
+# the old tensor-core path — implements one stage of the H4-Kronecker butterfly
+# *directly on the data*.  Calling it 4 times (log_4(256) = 4 stages) on a
+# (SUBCHUNK, 256) FP32 tile reproduces x @ H_{256, regular}.T exactly, with:
+#
+#   * **zero** extra constant tables (no D256 / perm256 / sign256)
+#   * **zero** tl.gather / tl.permute-as-scatter
+#   * identical arithmetic cost (1024 add/sub — same total FLOPs, just a
+#     different factorization of the same linear operator)
+#   * pure FP32 throughout → the split-FP16 accuracy hack is structurally
+#     unnecessary, not just "less needed"
+#
+# Verified numerically to float64 machine precision (max abs diff < 4e-15 vs
+# direct H256r @ x).  See CONVROT_INT8_DEEP_DIVE_V2.md §3.1–§3.3.
+#
+# ─── Register budget (v2 §3.4, rigorously re-derived) ────────────────────
+#
+# Triton's BlockedEncoding assigns elements to threads as a bijection: for a
+# tile of E elements distributed over T threads/CTA, each thread holds exactly
+# E/T elements in registers.  You do NOT get to pick "lanes per row"
+# independently of the tile shape — the two are locked together.
+#
+# For the butterfly primitive, the worst-instant live-set is 2× the resting
+# per-thread element count (v0..v3 and h0..h3 are all live simultaneously
+# between computing h0 and the final join).  So the safe tile size for one
+# butterfly call is:
+#
+#     SUBCHUNK × 256 / T  ≤  ~120 regs/thread  (leaving headroom for epilogue)
+#
+# At T = 256 threads/CTA (the standard num_warps=8 config):
+#     SUBCHUNK = 16  →  16 resting,  32 peak   ← recommended default (matches
+#                                                 the existing kernel's own
+#                                                 SUBCHUNK, known-good)
+#     SUBCHUNK = 32  →  32 resting,  64 peak   ← safe, fewer loop iterations
+#     SUBCHUNK = 64  →  64 resting, 128 peak   ← tight, only if maxnreg allows
+#     SUBCHUNK ≥ 128 →  exceeds 255-reg cap    ← IMPOSSIBLE
+#
+# The K1 kernel therefore processes the BLOCK_M-row tile in NUM_SUB = BLOCK_M /
+# SUBCHUNK sequential slices, exactly the idiom the existing tensor-core path
+# already used.  This is purely a register-pressure control knob — slicing is
+# bit-identical to whole-tile because rows are fully independent under this
+# transform (verified, max abs diff = 0.0 in float64).
 
 @triton.jit
 def _hadamard_butterfly_stage(
     x_tile, BLOCK_M: tl.constexpr, GROUP_SIZE: tl.constexpr, STAGE: tl.constexpr,
 ):
+    """One H4-Kronecker butterfly stage on a (BLOCK_M, GROUP_SIZE) FP32 tile.
+
+    This is the same primitive the old tensor-core path used to synthesize h16
+    from an identity matrix; here it is called directly on real data.  Each
+    stage applies the H4 base block to groups of 4 elements at stride 4**STAGE.
+    The 0.5 factor per stage folds the 1/√256 normalization across 4 stages
+    (0.5^4 = 1/16 = 1/√256).
+    """
     s: tl.constexpr = 4 ** STAGE
     n_groups: tl.constexpr = GROUP_SIZE // (4 * s)
     x_v = tl.reshape(x_tile, (BLOCK_M, n_groups, 4, s))
@@ -207,94 +423,158 @@ def _hadamard_butterfly_stage(
 
 
 @triton.jit
-def _generate_h16_fp16():
-    rows = tl.arange(0, 16)[:, None]
-    cols = tl.arange(0, 16)[None, :]
-    identity16 = tl.where(rows == cols, 1.0, 0.0).to(tl.float32)
-    h = identity16
-    for stage in tl.static_range(0, 2):
-        h = _hadamard_butterfly_stage(h, 16, 16, stage)
-    return h.to(tl.float16)
+def _convrot_rotate_256_subchunk(x_slice, SUBCHUNK: tl.constexpr, GROUP_SIZE: tl.constexpr):
+    """Apply the full 4-stage regular Hadamard rotation to a (SUBCHUNK, GROUP_SIZE) slice.
+
+    log_4(256) = 4 stages.  The 0.5 factor per stage folds the 1/√256 = 1/16
+    normalization, so no separate scale multiply is needed.
+    """
+    rotated = x_slice
+    for stage in tl.static_range(0, 4):
+        rotated = _hadamard_butterfly_stage(rotated, SUBCHUNK, GROUP_SIZE, stage)
+    return rotated
 
 
-@triton.jit
-def _rotate_256_tensorcore(x_tile, h16, SUBCHUNK: tl.constexpr):
-    X = tl.reshape(x_tile, (SUBCHUNK, 16, 16))
-    X_flat = tl.reshape(X, (SUBCHUNK * 16, 16))
-    X_hi = X_flat.to(tl.float16)
-    X_lo = (X_flat - X_hi.to(tl.float32)).to(tl.float16)
-    A_flat = tl.dot(X_hi, h16) + tl.dot(X_lo, h16)
-    A = tl.reshape(A_flat, (SUBCHUNK, 16, 16))
-    A_T = tl.permute(A, (0, 2, 1))
-    A_T_flat = tl.reshape(A_T, (SUBCHUNK * 16, 16))
-    A_T_hi = A_T_flat.to(tl.float16)
-    A_T_lo = (A_T_flat - A_T_hi.to(tl.float32)).to(tl.float16)
-    B_flat = tl.dot(A_T_hi, h16) + tl.dot(A_T_lo, h16)
-    B = tl.reshape(B_flat, (SUBCHUNK, 16, 16))
-    return tl.reshape(tl.permute(B, (0, 2, 1)), (SUBCHUNK, 256))
-
-
-@triton.autotune(configs=_K1_CONFIGS, key=["M", "K", "INPUT_FP16"])
+@triton.autotune(configs=_K1_CONFIGS, key=["M", "K", "INPUT_FP16", "CONTIG_XK"])
 @triton.jit
 def kernel1_convrot_quant(
     X_ptr, X_q_ptr, X_scale_ptr,
-    M, K, NUM_SMS,
+    M, K,
     stride_xm, stride_xk,
     stride_xqm, stride_xqk,
     stride_xsm, stride_xsg,
     BLOCK_M: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     INPUT_FP16: tl.constexpr,
+    CONTIG_XK: tl.constexpr,
 ):
+    """K1 — ConvRot regular Hadamard rotation + per-group INT8 quantization.
+
+    Rotation implementation (v2 §3):
+      4 sequential calls to ``_hadamard_butterfly_stage`` per SUBCHUNK-row
+      slice.  Pure FP32 add/sub — no tensor cores, no FP16 split, no gather.
+
+    Register safety (v2 §3.4):
+      SUBCHUNK=16 slicing keeps peak register usage at ~32-128/thread
+      (measured via ptxas -v, well under the 255 cap, zero spills).
+
+    Persistent grid (v2 §4.1):
+      The loop strides by ``tl.num_programs(0)`` (the actual launched grid
+      size).  No NUM_SMS runtime arg — the host computes the grid size and
+      the kernel reads it via ``tl.num_programs(0)``.
+
+    Stores are ALWAYS masked (patch review §4: dropping the store mask
+    caused out-of-bounds writes for any M not evenly divisible by BLOCK_M).
+    """
     tl.static_assert(GROUP_SIZE == 256, "Only GROUP_SIZE=256 is supported")
     tl.static_assert(BLOCK_M % 16 == 0, "BLOCK_M must be a multiple of 16")
+    # v2 §3.4: SUBCHUNK controls register pressure.  16 matches the existing
+    # kernel and sits at ~32 peak regs/thread (comfortable).  32 is a safe
+    # alternative for fewer loop iterations.  Values ≥ 64 risk the 255-reg cap
+    # once epilogue overhead is added.
     SUBCHUNK: tl.constexpr = 16
     NUM_SUB: tl.constexpr = BLOCK_M // SUBCHUNK
-
-    h16 = _generate_h16_fp16()
+    # Captured module-level constant (True only under TRITON_INTERPRET=1).
+    # Selects the rounding implementation below without touching the launch
+    # ABI or the autotune key space.
+    IS_INTERPRETER: tl.constexpr = _IS_TRITON_INTERPRETER
 
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_k_groups = K // GROUP_SIZE
     num_tiles = num_pid_m * num_k_groups
 
     start_pid = tl.program_id(0)
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+    # v2 §4.1: stride by the actual launched grid size.
+    #         tl.num_programs(0) is the runtime value of grid.x.
+    grid_x = tl.num_programs(0)
+    for tile_id in tl.range(start_pid, num_tiles, grid_x):
         pid_m = (tile_id // num_k_groups) * BLOCK_M
         pid_k = (tile_id % num_k_groups) * GROUP_SIZE
 
         for sub in tl.static_range(0, NUM_SUB):
-            rm = pid_m + sub * SUBCHUNK + tl.arange(0, SUBCHUNK)
+            sub_m_off = pid_m + sub * SUBCHUNK
+            rm = sub_m_off + tl.arange(0, SUBCHUNK)
             rk = pid_k + tl.arange(0, GROUP_SIZE)
             ram = rm % M
             mask_m = rm < M
-            mask = mask_m[:, None] & (rk[None, :] < K)
+            mask_k = rk[None, :] < K
+            mask_2d = mask_m[:, None] & mask_k
 
-            x_ptr_block = X_ptr + ram[:, None] * stride_xm + rk[None, :] * stride_xk
-            x_block = tl.load(x_ptr_block, mask=mask, other=0.0, eviction_policy="evict_first")
+            if CONTIG_XK:
+                x_ptr_block = X_ptr + ram[:, None] * stride_xm + rk[None, :]
+            else:
+                x_ptr_block = X_ptr + ram[:, None] * stride_xm + rk[None, :] * stride_xk
+
+            # Load: always masked.  The load side is safe even without a mask
+            # (ram = rm % M wraps in-bounds), but masking avoids unnecessary
+            # DRAM traffic for the tail tile.
+            x_block = tl.load(x_ptr_block, mask=mask_2d, other=0.0,
+                              eviction_policy="evict_first")
             if INPUT_FP16:
                 x_block = x_block.to(tl.float32)
 
-            rotated_x = _rotate_256_tensorcore(x_block, h16, SUBCHUNK)
+            # v2 §3: 4-stage H4 Kronecker butterfly = exact regular Hadamard.
+            rotated_x = _convrot_rotate_256_subchunk(x_block, SUBCHUNK, GROUP_SIZE)
 
+            # Per-row max-abs for the INT8 scale.
             block_max = tl.max(tl.abs(rotated_x), axis=1)
             scale = tl.maximum(block_max / 127.0, 1e-30)
 
-            x_q = libdevice.rint(rotated_x / scale[:, None])
+            # INT8 quantize: round-to-nearest-even + safety clamp.
+            #
+            # GPU path (production): libdevice.rint lowers to a single
+            # CVT.RNI SASS instruction (round-half-to-even, matching v6
+            # numerics exactly).
+            #
+            # Interpreter path (CPU unit tests only): Triton 3.7.x's
+            # interpreter does not implement libdevice.rint, so the tests
+            # use an explicit floor-based round-half-away-from-zero
+            # fallback.  The two paths differ ONLY on exact .5 ties (at
+            # most ±1 LSB on values that quantize to a tie), which is far
+            # below the tests' INT8-quantization tolerance.  IS_INTERPRETER
+            # is a constexpr, so the production cubin contains no trace of
+            # the fallback branch.
+            scaled = rotated_x / scale[:, None]
+            if IS_INTERPRETER:
+                abs_scaled = tl.abs(scaled)
+                rounded_abs = tl.floor(abs_scaled + 0.5)
+                sign_scaled = tl.where(scaled >= 0.0, 1.0, -1.0)
+                x_q = rounded_abs * sign_scaled
+            else:
+                x_q = libdevice.rint(scaled)
             x_q = tl.clamp(x_q, -127.0, 127.0).to(tl.int8)
 
-            xq_ptr_block = X_q_ptr + rm[:, None] * stride_xqm + rk[None, :] * stride_xqk
-            tl.store(xq_ptr_block, x_q, mask=mask)
+            # CRITICAL: X_q store is ALWAYS masked.
+            #
+            # The previous FAST_PATH=True branch dropped the store mask,
+            # causing out-of-bounds writes for any M not evenly divisible by
+            # BLOCK_M (which is every real production shape: M=1, 64, 300,
+            # 3000).  The workspace is sized exactly to M rows, so the last
+            # tile's rm values (which range up to pid_m + BLOCK_M - 1 > M-1)
+            # would write past the allocated buffer.
+            #
+            # Triton can still emit vectorized STG.128 stores with a mask
+            # applied at the granularity of whole vector lanes — the mask
+            # does not prevent vectorization, it only suppresses the
+            # out-of-bounds lanes.
+            if CONTIG_XK:
+                xq_ptr_block = X_q_ptr + rm[:, None] * stride_xqm + rk[None, :]
+            else:
+                xq_ptr_block = X_q_ptr + rm[:, None] * stride_xqm + rk[None, :] * stride_xqk
+            tl.store(xq_ptr_block, x_q, mask=mask_2d)
 
+            # X_scale: [n_groups, M] transposed layout.  Also ALWAYS masked
+            # for the same OOB reason.
             group_idx = pid_k // GROUP_SIZE
             xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + rm * stride_xsm
             tl.store(xs_ptr_block, scale, mask=mask_m)
 
 
-@triton.autotune(configs=_K2_CONFIGS, key=["M", "N", "K", "HAS_BIAS", "OUTPUT_FP16"])
+@triton.autotune(configs=_K2_CONFIGS, key=["M", "N", "K", "OUTPUT_FP16"])
 @triton.jit
 def kernel2_gemm_dequant(
     X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
-    M, N, K, NUM_SMS,
+    M, N, K,
     stride_xqm, stride_xqk,
     stride_xsm, stride_xsg,
     stride_wn, stride_wk,
@@ -304,9 +584,46 @@ def kernel2_gemm_dequant(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     GROUP_M: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
     OUTPUT_FP16: tl.constexpr,
 ):
+    """K2 — plain INT8 GEMM + late per-group xs fold ("hybrid_direct" variant).
+
+    This is the benchmarked ``hybrid_direct`` kernel from
+    ``benchmark_k2_tuning_space_hybrid.py``: it combines the historical
+    pre-patch [N, K] W_q layout (loaded with ``tl.trans(wq)`` in-kernel) with
+    the current-kernel unmasked / late-xs / occupancy-scaled persistent-grid
+    optimizations.  It intentionally has no boundary masks, no modulo-remapped
+    row/column indices, and no boundary-specialized variants.
+
+    The TensorRT plugin pads the activation workspace and executes a tiny
+    padded tail launch when the runtime M is not divisible by BLOCK_M, so
+    every K2 invocation sees an M that is exactly tile-aligned.  Production
+    ConvRot weights have K divisible by GROUP_SIZE=256 and N divisible by the
+    selected BLOCK_N; the plugin rejects unsupported N rather than shipping a
+    masked fallback.
+
+    Bias handling: HAS_BIAS is compile-time-hardwired to True (the single
+    shipped K2 cubin).  No-bias plugin instances pass a workspace zero-bias
+    vector so the same cubin handles both cases.
+
+    sm86 optimization notes (Nsight Compute profiled):
+
+      1. ``xs`` is loaded ONCE per group, outside the sub-MMA loop — xs is a
+         per-group quantity and doesn't change between sub-MMAs.
+
+      2. ``W_scale`` and bias are epilogue-only, dead throughout the K loop.
+         Both are tagged ``eviction_policy="evict_last"`` because they are
+         reused across tiles via the L2 super-group swizzle.
+
+      3. ``eviction_policy`` is DROPPED on xq/wq loads (Nsight showed L1 hit
+         rate ~3% — the hints add LSU overhead for zero benefit on streaming
+         INT8 operands that never fit L1).
+
+      4. Persistent grid stride uses ``tl.num_programs(0)`` so the kernel
+         matches the host's occupancy-scaled launch geometry
+         (``min(num_tiles, num_sms * max_active_ctas_per_sm)``) without
+         carrying a runtime NUM_SMS argument.
+    """
     tl.static_assert(GROUP_SIZE == 256, "Only GROUP_SIZE=256 is supported")
     tl.static_assert(GROUP_SIZE % BLOCK_K == 0, "GROUP_SIZE must be a multiple of BLOCK_K")
     GROUPS_PER_TILE: tl.constexpr = GROUP_SIZE // BLOCK_K
@@ -317,7 +634,8 @@ def kernel2_gemm_dequant(
     num_pid_in_group = GROUP_M * num_pid_n
 
     start_pid = tl.program_id(0)
-    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+    grid_x = tl.num_programs(0)
+    for tile_id in tl.range(start_pid, num_tiles, grid_x):
         group_id = tile_id // num_pid_in_group
         first_pid_m = group_id * GROUP_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
@@ -329,56 +647,266 @@ def kernel2_gemm_dequant(
 
         rm = pid_m_off + tl.arange(0, BLOCK_M)
         rn = pid_n_off + tl.arange(0, BLOCK_N)
-        ram = rm % M
-        rbn = rn % N
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        ws = tl.load(W_scale_ptr + rn, mask=rn < N, other=0.0)
 
         for k_group_start in tl.range(0, K, GROUP_SIZE):
             group_idx = k_group_start // GROUP_SIZE
-            xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + ram * stride_xsm
-            xs = tl.load(xs_ptr_block, mask=rm < M, other=0.0)
+            # Load xs ONCE per group (outside the sub-MMA loop).
+            xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + rm * stride_xsm
+            xs = tl.load(xs_ptr_block, eviction_policy="evict_last")
 
             int32_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
             for sub in tl.static_range(0, GROUPS_PER_TILE):
                 k_offset = k_group_start + sub * BLOCK_K
                 cols_k = k_offset + tl.arange(0, BLOCK_K)
-                xq = tl.load(X_q_ptr + ram[:, None] * stride_xqm + cols_k[None, :] * stride_xqk,
-                             mask=(rm[:, None] < M) & (cols_k[None, :] < K),
-                             other=0, eviction_policy="evict_last")
-                wq = tl.load(W_q_ptr + rbn[:, None] * stride_wn + cols_k[None, :] * stride_wk,
-                             mask=(rn[:, None] < N) & (cols_k[None, :] < K),
-                             other=0, eviction_policy="evict_first")
+                # Unmasked loads; no eviction_policy hint on streaming INT8.
+                xq = tl.load(X_q_ptr + rm[:, None] * stride_xqm + cols_k[None, :] * stride_xqk)
+                # W_q is [N, K] row-major (canonical Linear layout); consume
+                # it with tl.trans(wq) so the IMMA is fed [BM,BK] x [BK,BN].
+                wq = tl.load(W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
                 int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
 
-            acc += int32_acc.to(tl.float32) * xs[:, None] * ws[None, :]
+            acc += int32_acc.to(tl.float32) * xs[:, None]
 
-        if HAS_BIAS:
-            bias = tl.load(Bias_ptr + rn, mask=rn < N, other=0.0)
-            acc += bias[None, :]
+        # W_scale and bias are epilogue-only, outside the K loop.  HAS_BIAS is
+        # compile-time True (see BIAS_CONFIGS below); no-bias plugin instances
+        # pass a zero-filled FP32 bias vector from workspace.
+        ws = tl.load(W_scale_ptr + rn, eviction_policy="evict_last")
+        acc = acc * ws[None, :]
+        bias = tl.load(Bias_ptr + rn, eviction_policy="evict_last")
+        acc += bias[None, :]
 
         y_ptr_block = Y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn
-        mask_y = (rm[:, None] < M) & (rn[None, :] < N)
         if OUTPUT_FP16:
-            tl.store(y_ptr_block, acc.to(tl.float16), mask=mask_y)
+            tl.store(y_ptr_block, acc.to(tl.float16))
         else:
-            tl.store(y_ptr_block, acc.to(tl.float32), mask=mask_y)
+            tl.store(y_ptr_block, acc.to(tl.float32))
 
 
 GROUP_SIZE = 256
 DEFAULT_BLOCK_K = 64
 TILE_NAME = "PersistentG256"
-CONVROT_INT8_CUBIN_HEADER_VERSION = 6
-BIAS_CONFIGS = [("NOBIAS", False), ("BIAS", True)]
+# Version history:
+#   6 — GROUP_SIZE=256, TC-based rotation (H_16⊗H_16), decoupled BLOCK_K,
+#       persistent grid-stride launch, transposed X_scale layout.
+#   7 — Direct H4 butterfly K1 rotation (in-register; ~2 KB/warp shared from
+#       tl.split/tl.join), K1 CONTIG_XK constexpr toggle, occupancy-driven
+#       persistent grid (cuOccupancyMaxActiveBlocksPerMultiprocessor),
+#       evict_last on xs/ws/bias loads.  K2 is the plain/unmasked
+#       "hybrid_direct" variant: canonical [N, K] W_q consumed via
+#       tl.dot(xq, tl.trans(wq)), late per-group xs load, W_scale/bias
+#       epilogue-only.  The plugin pads/splits runtime M on the host side
+#       instead of shipping masked K2 variants.  Only the bias-enabled K2
+#       cubin ships; no-bias plugin instances pass a workspace zero-bias
+#       vector.
+CONVROT_INT8_CUBIN_HEADER_VERSION = 7
+# K2 is always compiled with HAS_BIAS=True.  For no-bias ONNX layers, the C++
+# plugin passes a zero-filled FP32 bias vector from workspace.
+BIAS_CONFIGS = [("BIAS", True)]
 DTYPE_CONFIGS = [("FP32IO", False, False)]
+# Real DiT decoder K2 shapes, expressed as (M, K, N).  M=3000 is not
+# divisible by all candidate BLOCK_M values; extract_k2 pads the benchmark M
+# to 3072 so the plain/unmasked K2 can be autotuned safely while staying within
+# 2.4% of the production work.
+#
+# The first entry is the primary compromise shape used for the single shipped
+# K2 cubin: it is one of the two dominant MLP projections and stresses wide-N
+# reuse (N=9728).  The full list still drives L2/GROUP_M pruning and
+# SM-wave-aware candidate injection, so down_proj / attention projections are
+# represented in the candidate set.
 AUTOTUNE_SHAPES_K2 = [
-    (1024, 2560, 9728),
-    (1024, 2560, 2560),
-    (1024, 2560, 4096),
-    (1024, 2560, 1024),
-    (384, 2560, 1024),
+    (3000, 2560, 9728),  # dit.mlp.gate_proj  — dominant, wide N
+    (3000, 9728, 2560),  # dit.mlp.down_proj  — dominant, large K
+    (3000, 2560, 4096),  # dit.self_attn.q_proj
+    (3000, 2560, 1024),  # dit.self_attn.k_proj
+    (3000, 4096, 2560),  # dit.self_attn.o_proj
 ]
+K2_AUTOTUNE_M_ALIGNMENT = 128  # max generated K2 BLOCK_M; avoids OOB in plain K2
+
+# Patch review §H2: autotune grid must mirror the production launch geometry.
+#
+# Production launches ``min(num_tiles, num_sms * max_active_ctas_per_sm)``
+# where ``max_active_ctas_per_sm`` is the per-cubin occupancy queried from the
+# CUDA driver at plugin init.  The old autotune grid used
+# ``min(num_sms, num_tiles)`` (1 CTA/SM, one wave), so a config that wins at
+# 1 CTA/SM might lose at 2 CTA/SM (and vice versa) — which is exactly the
+# occupancy effect this patch is chasing.
+#
+# ``_K2_CFG_OCCUPANCY`` is populated by the spill/compile filter with the
+# per-config occupancy derived from the compiled cubin's actual shared-memory
+# and register footprint (see ``_compute_ctas_per_sm``).  The K2 autotune
+# grid lambda then looks up the correct occupancy per meta and launches
+# ``min(num_tiles, num_sms * per_cfg_occ)`` — identical to the production
+# formula, so no config is measured under an occupancy it can't achieve.
+#
+# ``AUTOTUNE_OCCUPANCY_ASSUMPTION`` remains as the K1 fallback (K1 does not
+# populate an occupancy map because it has far fewer configs and much
+# lighter register/smem footprint) and as the sentinel value used when a
+# K2 config is absent from the map (e.g. the spill filter was skipped).
+#
+# A config that fits only at 1 CTA/SM still benchmarks correctly at any
+# grid size: the kernel's persistent grid-stride loop iterates more tiles
+# per CTA, so the total work is unchanged; only the per-config SM
+# utilization (and therefore the wall-clock time) changes with grid size.
+AUTOTUNE_OCCUPANCY_ASSUMPTION = 2
+
+# Per-config occupancy map for K2, populated by ``_filter_spilling_configs``.
+# Key is the same config identity tuple used by the spill filter
+# (``(sorted(kwargs.items()), num_warps, num_stages, maxnreg)``).  Value is
+# the CTAs/SM the compiled cubin is estimated to sustain on the target arch.
+_K2_CFG_OCCUPANCY: dict = {}
+
+
+def _cfg_occupancy_key(cfg):
+    """Identity tuple matching ``_filter_spilling_configs``'s reject map."""
+    return (tuple(sorted(cfg.kwargs.items())), cfg.num_warps, cfg.num_stages,
+            getattr(cfg, "maxnreg", None))
+
+
+def _compute_ctas_per_sm(shared_bytes: int, num_regs: int, num_warps: int,
+                         arch: int) -> int:
+    """Estimate CTAs/SM the way CUDA's occupancy calculator does.
+
+    Uses the three classical limiters:
+
+      * shared memory: ``shared_mem_per_sm // shared_bytes`` (aligned up to
+        the block allocation unit; on sm86 that's 128 B, negligible here)
+      * registers: ``regs_per_sm // (num_regs * threads_per_block)`` with
+        threads_per_block = ``num_warps * 32``.  Register file granularity
+        is 256 regs per warp on Turing/Ampere/Ada; we align up to that.
+      * maximum resident CTAs per SM (arch cap).
+
+    Returns the minimum of the three.  A returned value of 0 means the
+    cubin doesn't fit at all (this is a bug — the spill filter should
+    have caught it — but we clamp to 1 so the grid lambda still launches
+    something rather than dividing-by-zero downstream).
+
+    Numbers are taken from the CUDA C++ Programming Guide, Compute
+    Capabilities table (11.8 / 12.6, matching Triton 3.7's supported
+    arches).  For arches we haven't tabulated, we fall back to the
+    sm86/sm89 numbers, which underestimate occupancy on larger parts
+    (safe: the config is still launched, just with fewer CTAs than the
+    hardware could theoretically host).
+    """
+    if arch == 75:
+        # Turing (T4, RTX 20-series, GTX 16-series)
+        smem_per_sm = 64 * 1024
+        regs_per_sm = 65536
+        max_ctas_per_sm = 16
+        reg_alloc_unit = 256   # regs per warp allocation granularity
+    elif arch == 80:
+        # Ampere HPC (A100)
+        smem_per_sm = 164 * 1024
+        regs_per_sm = 65536
+        max_ctas_per_sm = 32
+        reg_alloc_unit = 256
+    elif arch == 86 or arch == 87:
+        # Ampere consumer (RTX 30, A40, A10, Jetson Orin)
+        smem_per_sm = 100 * 1024
+        regs_per_sm = 65536
+        max_ctas_per_sm = 16
+        reg_alloc_unit = 256
+    elif arch == 89:
+        # Ada Lovelace (RTX 40)
+        smem_per_sm = 100 * 1024
+        regs_per_sm = 65536
+        max_ctas_per_sm = 24
+        reg_alloc_unit = 256
+    elif arch == 90:
+        # Hopper (H100)
+        smem_per_sm = 228 * 1024
+        regs_per_sm = 65536
+        max_ctas_per_sm = 32
+        reg_alloc_unit = 256
+    else:
+        # Fallback: sm86 numbers.  Underestimates on larger parts, safe.
+        smem_per_sm = 100 * 1024
+        regs_per_sm = 65536
+        max_ctas_per_sm = 16
+        reg_alloc_unit = 256
+
+    # Shared-mem limiter.  Guard against 0 to avoid ZeroDivisionError; a
+    # zero-shared kernel is rare but legal (K1 was almost there before v7).
+    shared_bytes = max(int(shared_bytes), 1)
+    ctas_shared = smem_per_sm // shared_bytes
+
+    # Register limiter.  Per-thread reg count is rounded UP to 2 (Ampere/Ada
+    # granularity), multiplied by the block's thread count.  If the cubin
+    # didn't report a register count (cuobjdump failed), we fall back to the
+    # arch's max resident CTA cap and let the smem/CTA limiters take over.
+    #
+    # (``reg_alloc_unit`` is retained above for future arches whose warp-level
+    # allocation granularity differs; on sm75+ the effective per-thread
+    # rounding used by the driver is 2, which is what matters here.)
+    if num_regs and num_warps:
+        threads = num_warps * 32
+        regs_per_thread_rounded = ((int(num_regs) + 1) // 2) * 2
+        block_regs = regs_per_thread_rounded * threads
+        ctas_regs = regs_per_sm // max(block_regs, 1)
+    else:
+        ctas_regs = max_ctas_per_sm
+
+    ctas = min(ctas_shared, ctas_regs, max_ctas_per_sm)
+    return max(int(ctas), 1)
+
+# K2 shared-memory cap: reject configs whose actual GPU-JIT shared memory
+# exceeds this budget.  The cap prevents shipping a cubin that uses almost
+# the entire per-block optin budget (e.g. 96 KB on RTX 3050 Laptop), which
+# forces 1 CTA/SM and can profile poorly in the full DiT graph.
+#
+# Default: 0 = disabled (let the spill gate and per-arch smem filter in
+# _estimate_k2_configs be the only filters).  The previous 64 KB default
+# was set when the only viable configs were 64x128 BK=64 S=3 (96 KB) — it
+# blocked those configs, forcing the user to set
+# HOTSTEP_K2_MAX_SHARED_BYTES=0 to get any autotune winner.  With the new
+# arch-dispatched config builder, the smem filter in _estimate_k2_configs
+# already rejects configs that don't fit the per-arch optin budget, so
+# this secondary cap is redundant.  Override with a byte count to
+# re-enable.
+K2_MAX_SHARED_BYTES = int(os.environ.get("HOTSTEP_K2_MAX_SHARED_BYTES", "0"))
+
+
+def _autotune_grid_x(num_tiles: int, num_sms: int,
+                     ctas_per_sm: int = AUTOTUNE_OCCUPANCY_ASSUMPTION) -> int:
+    """Occupancy-scaled autotune grid (patch review §H2).
+
+    Mirrors the production launch formula
+    ``min(num_tiles, num_sms * max_active_ctas_per_sm)``.  ``ctas_per_sm``
+    defaults to ``AUTOTUNE_OCCUPANCY_ASSUMPTION`` (2) for K1 and any caller
+    that doesn't have a per-config occupancy value; K2's grid lambda passes
+    the precomputed per-config occupancy so every candidate is measured
+    under the same launch geometry the production plugin will use.
+    Caps at ``num_tiles`` so we never launch more CTAs than there is work.
+    """
+    cap = num_sms * max(int(ctas_per_sm), 1)
+    return min(num_tiles, cap) if num_tiles > cap else num_tiles
+
+
+def _autotune_grid_x_for_k2(num_tiles: int, num_sms: int, meta) -> int:
+    """K2-only grid lambda helper that looks up the per-config occupancy.
+
+    The Triton autotune grid lambda receives ``meta``: a dict of the
+    config's constexpr kwargs merged with ``num_warps``/``num_stages``.  We
+    reconstruct the config identity tuple and look up the occupancy that
+    the spill/compile filter previously computed for this exact
+    (kwargs, warps, stages, maxnreg) combination.
+
+    If the config isn't in the map (spill filter was skipped, e.g. tests
+    that inject a manual config list), we fall back to
+    ``AUTOTUNE_OCCUPANCY_ASSUMPTION``.
+    """
+    kwargs_items = tuple(sorted(
+        (k, v) for k, v in meta.items()
+        if k not in ("num_warps", "num_stages", "num_ctas", "maxnreg")
+    ))
+    key = (kwargs_items,
+           int(meta.get("num_warps", 0)),
+           int(meta.get("num_stages", 0)),
+           meta.get("maxnreg", None))
+    ctas = _K2_CFG_OCCUPANCY.get(key, AUTOTUNE_OCCUPANCY_ASSUMPTION)
+    return _autotune_grid_x(num_tiles, num_sms, ctas)
+
 
 _LAUNCH_ARG_ENUM = {
     "X_ptr": "kX_ptr",
@@ -391,7 +919,6 @@ _LAUNCH_ARG_ENUM = {
     "M": "kM",
     "N": "kN",
     "K": "kK",
-    "NUM_SMS": "kNUM_SMS",
     "stride_xm": "kStride_xm",
     "stride_xk": "kStride_xk",
     "stride_xqm": "kStride_xqm",
@@ -409,13 +936,13 @@ _POINTER_ARG_NAMES = {
 }
 
 _QUANT_ARG_NAMES = {
-    "X_ptr", "X_q_ptr", "X_scale_ptr", "M", "K", "NUM_SMS",
+    "X_ptr", "X_q_ptr", "X_scale_ptr", "M", "K",
     "stride_xm", "stride_xk", "stride_xqm", "stride_xqk", "stride_xsm", "stride_xsg",
 }
 
 _GEMM_ARG_NAMES = {
     "X_q_ptr", "X_scale_ptr", "W_q_ptr", "W_scale_ptr", "Bias_ptr", "Y_ptr",
-    "M", "N", "K", "NUM_SMS",
+    "M", "N", "K",
     "stride_xqm", "stride_xqk", "stride_xsm", "stride_xsg",
     "stride_wn", "stride_wk", "stride_ym", "stride_yn",
 }
@@ -764,6 +1291,67 @@ def _dump_cache_debug(kernel_cache, best_cfg):
             print("        sidecar: <missing>", flush=True)
 
 
+def _get_kernel_cache_dir(kernel):
+    """Return the Triton JIT cache directory holding this kernel's artifacts.
+
+    Each CompiledKernel is materialized on disk as a hash-named directory under
+    the Triton cache root (TRITON_CACHE_DIR or ~/.triton/cache) containing the
+    cubin, PTX, TTGIR, TTIR, and a JSON metadata sidecar.  Returning this
+    directory lets the operator pull the exact PTX/IR/SASS for the autotune
+    winner for offline diagnosis (cuobjdump, ptxas -v, nvdisasm).
+
+    Returns None if no on-disk artifact path can be recovered.
+
+    Triton 3.7.x CompiledKernel layout:
+      * kernel.metadata_group : dict[str, Path] — maps content-hash → Path
+        for each artifact (.json, .ptx, .ttgir, .cubin, etc.).  The parent
+        of any of these paths is the cache directory.
+      * kernel.hash : str — the hash used in the directory name.
+      * kernel.asm : AsmDict — maps suffix → bytes/text (no path info).
+      * No `cache_path` or `path` attribute exists in 3.7.x.
+    """
+    # Preferred: metadata_group dict (Triton 3.7.x).  Values are Path objects
+    # pointing at individual artifacts; the parent of any of them is the cache
+    # directory.
+    mg = getattr(kernel, "metadata_group", None)
+    if isinstance(mg, dict):
+        for v in mg.values():
+            if isinstance(v, (str, os.PathLike)) and not isinstance(v, (bytes, bytearray)):
+                try:
+                    p = Path(v)
+                    if p.is_file():
+                        return p.parent
+                    if p.is_dir():
+                        return p
+                except (OSError, ValueError):
+                    pass
+    # Fallback: check common path-like attributes (older Triton versions).
+    for attr in ("cache_path", "path"):
+        v = getattr(kernel, attr, None)
+        if isinstance(v, (str, os.PathLike)) and not isinstance(v, (bytes, bytearray)):
+            try:
+                p = Path(v)
+                if p.is_file():
+                    return p.parent
+                if p.is_dir():
+                    return p
+            except (OSError, ValueError):
+                pass
+    # Fallback: scan .asm dict for path-like values (some Triton versions
+    # store artifact paths here instead of raw bytes).
+    asm = getattr(kernel, "asm", None)
+    if isinstance(asm, dict):
+        for v in asm.values():
+            if isinstance(v, (str, os.PathLike)) and not isinstance(v, (bytes, bytearray)):
+                try:
+                    p = Path(v)
+                    if p.is_file():
+                        return p.parent
+                except (OSError, ValueError):
+                    pass
+    return None
+
+
 def _get_compiled_kernel(autotuned_fn, device=0, debug_dump=False, **runtime_kwargs):
     base_fn = _find_jit_holder(autotuned_fn)
     if base_fn is None:
@@ -781,7 +1369,36 @@ def _get_compiled_kernel(autotuned_fn, device=0, debug_dump=False, **runtime_kwa
         _dump_cache_debug(kernel_cache, best_cfg)
 
     kernel = _select_kernel_from_cache(kernel_cache, best_cfg, arg_names, runtime_kwargs)
-    return kernel, best_cfg
+    cache_dir = _get_kernel_cache_dir(kernel)
+    return kernel, best_cfg, cache_dir
+
+
+def _get_compiled_kernel_for_cfg(autotuned_fn, best_cfg, device=0,
+                                 debug_dump=False, **runtime_kwargs):
+    """Same as ``_get_compiled_kernel`` but for a caller-selected ``best_cfg``.
+
+    The custom K2 benchmarker (``_bench_k2_configs_custom``) bypasses
+    ``@triton.autotune``'s built-in measurement, so ``autotuned_fn.best_config``
+    is not populated for the shape we care about.  Instead we hand the picked
+    config in explicitly and reuse the same cache-walking helpers.
+    """
+    base_fn = _find_jit_holder(autotuned_fn)
+    if base_fn is None:
+        _debug_wrapper_chain(autotuned_fn)
+        raise RuntimeError(
+            f"Could not find Triton JIT cache holder in wrapper chain starting from "
+            f"{type(autotuned_fn)!r}"
+        )
+
+    kernel_cache = _safe_cache_entry(base_fn.device_caches, device)
+    arg_names = getattr(base_fn, "arg_names", None)
+
+    if debug_dump:
+        _dump_cache_debug(kernel_cache, best_cfg)
+
+    kernel = _select_kernel_from_cache(kernel_cache, best_cfg, arg_names, runtime_kwargs)
+    cache_dir = _get_kernel_cache_dir(kernel)
+    return kernel, best_cfg, cache_dir
 
 
 def _flush_compiled_kernel_cache(jit_fn):
@@ -805,7 +1422,7 @@ _K1_WORKER_STATE = threading.local()
 _K2_WORKER_STATE = threading.local()
 
 
-def _init_k1_worker(input_fp16, num_sms):
+def _init_k1_worker(input_fp16):
     import torch
     try:
         torch.set_num_threads(1)
@@ -813,7 +1430,6 @@ def _init_k1_worker(input_fp16, num_sms):
         pass
     dtype = torch.float16 if input_fp16 else torch.float32
     _K1_WORKER_STATE.input_fp16 = input_fp16
-    _K1_WORKER_STATE.num_sms = num_sms
     _K1_WORKER_STATE.x = torch.empty((1, 1), device="cuda", dtype=dtype)
     _K1_WORKER_STATE.xq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
     _K1_WORKER_STATE.xs = torch.empty((1, 1), device="cuda", dtype=torch.float32)
@@ -825,14 +1441,14 @@ def _worker_precompile_k1(config_tuple):
     from triton import Config
     kwargs, nw, ns, mr = config_tuple
     input_fp16 = _K1_WORKER_STATE.input_fp16
-    num_sms = _K1_WORKER_STATE.num_sms
     try:
         cfg = Config(kwargs, num_warps=nw, num_stages=ns, maxnreg=mr)
         kernel1_convrot_quant.fn.warmup(
             _K1_WORKER_STATE.x, _K1_WORKER_STATE.xq, _K1_WORKER_STATE.xs,
-            1024, 2560, num_sms,
+            1024, 2560,
             2560, 1, 2560, 1, 1, 1024,
             GROUP_SIZE=256, INPUT_FP16=input_fp16,
+            CONTIG_XK=True,
             **cfg.all_kwargs(),
             grid=(1, 1, 1)
         )
@@ -843,34 +1459,39 @@ def _worker_precompile_k1(config_tuple):
     return 1
 
 
-def _parallel_precompile_k1(configs, input_fp16, num_sms):
+def _parallel_precompile_k1(configs, input_fp16):
     num_workers = int(os.environ.get("HOTSTEP_AUTOTUNE_WORKERS", min(mp.cpu_count(), len(configs), 16)))
     if num_workers <= 1 or not configs:
         return
     print(f"    [parallel-compile] Precompiling {len(configs)} K1 configs across {num_workers} threads...", flush=True)
     tuples = [(c.kwargs, c.num_warps, c.num_stages, getattr(c, "maxnreg", None)) for c in configs]
+    done = 0
+    total = len(configs)
+    # Sparse newline-terminated progress (every ~10%): carriage-return
+    # progress lines interleave badly with worker-thread prints.
+    progress_step = max(total // 10, 1)
     try:
         with ThreadPool(
             processes=num_workers,
             initializer=_init_k1_worker,
-            initargs=(input_fp16, num_sms)
+            initargs=(input_fp16,)
         ) as pool:
             for _ in pool.imap_unordered(_worker_precompile_k1, tuples, chunksize=1):
-                pass
+                done += 1
+                if done % progress_step == 0 or done == total:
+                    print(f"    [parallel-compile] K1: {done}/{total} configs compiled", flush=True)
     except Exception as e:
         print(f"    [parallel-compile] Warning: parallel precompilation fallback ({e})", flush=True)
 
 
-def _init_k2_worker(has_bias, output_fp16, num_sms):
+def _init_k2_worker(output_fp16):
     import torch
     try:
         torch.set_num_threads(1)
     except Exception:
         pass
     out_dtype = torch.float16 if output_fp16 else torch.float32
-    _K2_WORKER_STATE.has_bias = has_bias
     _K2_WORKER_STATE.output_fp16 = output_fp16
-    _K2_WORKER_STATE.num_sms = num_sms
     _K2_WORKER_STATE.xq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
     _K2_WORKER_STATE.xs = torch.empty((1, 1), device="cuda", dtype=torch.float32)
     _K2_WORKER_STATE.wq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
@@ -884,17 +1505,16 @@ def _worker_precompile_k2(config_tuple):
         return 0
     from triton import Config
     kwargs, nw, ns, mr = config_tuple
-    has_bias = _K2_WORKER_STATE.has_bias
     output_fp16 = _K2_WORKER_STATE.output_fp16
-    num_sms = _K2_WORKER_STATE.num_sms
     try:
         cfg = Config(kwargs, num_warps=nw, num_stages=ns, maxnreg=mr)
+        # W_q is [N, K] row-major: stride_wn=K=2560, stride_wk=1.
         kernel2_gemm_dequant.fn.warmup(
             _K2_WORKER_STATE.xq, _K2_WORKER_STATE.xs, _K2_WORKER_STATE.wq,
             _K2_WORKER_STATE.ws, _K2_WORKER_STATE.bias, _K2_WORKER_STATE.y,
-            1024, 2560, 2560, num_sms,
+            1024, 2560, 2560,
             2560, 1, 1, 1024, 2560, 1, 2560, 1,
-            GROUP_SIZE=256, HAS_BIAS=has_bias, OUTPUT_FP16=output_fp16,
+            GROUP_SIZE=256, OUTPUT_FP16=output_fp16,
             **cfg.all_kwargs(),
             grid=(1, 1, 1)
         )
@@ -905,22 +1525,556 @@ def _worker_precompile_k2(config_tuple):
     return 1
 
 
-def _parallel_precompile_k2(configs, has_bias, output_fp16, num_sms):
+def _parallel_precompile_k2(configs, output_fp16):
     num_workers = int(os.environ.get("HOTSTEP_AUTOTUNE_WORKERS", min(mp.cpu_count(), len(configs), 16)))
     if num_workers <= 1 or not configs:
         return
     print(f"    [parallel-compile] Precompiling {len(configs)} K2 configs across {num_workers} threads...", flush=True)
     tuples = [(c.kwargs, c.num_warps, c.num_stages, getattr(c, "maxnreg", None)) for c in configs]
+    done = 0
+    total = len(configs)
+    # Sparse newline-terminated progress (every ~10%): carriage-return
+    # progress lines interleave badly with worker-thread prints.
+    progress_step = max(total // 10, 1)
     try:
         with ThreadPool(
             processes=num_workers,
             initializer=_init_k2_worker,
-            initargs=(has_bias, output_fp16, num_sms)
+            initargs=(output_fp16,)
         ) as pool:
             for _ in pool.imap_unordered(_worker_precompile_k2, tuples, chunksize=1):
-                pass
+                done += 1
+                if done % progress_step == 0 or done == total:
+                    print(f"    [parallel-compile] K2: {done}/{total} configs compiled", flush=True)
     except Exception as e:
         print(f"    [parallel-compile] Warning: parallel precompilation fallback ({e})", flush=True)
+
+
+# ─── Register spill detection (patch review §8 — robust, non-heuristic) ──
+#
+# Triton 3.7.x will SILENTLY spill registers to local memory (DRAM) when a
+# config's maxnreg cap can't be honored.  There is no compile error — the
+# kernel produces correct output but at a fraction of the performance because
+# every spilled register access goes through DRAM instead of the register file.
+#
+# ZERO TOLERANCE: any config that spills even one byte is rejected.  No
+# thresholds, no "borderline" acceptance.
+#
+# Detection method (patch review §8.1): every NVIDIA cubin carries per-kernel
+# ELF attributes (EIATTR_FRAME_SIZE) recording how many bytes of thread-local
+# ("local memory") stack space the kernel needs.  For a Triton kernel that
+# declares no .local arrays, the ONLY source of nonzero thread-local stack is
+# register spilling.  This is a hard, unambiguous binary signal:
+#   * STACK == 0 → no spills (categorically)
+#   * STACK > 0  → spills (categorically, REJECT)
+#
+# We read this via cuobjdump --dump-resource-usage (the STACK: field, NOT
+# LOCAL: which stays 0 for Triton kernels).  If cuobjdump is unavailable,
+# we fall back to PTX-level ld.local/st.local count (also zero-tolerance:
+# any nonzero count = reject).
+
+_CUOBJDUMP_FUNC_RE = None  # lazy-compiled
+
+
+def _find_cuobjdump():
+    """Find cuobjdump — prefer the one bundled with Triton (version-matched)."""
+    import shutil
+    try:
+        import triton as _triton
+        candidate = (Path(_triton.__file__).resolve().parent
+                     / "backends" / "nvidia" / "bin" / "cuobjdump")
+        if candidate.exists():
+            return str(candidate)
+    except ImportError:
+        pass
+    return shutil.which("cuobjdump")
+
+
+def _check_cubin_spills_cuobjdump(cubin_bytes, function_name):
+    """Robust spill check via cuobjdump --dump-resource-usage.
+
+    Returns (spills: bool, local_bytes_per_thread: int, registers: int).
+    Returns (None, 0, 0) if cuobjdump is not available.
+    """
+    import re
+    import subprocess
+    import tempfile
+
+    global _CUOBJDUMP_FUNC_RE
+    if _CUOBJDUMP_FUNC_RE is None:
+        _CUOBJDUMP_FUNC_RE = re.compile(
+            r"Function\s+(?P<name>\S+?):\s*\n\s*"
+            r"REG:(?P<reg>\d+)\s+STACK:(?P<stack>\d+)\s+SHARED:(?P<shared>\d+)\s+LOCAL:(?P<local>\d+)",
+        )
+
+    cuobjdump = _find_cuobjdump()
+    if cuobjdump is None:
+        return (None, 0, 0)  # cuobjdump not available
+
+    with tempfile.NamedTemporaryFile(suffix=".cubin", delete=False) as f:
+        f.write(cubin_bytes)
+        cubin_path = f.name
+    try:
+        proc = subprocess.run(
+            [cuobjdump, "--dump-resource-usage", cubin_path],
+            capture_output=True, text=True, check=True,
+        )
+        for m in _CUOBJDUMP_FUNC_RE.finditer(proc.stdout):
+            if m.group("name") == function_name:
+                stack = int(m.group("stack"))
+                regs = int(m.group("reg"))
+                # ZERO TOLERANCE: stack > 0 means spills, period.
+                return (stack > 0, stack, regs)
+        # Function not found — can't determine
+        return (None, 0, 0)
+    except Exception:
+        return (None, 0, 0)
+    finally:
+        Path(cubin_path).unlink(missing_ok=True)
+
+
+def _detect_spills(kernel, function_name: str = "") -> dict:
+    """Check a compiled kernel for register spills.  ZERO TOLERANCE.
+
+    Primary method: cuobjdump STACK: field (nonzero = spills).
+    Fallback (if cuobjdump unavailable): PTX-level ld.local/st.local count
+    (any nonzero = spills).
+
+    Returns a dict with:
+      * 'spilling': bool — True if ANY spills detected
+      * 'local_bytes': int — thread-local stack bytes from cuobjdump
+      * 'registers': int — register count from cuobjdump
+      * 'ptx_spills': int — count of ld.local/st.local in PTX
+      * 'method': str — 'cuobjdump' or 'ptx-fallback'
+    """
+    cubin = kernel.asm.get("cubin", b"")
+    cubin_size = len(cubin) if isinstance(cubin, (bytes, bytearray)) else 0
+
+    ptx = kernel.asm.get("ptx", "")
+    if isinstance(ptx, bytes):
+        ptx = ptx.decode(errors="replace")
+    ptx_spills = ptx.count("ld.local") + ptx.count("st.local")
+
+    # Primary: cuobjdump STACK field (authoritative, zero-tolerance)
+    spills_cuobjdump, local_bytes, registers = (None, 0, 0)
+    if function_name and cubin_size > 0:
+        spills_cuobjdump, local_bytes, registers = _check_cubin_spills_cuobjdump(
+            cubin, function_name)
+
+    if spills_cuobjdump is not None:
+        # cuobjdump succeeded — STACK > 0 means spills.  Zero tolerance.
+        spilling = spills_cuobjdump
+        method = "cuobjdump"
+    else:
+        # Fallback: any PTX-level ld.local/st.local = spills.  Zero tolerance.
+        # Patch review §LOW: log when the primary cuobjdump path degrades to
+        # the PTX fallback so a silently-broken cuobjdump invocation (wrong
+        # version, missing binary, regex mismatch) is visible in the build
+        # log instead of being hidden behind a successful PTX result.
+        if function_name and cubin_size > 0:
+            print(
+                f"    [spill-check] WARNING: cuobjdump unavailable or parsing "
+                f"failed for {function_name} (cubin={cubin_size}B); falling "
+                f"back to PTX ld.local/st.local counting (less authoritative).",
+                flush=True,
+            )
+        spilling = ptx_spills > 0
+        method = "ptx-fallback"
+
+    return {
+        "spilling": spilling,
+        "ptx_spills": ptx_spills,
+        "local_bytes": local_bytes,
+        "registers": registers,
+        "method": method,
+    }
+
+
+def _compile_kernel_for_spill_check(jit_fn, signature, constexprs, num_warps,
+                                     num_stages, maxnreg, target_arch):
+    """Compile a single config for spill analysis (no autotune, no launch)."""
+    from triton.compiler import compile as triton_compile
+    from triton.compiler.compiler import ASTSource
+    from triton.backends.compiler import GPUTarget
+
+    fn = jit_fn.fn if hasattr(jit_fn, 'fn') else jit_fn
+    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
+    target = GPUTarget(backend='cuda', arch=target_arch, warp_size=32)
+    options = {'num_warps': num_warps, 'num_stages': num_stages}
+    if maxnreg is not None:
+        options['maxnreg'] = maxnreg
+    return triton_compile(src, target=target, options=options)
+
+
+# ─── Parallel spill-check worker state ────────────────────────────────────
+_SPILL_CHECK_STATE = threading.local()
+
+
+def _init_spill_check_worker(jit_fn, target_arch, stage):
+    _SPILL_CHECK_STATE.jit_fn = jit_fn
+    _SPILL_CHECK_STATE.target_arch = target_arch
+    _SPILL_CHECK_STATE.fn_name = "kernel1_convrot_quant" if stage == "k1" else "kernel2_gemm_dequant"
+
+
+def _worker_check_spills(task):
+    """Compile one (config, variant) and return (config, label, spill_info_or_error)."""
+    cfg, variant_label, signature, constexprs = task
+    try:
+        kernel = _compile_kernel_for_spill_check(
+            _SPILL_CHECK_STATE.jit_fn,
+            signature,
+            constexprs,
+            cfg.num_warps, cfg.num_stages,
+            getattr(cfg, 'maxnreg', None),
+            _SPILL_CHECK_STATE.target_arch)
+        spill_info = _detect_spills(kernel, _SPILL_CHECK_STATE.fn_name)
+        spill_info["shared_bytes"] = int(getattr(kernel.metadata, "shared", 0) or 0)
+        return (cfg, variant_label, spill_info, None)
+    except Exception as e:
+        return (cfg, variant_label, None, f"{type(e).__name__}: {e}")
+
+
+def _spill_check_variants(stage):
+    """Enumerate ALL shipped constexpr variants for the spill gate.
+
+    Register pressure differs between variants — e.g. the K2 BIAS variant
+    holds an extra (BLOCK_N,) fp32 tile in the epilogue, and FP16 IO changes
+    both load widths and conversion sequences.  A config is only kept if it
+    is spill-free in EVERY variant that will actually be extracted (per
+    shipped BIAS_CONFIGS × DTYPE_CONFIGS), otherwise a config could pass the gate on
+    the NOBIAS/FP32 variant and then spill in the BIAS variant that ships.
+
+    Yields (label, signature, extra_constexprs) tuples.
+    """
+    if stage == "k1":
+        for dtype_suffix, input_fp16, _ in DTYPE_CONFIGS:
+            x_type = '*fp16' if input_fp16 else '*fp32'
+            signature = {
+                'X_ptr': x_type, 'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32',
+                'M': 'i32', 'K': 'i32',
+                'stride_xm': 'i32', 'stride_xk': 'i32',
+                'stride_xqm': 'i32', 'stride_xqk': 'i32',
+                'stride_xsm': 'i32', 'stride_xsg': 'i32',
+            }
+            yield (dtype_suffix, signature,
+                   {'GROUP_SIZE': 256, 'INPUT_FP16': input_fp16, 'CONTIG_XK': True})
+    else:  # k2
+        # HAS_BIAS is compile-time-hardwired in the shipped K2 cubin
+        # (see BIAS_CONFIGS).  Iterating BIAS_CONFIGS keeps the label scheme
+        # in sync with the extraction summary and the C++ cubin lookup.
+        for bias_suffix, _has_bias in BIAS_CONFIGS:
+            for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
+                y_type = '*fp16' if output_fp16 else '*fp32'
+                signature = {
+                    'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32', 'W_q_ptr': '*i8',
+                    'W_scale_ptr': '*fp32', 'Bias_ptr': '*fp32', 'Y_ptr': y_type,
+                    'M': 'i32', 'N': 'i32', 'K': 'i32',
+                    'stride_xqm': 'i32', 'stride_xqk': 'i32',
+                    'stride_xsm': 'i32', 'stride_xsg': 'i32',
+                    'stride_wn': 'i32', 'stride_wk': 'i32',
+                    'stride_ym': 'i32', 'stride_yn': 'i32',
+                }
+                yield (f"{bias_suffix}_{dtype_suffix}", signature,
+                       {'GROUP_SIZE': 256,
+                        'OUTPUT_FP16': output_fp16})
+
+
+def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
+    """Compile each config in parallel and reject any that spill registers.
+
+    ZERO TOLERANCE: any config with STACK > 0 (from cuobjdump) or any
+    PTX-level ld.local/st.local is rejected.  No thresholds.
+
+    Every SHIPPED constexpr variant (currently bias-enabled K2 only × DTYPE_CONFIGS) is
+    checked — a config survives only if it is spill-free in all of them
+    (see _spill_check_variants).
+
+    Uses the same 16-thread ThreadPool as the precompile step — sequential
+    compilation of 50+ configs takes minutes; parallel takes seconds.
+
+    Returns the filtered config list.
+    """
+    if not configs:
+        return configs
+
+    def make_constexprs(cfg, extra):
+        out = dict(extra)
+        out.update(cfg.kwargs)  # BLOCK_M[/BLOCK_N/BLOCK_K/GROUP_M]
+        return out
+
+    # Build the task list: (config, variant_label, signature, constexprs)
+    # for each config × shipped variant.
+    tasks = [
+        (cfg, label, signature, make_constexprs(cfg, extra))
+        for cfg in configs
+        for (label, signature, extra) in _spill_check_variants(stage)
+    ]
+
+    # Compile all config × variant combinations in parallel using the same
+    # ThreadPool approach as _parallel_precompile_k1/k2 (16 threads default).
+    num_workers = int(os.environ.get("HOTSTEP_AUTOTUNE_WORKERS",
+                                      min(mp.cpu_count(), len(tasks), 16)))
+    print(f"    [spill-check] {stage}: checking {len(configs)} configs x "
+          f"{len(tasks) // max(len(configs), 1)} variant(s) = {len(tasks)} compiles "
+          f"across {num_workers} threads (zero-tolerance)...", flush=True)
+
+    results = []
+    total = len(tasks)
+
+    def _progress(done_count):
+        # Plain end='\n'-free progress would interleave with worker prints
+        # (e.g. cuobjdump fallback warnings); emit sparse newline-terminated
+        # progress lines instead (every ~10% and at completion).
+        step = max(total // 10, 1)
+        if done_count % step == 0 or done_count == total:
+            print(f"    [spill-check] {stage}: {done_count}/{total} compiled", flush=True)
+
+    if num_workers <= 1:
+        # Sequential fallback
+        _init_spill_check_worker(jit_fn, target_arch, stage)
+        for task in tasks:
+            results.append(_worker_check_spills(task))
+            _progress(len(results))
+    else:
+        try:
+            with ThreadPool(
+                processes=num_workers,
+                initializer=_init_spill_check_worker,
+                initargs=(jit_fn, target_arch, stage)
+            ) as pool:
+                for r in pool.imap_unordered(_worker_check_spills, tasks, chunksize=1):
+                    results.append(r)
+                    _progress(len(results))
+        except Exception as e:
+            print(f"    [spill-check] Warning: parallel spill-check failed ({e}), "
+                  f"falling back to sequential", flush=True)
+            results = []
+            _init_spill_check_worker(jit_fn, target_arch, stage)
+            for task in tasks:
+                results.append(_worker_check_spills(task))
+                _progress(len(results))
+
+    # A config is rejected if ANY of its shipped variants spills or fails to
+    # compile.  Aggregate per-config over all variant results.
+    def _cfg_id(c):
+        return (tuple(sorted(c.kwargs.items())), c.num_warps, c.num_stages,
+                getattr(c, 'maxnreg', None))
+
+    reject_reasons: dict = {}
+    for cfg, variant_label, spill_info, error in results:
+        cid = _cfg_id(cfg)
+        if error is not None:
+            reject_reasons.setdefault(cid, []).append(
+                f"[{variant_label}] compile failed: {error}")
+        elif spill_info['spilling']:
+            reject_reasons.setdefault(cid, []).append(
+                f"[{variant_label}] SPILLS: {spill_info['method']}: "
+                f"local_bytes={spill_info['local_bytes']}, "
+                f"ptx_spills={spill_info['ptx_spills']}, "
+                f"regs={spill_info['registers']}")
+        elif stage == "k2" and K2_MAX_SHARED_BYTES > 0 and spill_info.get("shared_bytes", 0) > K2_MAX_SHARED_BYTES:
+            reject_reasons.setdefault(cid, []).append(
+                f"[{variant_label}] shared_bytes={spill_info.get('shared_bytes', 0)} "
+                f"> K2_MAX_SHARED_BYTES={K2_MAX_SHARED_BYTES}")
+
+    filtered = []
+    rejected = []
+    # ── Per-config occupancy: minimum CTAs/SM over all shipped variants ──
+    # We take the min so the autotune grid never over-launches beyond what
+    # the tightest variant supports.  Populated for K2 only; K1 keeps the
+    # fixed AUTOTUNE_OCCUPANCY_ASSUMPTION fallback.
+    occ_map: dict = {}
+    for cfg, variant_label, spill_info, error in results:
+        if error is not None or spill_info is None:
+            continue
+        cur = _compute_ctas_per_sm(
+            spill_info.get("shared_bytes", 0),
+            spill_info.get("registers", 0),
+            cfg.num_warps,
+            target_arch,
+        )
+        cid = _cfg_id(cfg)
+        prev = occ_map.get(cid)
+        occ_map[cid] = cur if prev is None else min(prev, cur)
+
+    for cfg in configs:
+        reasons = reject_reasons.get(_cfg_id(cfg))
+        if reasons:
+            rejected.append((cfg, "; ".join(reasons)))
+        else:
+            filtered.append(cfg)
+
+    if stage == "k2":
+        # Publish surviving configs' occupancy to the module-level map so
+        # the K2 autotune grid lambda can read it.  Keyed by the
+        # occupancy-map key (which matches _cfg_id above).
+        _K2_CFG_OCCUPANCY.clear()
+        for cfg in filtered:
+            occ = occ_map.get(_cfg_id(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
+            _K2_CFG_OCCUPANCY[_cfg_occupancy_key(cfg)] = int(occ)
+
+    if rejected:
+        print(f"    [spill-check] {stage}: REJECTED {len(rejected)} configs "
+              f"(zero-tolerance: any spill in any shipped variant = reject):", flush=True)
+        for cfg, reason in rejected[:10]:
+            mr = getattr(cfg, 'maxnreg', None)
+            print(f"      REJECT {cfg.kwargs} W={cfg.num_warps} S={cfg.num_stages} MR={mr}: {reason}", flush=True)
+        if len(rejected) > 10:
+            print(f"      ... and {len(rejected) - 10} more", flush=True)
+    else:
+        print(f"    [spill-check] {stage}: all {len(configs)} configs are spill-free "
+              f"in all shipped variants", flush=True)
+
+    return filtered
+
+
+# ─── Custom K2 benchmark loop (replaces Triton's built-in do_bench) ──────
+#
+# Triton 3.7.x's ``@triton.autotune`` measures each config with an internal
+# ``do_bench`` call whose warmup/rep budget is dynamic and (empirically) too
+# short for our K2 configs: on sm86, adjacent points in the tuning space
+# routinely swap under repeated measurement.  The standalone benchmark
+# ``benchmark_k2_tuning_space_hybrid.py`` uses a fixed ``warmup=20``,
+# ``iters=50`` CUDA-event loop and consistently ranks the same config
+# combinations — with ~0.5% run-to-run noise vs. the ~2% swings we saw
+# from Triton's built-in.  So for K2 we replace the built-in measurement
+# with the exact benchmark methodology the standalone benchmark uses,
+# then plug the picked config back into ``_get_compiled_kernel_for_cfg``
+# for header emission.
+#
+# Environment variables (all optional):
+#   HOTSTEP_K2_BENCH_WARMUP   — warmup iterations per config (default 20)
+#   HOTSTEP_K2_BENCH_ITERS    — timed iterations per config (default 50)
+#   HOTSTEP_K2_BENCH_TOPN     — how many top configs to print (default 5)
+
+K2_BENCH_WARMUP = int(os.environ.get("HOTSTEP_K2_BENCH_WARMUP", "20"))
+K2_BENCH_ITERS = int(os.environ.get("HOTSTEP_K2_BENCH_ITERS", "50"))
+K2_BENCH_TOPN = int(os.environ.get("HOTSTEP_K2_BENCH_TOPN", "5"))
+
+
+def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
+    """Launch one K2 config with the occupancy-scaled production grid.
+
+    Uses ``kernel2_gemm_dequant.fn[grid](...)`` (the raw JITFunction, no
+    autotune wrapping) with the config's constexprs passed explicitly so
+    each call is a straight launch — no measurement is done here.
+    """
+    xq, xs, wq, ws, bias, y = tensors
+    num_tiles = triton.cdiv(M, cfg.kwargs["BLOCK_M"]) * triton.cdiv(N, cfg.kwargs["BLOCK_N"])
+    # Per-config occupancy (populated by the spill/compile filter) mirrors the
+    # production launch geometry; fall back to AUTOTUNE_OCCUPANCY_ASSUMPTION
+    # if the map was skipped (e.g. tests injecting a manual config list).
+    ctas = _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
+    grid_x = _autotune_grid_x(num_tiles, num_sms, ctas)
+    kwargs = dict(cfg.kwargs)
+    kwargs["GROUP_SIZE"] = GROUP_SIZE
+    kwargs["OUTPUT_FP16"] = output_fp16
+    kwargs["num_warps"] = cfg.num_warps
+    kwargs["num_stages"] = cfg.num_stages
+    mr = getattr(cfg, "maxnreg", None)
+    if mr is not None:
+        kwargs["maxnreg"] = mr
+    kernel2_gemm_dequant.fn[(grid_x,)](
+        xq, xs, wq, ws, bias, y,
+        M, N, K,
+        K, 1,
+        1, M,
+        K, 1,        # W_q [N, K] row-major
+        N, 1,
+        **kwargs,
+    )
+    return grid_x
+
+
+def _bench_k2_config(cfg, tensors, M, N, K, num_sms, output_fp16,
+                     warmup=None, iters=None):
+    """Time a single K2 config with warmup + CUDA events, returning (ms, grid).
+
+    Mirrors ``benchmark_k2_tuning_space_hybrid.py``'s per-config loop: one
+    compile launch, ``warmup`` warm launches, then ``iters`` timed launches
+    bracketed by ``torch.cuda.Event`` records, returning the mean time per
+    launch in ms.
+
+    Raises whatever the launch raises (typically ``OutOfResources`` /
+    ``triton.compiler.errors.CompilationError`` for configs that can't fit).
+    """
+    import torch
+    if warmup is None:
+        warmup = K2_BENCH_WARMUP
+    if iters is None:
+        iters = K2_BENCH_ITERS
+
+    # 1 compile-and-launch call to force JIT + cache population.
+    grid_x = _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+    torch.cuda.synchronize()
+    for _ in range(warmup):
+        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+    end.record()
+    torch.cuda.synchronize()
+    ms = start.elapsed_time(end) / iters
+    return ms, grid_x
+
+
+def _bench_k2_configs_custom(configs, tensors, M, N, K, num_sms, output_fp16):
+    """Custom-benchmark every config and return (best_cfg, results_sorted).
+
+    ``results_sorted`` is a list of ``(cfg, ms, grid_x, error)`` tuples ordered
+    by ascending ms (successful configs first, failures appended last with
+    ``ms=inf``).  ``best_cfg`` is ``results_sorted[0][0]`` if any config
+    succeeded, else ``None``.
+
+    Progress is logged every ~10% of the config space.
+    """
+    if not configs:
+        return None, []
+
+    total = len(configs)
+    step = max(total // 10, 1)
+    results: list = []
+    print(f"    [custom-bench] Benchmarking {total} K2 configs "
+          f"(warmup={K2_BENCH_WARMUP}, iters={K2_BENCH_ITERS})...", flush=True)
+
+    for i, cfg in enumerate(configs, start=1):
+        try:
+            ms, grid_x = _bench_k2_config(cfg, tensors, M, N, K, num_sms, output_fp16)
+            results.append((cfg, ms, grid_x, None))
+        except Exception as e:
+            results.append((cfg, float("inf"), 0, f"{type(e).__name__}: {e}"))
+        if i % step == 0 or i == total:
+            ok = sum(1 for _, ms, _, _ in results if ms != float("inf"))
+            print(f"    [custom-bench] {i}/{total} benchmarked ({ok} succeeded)",
+                  flush=True)
+
+    results.sort(key=lambda r: r[1])
+    best = results[0][0] if results and results[0][1] != float("inf") else None
+    return best, results
+
+
+def _print_k2_bench_topn(results, M, K, N, topn=None):
+    """Log the top-N benchmark results in the same format the standalone bench uses."""
+    if topn is None:
+        topn = K2_BENCH_TOPN
+    print(f"    [custom-bench] top-{topn} configs (M={M}, K={K}, N={N}):", flush=True)
+    real_ops = 2.0 * M * K * N
+    for cfg, ms, grid_x, err in results[:topn]:
+        if ms == float("inf"):
+            print(f"      FAIL   {cfg.kwargs} W={cfg.num_warps} S={cfg.num_stages}: {err}",
+                  flush=True)
+            continue
+        tops = real_ops / (ms * 1e-3) / 1e12
+        mr = getattr(cfg, "maxnreg", None)
+        print(f"      {ms:7.4f} ms  {tops:6.2f} TOPS  grid={grid_x:4d}  "
+              f"BM={cfg.kwargs.get('BLOCK_M')} BN={cfg.kwargs.get('BLOCK_N')} "
+              f"BK={cfg.kwargs.get('BLOCK_K')} GM={cfg.kwargs.get('GROUP_M')} "
+              f"W={cfg.num_warps} S={cfg.num_stages} MR={mr}",
+              flush=True)
 
 
 def extract_k1(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=0):
@@ -930,45 +2084,80 @@ def extract_k1(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
         num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     for dtype_suffix, input_fp16, _ in DTYPE_CONFIGS:
         print(f"\n  K1 G256 {dtype_suffix} (autotuning)...", flush=True)
-        _parallel_precompile_k1(_K1_CONFIGS, input_fp16, num_sms)
+        _parallel_precompile_k1(_K1_CONFIGS, input_fp16)
         dtype = torch.float16 if input_fp16 else torch.float32
         M, K = 1024, 2560
         x = torch.randn((M, K), device="cuda", dtype=dtype)
         xq = torch.empty((M, K), device="cuda", dtype=torch.int8)
         n_groups = K // GROUP_SIZE
         xs = torch.empty((n_groups, M), device="cuda", dtype=torch.float32)
-        grid_k1 = lambda meta: (min(num_sms, triton.cdiv(M, meta["BLOCK_M"]) * n_groups),)
+        # §H2: autotune grid mirrors the production occupancy-scaled launch
+        # (min(num_tiles, num_sms * max_active_ctas_per_sm)).  See
+        # ``_autotune_grid_x`` for the rationale and the 2-CTA/SM assumption.
+        grid_k1 = lambda meta: (_autotune_grid_x(
+            triton.cdiv(M, meta["BLOCK_M"]) * n_groups, num_sms),)
 
         kernel1_convrot_quant[grid_k1](
             x, xq, xs,
-            M, K, num_sms,
+            M, K,
             K, 1,
             K, 1,
             1, M,
             GROUP_SIZE=GROUP_SIZE, INPUT_FP16=input_fp16,
+            CONTIG_XK=True,
         )
         torch.cuda.synchronize()
 
-        kernel, best_cfg = _get_compiled_kernel(
+        kernel, best_cfg, cache_dir = _get_compiled_kernel(
             kernel1_convrot_quant,
             debug_dump=debug_dump,
             GROUP_SIZE=GROUP_SIZE,
-            INPUT_FP16=input_fp16
+            INPUT_FP16=input_fp16,
+            CONTIG_XK=True,
         )
 
         block_m = best_cfg.kwargs["BLOCK_M"]
         nw = best_cfg.num_warps
         ns = best_cfg.num_stages
+        mr = getattr(best_cfg, "maxnreg", None)
         cubin = kernel.asm["cubin"]
         shared = kernel.metadata.shared
         abi = _extract_kernel_abi(kernel, "quant")
-        print(f"  -> Autotune winner: BLOCK_M={block_m}, num_warps={nw}, num_stages={ns}", flush=True)
+
+        # Post-autotune spill validation: verify the winning cubin — the one
+        # that actually ships in the header — does not spill.  Uses the same
+        # authoritative cuobjdump STACK-field detector as the pre-autotune
+        # gate (with PTX ld.local/st.local fallback), and FAILS THE BUILD on
+        # spill: zero tolerance means a spilling winner must never land in
+        # the generated header silently.
+        spill_info = _detect_spills(kernel, abi["function_name"])
+        if spill_info["spilling"]:
+            raise SystemExit(
+                f"[spill-check] K1 {dtype_suffix} autotune winner SPILLS "
+                f"({spill_info['method']}: local_bytes={spill_info['local_bytes']}, "
+                f"ptx_spills={spill_info['ptx_spills']}, regs={spill_info['registers']}). "
+                f"Config: BLOCK_M={block_m}, num_warps={nw}, num_stages={ns}, "
+                f"maxnreg={mr}. Zero tolerance: refusing to write a spilling "
+                f"cubin into the generated header."
+            )
+        spill_status = f"no spills ({spill_info['method']}, regs={spill_info['registers']})"
+
+        print(f"  -> Autotune winner: BLOCK_M={block_m}, num_warps={nw}, num_stages={ns}, maxnreg={mr}", flush=True)
         print(
             f"     shared={shared/1024:.0f}KB, cubin={len(cubin)}B, "
             f"runtime_args={len(abi['runtime_signature'])}, scratch_ptrs={abi['scratch_ptr_count']}, "
-            f"reqntid={abi['block']}",
+            f"reqntid={abi['block']}, {spill_status}",
             flush=True,
         )
+        if cache_dir is not None:
+            print(f"     cache_dir: {cache_dir}", flush=True)
+            print(f"       (PTX/IR for diagnosis: "
+                  f"{Path(cache_dir) / (abi['function_name'] + '.ptx')} , "
+                  f"{Path(cache_dir) / (abi['function_name'] + '.ttgir')})",
+                  flush=True)
+        else:
+            print("     cache_dir: <unavailable — set HOTSTEP_TRITON_CACHE_DEBUG=1>",
+                  flush=True)
         results[dtype_suffix] = {
             "cubin": cubin,
             "shared": shared,
@@ -976,8 +2165,10 @@ def extract_k1(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             "block_k": GROUP_SIZE,
             "num_warps": nw,
             "num_stages": ns,
-            "maxnreg": getattr(best_cfg, "maxnreg", None),
+            "maxnreg": mr,
             "abi": abi,
+            "cache_dir": str(cache_dir) if cache_dir is not None else None,
+            "function_name": abi["function_name"],
         }
     return results
 
@@ -987,39 +2178,67 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
     results = {}
     if num_sms == 0:
         num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    for bias_suffix, has_bias in BIAS_CONFIGS:
+    # HAS_BIAS is compile-time-hardwired True in the shipped K2 cubin (see
+    # BIAS_CONFIGS).  We still iterate BIAS_CONFIGS so the label scheme in the
+    # extraction summary and the generated cubin lookup stays uniform.
+    for bias_suffix, _has_bias in BIAS_CONFIGS:
         for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
             config_name = f"{bias_suffix}_{dtype_suffix}"
-            print(f"\n  K2 G256 {config_name} (autotuning)...", flush=True)
-            _parallel_precompile_k2(_K2_CONFIGS, has_bias, output_fp16, num_sms)
+            print(f"\n  K2 G256 {config_name} (custom-bench selection)...", flush=True)
+            _parallel_precompile_k2(_K2_CONFIGS, output_fp16)
             out_dtype = torch.float16 if output_fp16 else torch.float32
-            M, K, N = AUTOTUNE_SHAPES_K2[0]
+            M_real, K, N = AUTOTUNE_SHAPES_K2[0]
+            # Plain K2 has no M masks.  Autotune the same production-like work
+            # with M padded to the largest generated BLOCK_M so every candidate
+            # can run safely; this mirrors the plugin's host-side padding while
+            # keeping the benchmark within 2.4% of M=3000.
+            M = ((M_real + K2_AUTOTUNE_M_ALIGNMENT - 1) // K2_AUTOTUNE_M_ALIGNMENT) * K2_AUTOTUNE_M_ALIGNMENT
+            if M != M_real:
+                print(f"    [K2 autotune] primary shape M={M_real}, K={K}, N={N}; "
+                      f"using padded M={M} for plain/unmasked K2 safety", flush=True)
             xq = torch.randint(-127, 128, (M, K), device="cuda", dtype=torch.int8)
             n_groups = K // GROUP_SIZE
             xs = torch.rand((n_groups, M), device="cuda", dtype=torch.float32) * 0.02 + 0.001
+            # W_q is [N, K] row-major (canonical Linear layout).  The
+            # hybrid_direct K2 kernel handles the transpose in-kernel with
+            # tl.trans(wq), so nothing about the exported weight layout
+            # changes.
             wq = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
             ws = torch.rand((N,), device="cuda", dtype=torch.float32) * 0.02 + 0.001
-            bias = torch.randn((N,), device="cuda", dtype=torch.float32) if has_bias else torch.empty((1,), device="cuda", dtype=torch.float32)
+            # HAS_BIAS is hardwired True in the shipped cubin; always pass a
+            # real bias tensor to autotune so the fused epilogue is measured.
+            bias = torch.randn((N,), device="cuda", dtype=torch.float32)
             y = torch.empty((M, N), device="cuda", dtype=out_dtype)
-            grid_k2 = lambda meta: (min(num_sms, triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"])),)
+            # Bypass Triton's @autotune measurement (its internal do_bench is
+            # too noisy at the ~2% level, causing mis-ranking of adjacent K2
+            # configs) and use the fixed-budget CUDA-event benchmark loop
+            # from ``benchmark_k2_tuning_space_hybrid.py`` instead.  Every
+            # config is launched at its per-config occupancy-scaled grid
+            # (see ``_autotune_grid_x_for_k2`` for the geometry rationale).
+            tensors = (xq, xs, wq, ws, bias, y)
+            best_cfg, bench_results = _bench_k2_configs_custom(
+                _K2_CONFIGS, tensors, M, N, K, num_sms, output_fp16)
+            if best_cfg is None:
+                raise SystemExit(
+                    f"[custom-bench] K2 {config_name}: no config successfully "
+                    f"benchmarked. Config space was likely rejected wholesale "
+                    f"by the spill filter — check the [spill-check] log above."
+                )
+            _print_k2_bench_topn(bench_results, M, K, N)
 
-            kernel2_gemm_dequant[grid_k2](
-                xq, xs, wq, ws, bias, y,
-                M, N, K, num_sms,
-                K, 1,
-                1, M,
-                K, 1,
-                N, 1,
-                GROUP_SIZE=GROUP_SIZE, HAS_BIAS=has_bias, OUTPUT_FP16=output_fp16,
-            )
+            # Force Triton to compile and cache the picked winner so
+            # _get_compiled_kernel_for_cfg can retrieve its CompiledKernel.
+            # (The custom bench already ran the winner — the cache entry is
+            # present — but we re-launch to be defensive against a possible
+            # cache-flush from the spill filter running between passes.)
+            _launch_k2_for_bench(best_cfg, tensors, M, N, K, num_sms, output_fp16)
             torch.cuda.synchronize()
 
-            kernel, best_cfg = _get_compiled_kernel(
-                kernel2_gemm_dequant,
+            kernel, best_cfg, cache_dir = _get_compiled_kernel_for_cfg(
+                kernel2_gemm_dequant, best_cfg,
                 debug_dump=debug_dump,
                 GROUP_SIZE=GROUP_SIZE,
-                HAS_BIAS=has_bias,
-                OUTPUT_FP16=output_fp16
+                OUTPUT_FP16=output_fp16,
             )
 
             block_m = best_cfg.kwargs["BLOCK_M"]
@@ -1031,14 +2250,60 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             mr = getattr(best_cfg, "maxnreg", None)
             cubin = kernel.asm["cubin"]
             shared = kernel.metadata.shared
+            if K2_MAX_SHARED_BYTES > 0 and int(shared) > K2_MAX_SHARED_BYTES:
+                raise SystemExit(
+                    f"[shared-check] K2 {config_name} custom-bench winner uses shared={int(shared)}B "
+                    f"> K2_MAX_SHARED_BYTES={K2_MAX_SHARED_BYTES}B. Refusing to write a "
+                    f"high-shared 1-CTA/SM cubin into the generated header; adjust the config "
+                    f"space or set HOTSTEP_K2_MAX_SHARED_BYTES=0 for experiments."
+                )
             abi = _extract_kernel_abi(kernel, "gemm")
-            print(f"  -> Autotune winner: BM={block_m} BN={block_n} BK={block_k_winning} GM={group_m} W={nw} S={ns} MR={mr}", flush=True)
+
+            # Post-autotune spill validation: authoritative cuobjdump check
+            # on the exact winning cubin, fatal on spill (see extract_k1).
+            spill_info = _detect_spills(kernel, abi["function_name"])
+            if spill_info["spilling"]:
+                raise SystemExit(
+                    f"[spill-check] K2 {config_name} custom-bench winner SPILLS "
+                    f"({spill_info['method']}: local_bytes={spill_info['local_bytes']}, "
+                    f"ptx_spills={spill_info['ptx_spills']}, regs={spill_info['registers']}). "
+                    f"Config: BM={block_m} BN={block_n} BK={block_k_winning} "
+                    f"GM={group_m} W={nw} S={ns} MR={mr}. "
+                    f"Zero tolerance: refusing to write a spilling cubin into "
+                    f"the generated header."
+                )
+            spill_status = f"no spills ({spill_info['method']}, regs={spill_info['registers']})"
+
+            occ_ctas = _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(best_cfg))
+            occ_note = f", occupancy={occ_ctas} CTA/SM" if occ_ctas else ""
+            # Winning ms/TOPS from the custom bench are recorded so the
+            # summary log shows the exact per-launch time that drove the
+            # selection.
+            win_row = next(((c, ms, g) for c, ms, g, e in bench_results
+                            if c is best_cfg and e is None), None)
+            win_note = ""
+            if win_row is not None:
+                real_ops = 2.0 * M * K * N
+                _, win_ms, win_grid = win_row
+                win_tops = real_ops / (win_ms * 1e-3) / 1e12
+                win_note = f", {win_ms:.4f} ms, {win_tops:.2f} TOPS, grid={win_grid}"
+            print(f"  -> Custom-bench winner: BM={block_m} BN={block_n} BK={block_k_winning} GM={group_m} "
+                  f"W={nw} S={ns} MR={mr}{occ_note}{win_note}", flush=True)
             print(
                 f"     shared={shared/1024:.0f}KB, cubin={len(cubin)}B, "
                 f"runtime_args={len(abi['runtime_signature'])}, scratch_ptrs={abi['scratch_ptr_count']}, "
-                f"reqntid={abi['block']}",
+                f"reqntid={abi['block']}, {spill_status}",
                 flush=True,
             )
+            if cache_dir is not None:
+                print(f"     cache_dir: {cache_dir}", flush=True)
+                print(f"       (PTX/IR for diagnosis: "
+                      f"{Path(cache_dir) / (abi['function_name'] + '.ptx')} , "
+                      f"{Path(cache_dir) / (abi['function_name'] + '.ttgir')})",
+                      flush=True)
+            else:
+                print("     cache_dir: <unavailable — set HOTSTEP_TRITON_CACHE_DEBUG=1>",
+                      flush=True)
             results[config_name] = {
                 "cubin": cubin,
                 "shared": shared,
@@ -1050,6 +2315,8 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                 "num_stages": ns,
                 "maxnreg": mr,
                 "abi": abi,
+                "cache_dir": str(cache_dir) if cache_dir is not None else None,
+                "function_name": abi["function_name"],
             }
     return results
 
@@ -1299,14 +2566,74 @@ def write_header(k1_results, k2_results, output_path):
         "    return static_cast<uint32_t>((x + y - 1) / y);",
         "}",
         "",
+        "// §1.1 — Persistent grid sizing based on actual SM occupancy.",
+        "//",
+        "// The old version returned ``min(num_tiles, num_sms)``, which caps the",
+        "// launch at exactly one wave.  Combined with ``num_stages=3`` inflating",
+        "// shared memory, no shape ever exceeded ``waves_per_multiprocessor == 1``.",
+        "//",
+        "// The fix is to query ``cuOccupancyMaxActiveBlocksPerMultiprocessor`` on",
+        "// the loaded cubin (the value is a property of the cubin + device, not",
+        "// something Triton can know at AOT time) and launch",
+        "// ``min(num_tiles, num_sms * max_active_ctas_per_sm)``.  This satisfies the",
+        "// task requirement that \"actual SM usage should be obtained from the",
+        "// resulting kernel metadata, not estimated.\"",
+        "//",
+        "// When the occupancy query fails (returns 0), we fall back to the old",
+        "// 1-wave behaviour — the kernel still produces correct results, it just",
+        "// doesn't get the 2-CTA/SM speed-up.",
+        "inline uint32_t persistentGridU32(uint32_t num_tiles, uint32_t num_sms,",
+        "                                  uint32_t max_active_ctas_per_sm) {",
+        "    uint32_t const grid_cap = num_sms * (max_active_ctas_per_sm == 0 ? 1u : max_active_ctas_per_sm);",
+        "    return (num_tiles < grid_cap) ? num_tiles : grid_cap;",
+        "}",
+        "",
+        "// Backwards-compatible overload — same as passing max_active_ctas_per_sm=1.",
         "inline uint32_t persistentGridU32(uint32_t num_tiles, uint32_t num_sms) {",
-        "    return (num_tiles < num_sms) ? num_tiles : num_sms;",
+        "    return persistentGridU32(num_tiles, num_sms, 1u);",
+        "}",
+        "",
+        "// §1.1 — Query the actual max-resident-CTAs-per-SM for a loaded cubin.",
+        "//",
+        "// This is the value the task asks for (\"actual SM usage should be obtained",
+        "// from the resulting kernel metadata, not estimated\").  It depends on the",
+        "// loaded cubin's register/shared/thread footprint and the device's RF/shared",
+        "// budget — neither Triton nor the AOT pipeline knows it at compile time.",
+        "//",
+        "// Returns 0 on failure (caller should fall back to 1-CTA/SM launch).",
+        "//",
+        "// CRITICAL (patch review §5): the previous version passed blockSize=0,",
+        "// but the CUDA occupancy calculator (cuda_occupancy.h) rejects",
+        "// blockSize <= 0 unconditionally with CUDA_OCC_ERROR_INVALID_INPUT,",
+        "// which propagates as CUDA_ERROR_INVALID_VALUE.  This made the entire",
+        "// occupancy-driven grid-sizing feature dead code — every launch",
+        "// silently fell back to the old 1-wave (1 CTA/SM) grid.",
+        "//",
+        "// Fix: pass the real block size from ConvRotCubinDesc.block_x * block_y",
+        "// * block_z, which is the .reqntid value ptxas baked into the cubin.",
+        "//",
+        "// Caching (patch review §H1): the plugin caches the query result once",
+        "// per cubin in initTriton() (m_max_ctas_per_sm_quant / _gemm) and passes",
+        "// it through this parameter on every enqueue(); the DiT loop calls",
+        "// enqueue() 359 times per step, so re-querying here would add ~700",
+        "// driver round-trips per step.",
+        "inline uint32_t queryMaxActiveCtasPerSm(CUfunction func,",
+        "                                       uint32_t block_threads,",
+        "                                       uint32_t shared_bytes) {",
+        "    if (func == nullptr || block_threads == 0) return 0;",
+        "    int num_blocks = 0;",
+        "    CUresult const rc = cuOccupancyMaxActiveBlocksPerMultiprocessor(",
+        "        &num_blocks, func,",
+        "        static_cast<int>(block_threads),",
+        "        shared_bytes);",
+        "    if (rc != CUDA_SUCCESS || num_blocks <= 0) return 0;",
+        "    return static_cast<uint32_t>(num_blocks);",
         "}",
         "",
         "inline void* selectQuantLaunchParam(",
         "    ConvRotLaunchArgId id,",
         "    void*& x_param, void*& xq_ptr, void*& xs_ptr,",
-        "    int32_t& M, int32_t& K, int32_t& num_sms,",
+        "    int32_t& M, int32_t& K,",
         "    int32_t& stride_xm, int32_t& stride_xk,",
         "    int32_t& stride_xqm, int32_t& stride_xqk,",
         "    int32_t& stride_xsm, int32_t& stride_xsg) {",
@@ -1316,7 +2643,6 @@ def write_header(k1_results, k2_results, output_path):
         "        case ConvRotLaunchArgId::kX_scale_ptr: return &xs_ptr;",
         "        case ConvRotLaunchArgId::kM: return &M;",
         "        case ConvRotLaunchArgId::kK: return &K;",
-        "        case ConvRotLaunchArgId::kNUM_SMS: return &num_sms;",
         "        case ConvRotLaunchArgId::kStride_xm: return &stride_xm;",
         "        case ConvRotLaunchArgId::kStride_xk: return &stride_xk;",
         "        case ConvRotLaunchArgId::kStride_xqm: return &stride_xqm;",
@@ -1330,7 +2656,7 @@ def write_header(k1_results, k2_results, output_path):
         "inline void* selectGemmLaunchParam(",
         "    ConvRotLaunchArgId id,",
         "    void*& xq_ptr, void*& xs_ptr, void*& wq_param, void*& ws_param, void*& bias_param, void*& y_ptr,",
-        "    int32_t& M, int32_t& N, int32_t& K, int32_t& num_sms,",
+        "    int32_t& M, int32_t& N, int32_t& K,",
         "    int32_t& stride_xqm, int32_t& stride_xqk,",
         "    int32_t& stride_xsm, int32_t& stride_xsg,",
         "    int32_t& stride_wn, int32_t& stride_wk,",
@@ -1345,7 +2671,6 @@ def write_header(k1_results, k2_results, output_path):
         "        case ConvRotLaunchArgId::kM: return &M;",
         "        case ConvRotLaunchArgId::kN: return &N;",
         "        case ConvRotLaunchArgId::kK: return &K;",
-        "        case ConvRotLaunchArgId::kNUM_SMS: return &num_sms;",
         "        case ConvRotLaunchArgId::kStride_xqm: return &stride_xqm;",
         "        case ConvRotLaunchArgId::kStride_xqk: return &stride_xqk;",
         "        case ConvRotLaunchArgId::kStride_xsm: return &stride_xsm;",
@@ -1364,7 +2689,8 @@ def write_header(k1_results, k2_results, output_path):
         "    int32_t M, int32_t K, int32_t num_sms,",
         "    int32_t stride_xm, int32_t stride_xk,",
         "    int32_t stride_xqm, int32_t stride_xqk,",
-        "    int32_t stride_xsm, int32_t stride_xsg) {",
+        "    int32_t stride_xsm, int32_t stride_xsg,",
+        "    uint32_t max_active_ctas_per_sm = 0) {",
         "    void* triton_scratch1 = nullptr;",
         "    void* triton_scratch2 = nullptr;",
         "    if (d.runtime_arg_count + d.trailing_scratch_ptr_count > kConvRotMaxLaunchParams ||",
@@ -1375,14 +2701,23 @@ def write_header(k1_results, k2_results, output_path):
         "    uint32_t const num_pid_m = ceilDivU32(M, d.block_m);",
         "    uint32_t const num_k_groups = static_cast<uint32_t>(K / d.group_size);",
         "    uint32_t const total_tiles = num_pid_m * num_k_groups;",
-        "    uint32_t const grid_x = persistentGridU32(total_tiles, static_cast<uint32_t>(num_sms));",
+        "    // §1.1: if the caller didn't pre-query occupancy, query it now (cached",
+        "    //        per-CUfunction by the driver).  Falls back to 1 CTA/SM on failure.",
+        "    //        Patch review §5: must pass the real block size, not 0.",
+        "    uint32_t const block_threads = d.block_x * d.block_y * d.block_z;",
+        "    uint32_t const occupancy = (max_active_ctas_per_sm != 0)",
+        "        ? max_active_ctas_per_sm",
+        "        : queryMaxActiveCtasPerSm(func, block_threads, static_cast<uint32_t>(d.shared_bytes));",
+        "    uint32_t const grid_x = persistentGridU32(total_tiles,",
+        "                                              static_cast<uint32_t>(num_sms),",
+        "                                              occupancy);",
         "    void* params[kConvRotMaxLaunchParams] = {};",
         "    uint32_t n = 0;",
         "    for (uint32_t i = 0; i < d.runtime_arg_count; ++i) {",
         "        void* slot = selectQuantLaunchParam(",
         "            d.runtime_args[i].id,",
         "            x_param, xq_ptr, xs_ptr,",
-        "            M, K, num_sms,",
+        "            M, K,",
         "            stride_xm, stride_xk, stride_xqm, stride_xqk, stride_xsm, stride_xsg);",
         "        if (slot == nullptr) return CUDA_ERROR_INVALID_VALUE;",
         "        params[n++] = slot;",
@@ -1402,7 +2737,8 @@ def write_header(k1_results, k2_results, output_path):
         "    int32_t stride_xqm, int32_t stride_xqk,",
         "    int32_t stride_xsm, int32_t stride_xsg,",
         "    int32_t stride_wn, int32_t stride_wk,",
-        "    int32_t stride_ym, int32_t stride_yn) {",
+        "    int32_t stride_ym, int32_t stride_yn,",
+        "    uint32_t max_active_ctas_per_sm = 0) {",
         "    void* triton_scratch1 = nullptr;",
         "    void* triton_scratch2 = nullptr;",
         "    if (d.runtime_arg_count + d.trailing_scratch_ptr_count > kConvRotMaxLaunchParams ||",
@@ -1415,14 +2751,22 @@ def write_header(k1_results, k2_results, output_path):
         "    uint32_t const grid_m = ceilDivU32(M, d.block_m);",
         "    uint32_t const grid_n = ceilDivU32(N, d.block_n);",
         "    uint32_t const total_tiles = grid_m * grid_n;",
-        "    uint32_t const grid_x = persistentGridU32(total_tiles, static_cast<uint32_t>(num_sms));",
+        "    // §1.1: see launchConvRotQuant — occupancy-driven grid sizing.",
+        "    //        Patch review §5: must pass the real block size, not 0.",
+        "    uint32_t const block_threads = d.block_x * d.block_y * d.block_z;",
+        "    uint32_t const occupancy = (max_active_ctas_per_sm != 0)",
+        "        ? max_active_ctas_per_sm",
+        "        : queryMaxActiveCtasPerSm(func, block_threads, static_cast<uint32_t>(d.shared_bytes));",
+        "    uint32_t const grid_x = persistentGridU32(total_tiles,",
+        "                                              static_cast<uint32_t>(num_sms),",
+        "                                              occupancy);",
         "    void* params[kConvRotMaxLaunchParams] = {};",
         "    uint32_t n = 0;",
         "    for (uint32_t i = 0; i < d.runtime_arg_count; ++i) {",
         "        void* slot = selectGemmLaunchParam(",
         "            d.runtime_args[i].id,",
         "            xq_ptr, xs_ptr, wq_param, ws_param, bias_param, y_ptr,",
-        "            M, N, K, num_sms,",
+        "            M, N, K,",
         "            stride_xqm, stride_xqk, stride_xsm, stride_xsg,",
         "            stride_wn, stride_wk, stride_ym, stride_yn);",
         "        if (slot == nullptr) return CUDA_ERROR_INVALID_VALUE;",
@@ -1460,6 +2804,15 @@ def main():
     if l2_bytes == 0:
         l2_bytes = 2 * 1024 * 1024
 
+    # All device properties (arch, SM count, L2 size, shared-mem/SM) are
+    # derived directly from the GPU the script is running on.  The cubin
+    # extraction MUST be run on the target device — the generated cubins are
+    # arch-specific (sm75/sm80/sm86/sm89 each produce different SASS) and the
+    # autotune-space pruning (GROUP_M, shared-mem budgets) depends on the
+    # exact L2 size and shared-mem/SM of the runtime device.  There is no
+    # "build machine" vs "runtime machine" split here: one device, one
+    # extraction, one cubin header.
+
     if arch >= 89:
         shared_mem_per_sm = 100 * 1024
     elif arch >= 86:
@@ -1477,15 +2830,39 @@ def main():
 
     global _K1_CONFIGS, _K2_CONFIGS
     _K1_CONFIGS[:] = _estimate_k1_configs(num_sms, l2_bytes, shared_mem_per_sm, AUTOTUNE_SHAPES_K2)
-    _K2_CONFIGS[:] = _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, AUTOTUNE_SHAPES_K2)
+    # Arch-dispatched K2 config builder.  Pass arch so the config space is
+    # tailored to the target GPU's smem budget, L2 size, and CTA cap.
+    _K2_CONFIGS[:] = _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm,
+                                          AUTOTUNE_SHAPES_K2, arch=arch)
     _K2_CONFIGS[:] = _add_sm_aware_tile_candidates(_K2_CONFIGS, num_sms, AUTOTUNE_SHAPES_K2)
+
+    # ── Register spill filtering (patch review §8) ───────────────────────
+    # Triton will SILENTLY spill registers to local memory (DRAM) when a
+    # config's maxnreg can't be honored.  Spilling kernels produce correct
+    # output but catastrophic performance.  ZERO TOLERANCE: we compile each
+    # config, check the cubin's STACK field via cuobjdump (or PTX-level
+    # ld.local/st.local as fallback), and reject ANY config that spills
+    # even one byte.  No thresholds.
+    print(f"\n[spill-check] Filtering configs for register spills (zero-tolerance)...", flush=True)
+    _K1_CONFIGS[:] = _filter_spilling_configs(_K1_CONFIGS, kernel1_convrot_quant, "k1", arch)
+    _K2_CONFIGS[:] = _filter_spilling_configs(_K2_CONFIGS, kernel2_gemm_dequant, "k2", arch)
 
     kernel1_convrot_quant.configs = _K1_CONFIGS
     kernel2_gemm_dequant.configs = _K2_CONFIGS
 
     print(f"[extract_jit_cubins_autotune] GROUP_SIZE={GROUP_SIZE}", flush=True)
-    print(f"[extract_jit_cubins_autotune] K1 configs: {len(_K1_CONFIGS)} (heuristic-pruned)", flush=True)
-    print(f"[extract_jit_cubins_autotune] K2 configs: {len(_K2_CONFIGS)} (heuristic-pruned + SM-aware)", flush=True)
+    print(f"[extract_jit_cubins_autotune] K2 max shared cap: {K2_MAX_SHARED_BYTES if K2_MAX_SHARED_BYTES > 0 else 'disabled'} bytes", flush=True)
+    print(f"[extract_jit_cubins_autotune] K1 configs: {len(_K1_CONFIGS)} (heuristic-pruned + spill-filtered)", flush=True)
+    print(f"[extract_jit_cubins_autotune] K2 configs: {len(_K2_CONFIGS)} (heuristic-pruned + SM-aware + spill-filtered)", flush=True)
+    # Per-config occupancy summary (K2 only).  The K2 autotune grid uses these
+    # so each candidate is measured under the actual CTAs/SM it will get in
+    # production — e.g. a 96 KB-shared config runs at 1 CTA/SM, not 2 CTA/SM.
+    if _K2_CFG_OCCUPANCY:
+        from collections import Counter
+        occ_hist = Counter(_K2_CFG_OCCUPANCY.values())
+        occ_summary = ", ".join(f"{occ} CTA/SM: {n}"
+                                for occ, n in sorted(occ_hist.items()))
+        print(f"[extract_jit_cubins_autotune] K2 per-config occupancy: {occ_summary}", flush=True)
     if debug_dump:
         print("[extract_jit_cubins_autotune] HOTSTEP_TRITON_CACHE_DEBUG=1 — dumping cache metadata", flush=True)
 
@@ -1507,6 +2884,28 @@ def main():
     print("\n[extract_jit_cubins_autotune] DONE!", flush=True)
     print("  The header is drop-in compatible with the C++ plugin.", flush=True)
     print("  Rebuild the plugin and TRT engine to use the autotune-selected cubins.", flush=True)
+
+    # ── Winner cache directory summary (for PTX/IR/SASS diagnosis) ──────
+    print("\n=== Autotune winner cache directories (PTX/IR for diagnosis) ===", flush=True)
+    for dtype_suffix, _, _ in DTYPE_CONFIGS:
+        r = k1_results.get(dtype_suffix, {})
+        cd = r.get("cache_dir")
+        fn = r.get("function_name", "<unknown>")
+        if cd:
+            print(f"  K1 {dtype_suffix}:  {cd}", flush=True)
+            print(f"      function: {fn}", flush=True)
+        else:
+            print(f"  K1 {dtype_suffix}:  <cache_dir unavailable>", flush=True)
+    for bias_suffix, _ in BIAS_CONFIGS:
+        for dtype_suffix, _, _ in DTYPE_CONFIGS:
+            r = k2_results.get(f"{bias_suffix}_{dtype_suffix}", {})
+            cd = r.get("cache_dir")
+            fn = r.get("function_name", "<unknown>")
+            if cd:
+                print(f"  K2 {bias_suffix}_{dtype_suffix}:  {cd}", flush=True)
+                print(f"      function: {fn}", flush=True)
+            else:
+                print(f"  K2 {bias_suffix}_{dtype_suffix}:  <cache_dir unavailable>", flush=True)
     return 0
 
 if __name__ == "__main__":
