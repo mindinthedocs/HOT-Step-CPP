@@ -9,9 +9,11 @@
  * A previous specialized M==1 fused kernel was removed after profiling showed
  * the two-kernel BK64/BM128/BN128 path is faster for the M==1 workload too.
  *
- * The Hadamard/ConvRot transform itself is still implemented as in-register
- * H_4 Kronecker butterflies. No dense H matrix is staged in shared memory and
- * no H tensor is passed through the plugin boundary.
+ * The Hadamard/ConvRot transform is implemented as a tensor-core (TC)
+ * rotation: H_{GROUP_SIZE} is factored as H_16 ⊗ H_16 and computed by two
+ * FP16 ``tl.dot`` matmuls (with a split-FP16 hi/lo decomposition for full
+ * dynamic range).  No dense H matrix is staged in shared memory and no H
+ * tensor is passed through the plugin boundary.
  */
 
 #pragma once
@@ -165,8 +167,9 @@ private:
     // Device SM count — queried once at initTriton() for persistent-kernel
     // grid sizing (the generated launch stubs compute
     // min(num_tiles, num_sms * max_active_ctas_per_sm)).  Not a kernel
-    // argument: the kernels stride their persistent loops by
-    // tl.num_programs(0).
+    // argument: K1 strides its persistent loop by tl.num_programs(0), and K2
+    // (Gluon gluon_pipe) takes a NUM_TILES runtime arg and strides by
+    // gl.num_programs(0).
     int32_t m_num_sms{0};
 
     // Max resident CTAs/SM for each loaded cubin, from

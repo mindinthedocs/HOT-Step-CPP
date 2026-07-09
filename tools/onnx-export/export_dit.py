@@ -2161,9 +2161,11 @@ def _quantize_w8a8_initializers_with_convrot(
     H_np = build_hadamard(group_size).astype(np.float32)
 
     # Single shared H initializer for activation rotation. The v2 plugin
-    # contract uses FP16 activation/H/bias tensors by default; the CUDA
-    # butterfly implementation does not read H at runtime, but typing it as
-    # FP16 keeps the ONNX contract cast-free at the plugin boundary.
+    # contract uses FP16 activation/H/bias tensors by default; the K1
+    # tensor-core rotation synthesizes its 16×16 H_16 factor in-register from
+    # an identity seed and does not read the ONNX H tensor at runtime, but
+    # typing it as FP16 keeps the ONNX contract cast-free at the plugin
+    # boundary.
     H_name = "convrot.hadamard"
     H_already_present = any(init.name == H_name for init in model.graph.initializer)
     if not H_already_present:

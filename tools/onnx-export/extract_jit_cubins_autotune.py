@@ -64,6 +64,59 @@ _IS_TRITON_INTERPRETER = triton.language.constexpr(
     os.environ.get("TRITON_INTERPRET", "").strip() == "1"
 )
 
+# ── Optional Gluon (explicit-layout dialect) support ───────────────────────
+# Gluon is Triton's low-level explicit-layout dialect (triton.experimental).
+# Required for the K2 ``gluon_pipe`` kernel (``k2_gluon_pipelined``): a
+# persistent, multi-stage cp.async pipelined GEMM+dequant targeting Ampere
+# mma_v2 (sm80/sm86/sm89).  If the import fails the K2 extraction aborts with
+# a clear message — the gluon_pipe kernel is now the only shipped K2 path.
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon.language.nvidia.ampere import (
+        mma_v2 as _gluon_mma_v2,
+        async_copy as _gluon_async_copy,
+    )
+    from triton.experimental.gluon._runtime import GluonASTSource
+    from triton.compiler import compile as _triton_compile
+    from triton.compiler.compiler import ASTSource as _TritonASTSource
+    from triton.backends.compiler import GPUTarget as _GPUTarget
+    GLUON_AVAILABLE = True
+except Exception as _gluon_import_err:  # pragma: no cover
+    gluon = None
+    gl = None
+    _gluon_mma_v2 = None
+    _gluon_async_copy = None
+    GluonASTSource = None
+    _triton_compile = None
+    _TritonASTSource = None
+    _GPUTarget = None
+    GLUON_AVAILABLE = False
+    _GLUON_IMPORT_ERR = _gluon_import_err
+
+
+def _is_gluon_kernel(fn) -> bool:
+    """True if ``fn`` is a Gluon JIT kernel (vs a @triton.jit / autotune fn).
+
+    Detection is by the class module of ``fn`` itself: ``@gluon.jit`` produces
+    a GluonJITFunction whose class lives under ``triton.experimental.gluon``,
+    while ``@triton.jit`` / ``@triton.autotune`` produce wrappers under
+    ``triton.runtime``.  A ``__gluon__`` attribute fallback is kept for
+    forward-compatibility.
+
+    NOTE: we check ``type(fn).__module__`` — NOT ``type(fn.fn).__module__`` —
+    because ``fn.fn`` is the raw Python function (defined in this module), and
+    GluonASTSource expects the ``@gluon.jit`` wrapper object (which carries
+    ``.arg_names`` and the other metadata the compile path needs), not the
+    unwrapped function.
+    """
+    if fn is None or gluon is None:
+        return False
+    cls_mod = type(fn).__module__ or ""
+    if "triton.experimental.gluon" in cls_mod:
+        return True
+    return bool(getattr(fn, "__gluon__", False))
+
 
 # ─── Device-specs-driven autotune config builder ───────────────────────────
 
@@ -141,136 +194,151 @@ def _estimate_k1_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes):
 
 
 def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, arch=86):
-    """Build the autotune config list for the K2 GEMM+dequant kernel.
+    """Build the tuning config list for the K2 Gluon ``gluon_pipe`` kernel.
 
-    Arch-dispatched config builder.  The kernel body is identical across
-    sm75/sm80/sm86/sm89 — only the autotune candidate set differs because
-    each arch has a different smem budget, CTA cap, and L2 size.
+    The K2 kernel is the Gluon pipelined variant (``k2_gluon_pipelined``),
+    num_warps=8 (warps_per_cta=[4, 2], hardcoded inside the kernel).  The
+    tuning grid is pinned to the user-specified space and is arch-independent
+    — every config is emitted and the spill/compile filter rejects any that
+    don't fit the target's smem/register budget:
 
-    sm86/sm89 (RTX 30/40, 100 KB smem/SM, 1.5-6 MB L2):
-      Primary target.  128x128 BK=32 S=4 at 1 CTA/SM is the throughput
-      optimum for memory-bound K2 (IMMA at 9%, LSU at 59% in Nsight
-      profile).  The 2.75x Triton smem tax (calibrated from 99 KB actual
-      / 36 KB naive for BK=64 BM=64 BN=128 S=3) means 128x128 BK=32 S=4
-      uses ~88 KB — fits the 99 KB optin budget.
+        BM ∈ {64, 128}
+        BN ∈ {64, 128}
+        BK ∈ {32, 64}        (must divide GROUP_SIZE=256)
+        stages ∈ {2, 3}      (→ NUM_BUFS = stages cp.async buffers)
 
-      2 CTA/SM is NOT pursued: the (partial_int32 + acc_fp32) register
-      overlap during the per-group fold is 128 regs at W=8 for BM=BN=128,
-      which doesn't fit maxnreg=128.  Going to 64x128 to fit 2 CTA/SM
-      loses 50% on bandwidth tax (60 B/out vs 40 B/out) — a bad trade
-      for a memory-bound kernel.
+    That is 2 × 2 × 2 × 2 = 16 configs, all num_warps=8.  GROUP_M is fixed at
+    8 (the L2 super-group swizzle size; affects tile-scheduling order only,
+    not smem/registers).  FOLD_EVERY defaults to GROUPS_PER_TILE = 256 / BK
+    (one int32→fp32 fold per group); NUM_BUFS = stages.
 
-    sm80 (A100, 164 KB smem/SM, 4 MB L2):
-      Same 128x128 tile but deeper pipelining (S=6) enabled by the larger
-      smem budget.  BK=64 S=3 is also viable (halves MMA instruction
-      count) thanks to the 164 KB budget.
+    Output dtype is FP32 (DTYPE_CONFIGS = [("FP32IO", False, False)]); the
+    kernel's OUTPUT_FP16 constexpr is wired from the dtype config at compile
+    time, not from the tuning grid.
 
-    sm75 (Turing, 64 KB smem/SM, m8n8k32 IMMA):
-      128x128 BK=32 S=2 is the max that fits 48 KB optin smem (44 KB
-      after tax).  2 CTA/SM is not viable — the 24 KB budget forces
-      BM=16 tiles with 4.5x worse B/out.  Ship 1 CTA/SM with the big
-      tile and accept 25% occupancy.
+    The arch/smem heuristics that used to prune the @triton.autotune K2 space
+    are no longer applied here: the gluon kernel's explicit shared-memory
+    allocation is checked exactly by the spill/compile filter (cuobjdump
+    SHARED field), and the custom benchmarker times each survivor so the
+    winner is picked on measured throughput, not on a smem-tax estimate.
     """
-    # ── Per-arch tile shapes and pipeline depths ──────────────────────────
-    #
-    # All arches ship 128x128 as the primary tile — it gives 40 B/output
-    # (vs 60 B/output for 64x128), which is 33% less DRAM traffic for a
-    # memory-bound kernel.  The difference between arches is pipeline
-    # depth (S) and BK, driven by the smem budget.
-    #
-    # Smem tax: Triton's auto-layout for INT8 IMMA inflates the naive
-    # smem estimate (BK × (BM + BN) × S) by ~2.75× (calibrated from the
-    # post-autotune profile: 99 KB actual / 36 KB naive for BK=64 BM=64
-    # BN=128 S=3).  The filter below uses this factor to reject configs
-    # that won't fit the per-block optin smem budget.
-
-    if arch == 75:
-        # sm75 (Turing): 64 KB/SM, 48 KB/block optin.  S=2 only at 128x128.
-        tile_shapes = [
-            (128, 128, 2),    # primary: 40 B/out, 44 KB at S=2 (fits 48 KB)
-            (128, 64,  2),    # wide-M for down_proj (N=2560)
-            (64,  128, 4),    # fallback: smaller tile, bigger GM
-        ]
-        warps_stages = [(8, 2), (4, 2)]
-    elif arch == 80:
-        # sm80 (A100): 164 KB/SM, 163 KB/block optin.  Deep pipelining wins.
-        # S=6 at 128x128 BK=32 = 132 KB (fits 163 KB).
-        # BK=64 S=3 = 132 KB (also fits, halves MMA count).
-        tile_shapes = [
-            (128, 128, 4),    # primary: 40 B/out, S=6 fits
-            (128, 128, 2),    # smaller GM for K=9728 (down_proj)
-            (128, 256, 4),    # wide-N for gate_proj (N=9728)
-            (256, 128, 4),    # wide-M (if regs fit — borderline at 255)
-        ]
-        warps_stages = [(8, 2), (8, 3), (8, 4), (8, 5), (8, 6)]
-    else:
-        # sm86/sm89 (RTX 30/40): 100 KB/SM, 99 KB/block optin.
-        # S=4 at 128x128 BK=32 = 88 KB (fits 99 KB).
-        # S=5 = 110 KB (doesn't fit).  BK=64 S=2 = 88 KB (also fits).
-        tile_shapes = [
-            (128, 128, 2),    # primary: 40 B/out, S=4 fits 88 KB
-            (128, 64,  2),    # wide-M for down_proj (N=2560)
-            (64,  128, 4),    # fallback: smaller tile, bigger GM
-            (64,  256, 2),    # wide-N for gate_proj (N=9728)
-        ]
-        warps_stages = [(8, 2), (8, 3), (8, 4), (4, 2)]
-
-    # ── GROUP_M candidates (L2 pruning REMOVED) ──────────────────────────
-    #
-    # The old "L2-aware GROUP_M pruning" capped the super-group footprint
-    # (K × (GM × BM + BN)) at L2/2 and demoted every big tile to GROUP_M=1
-    # on small-L2 parts.  The ½ factor was a heuristic, the footprint used
-    # the worst-case K across all shapes, and GM only affects tile-scheduling
-    # order (not smem/registers) — so mispredicting it can never break a
-    # launch, only change L2 hit rates.  Real benchmarking decides now: keep
-    # the author-specified GM per tile and let autotune pick the winner.
-    tile_shapes = list(dict.fromkeys(tile_shapes))
-
-    # ── BK candidates ────────────────────────────────────────────────────
-    # BK=32 is the primary (smaller swizzle atom, better bank-conflict
-    # behavior, fits deeper pipelining).  BK=64 is included for arches
-    # where the smem budget allows it (halves the sub-MMA count per group).
-    if arch == 80:
-        block_k_candidates = [32, 64]
-    else:
-        block_k_candidates = [32, 64]  # both, let the smem filter decide
+    block_m_candidates = [64, 128]
+    block_n_candidates = [64, 128]
+    block_k_candidates = [32, 64]
+    stages_candidates = [2, 3]
+    group_m = 8  # L2 super-group swizzle (tile-scheduling order only)
 
     configs = []
     seen = set()
-    for bm, bn, gm in tile_shapes:
-        for bk in block_k_candidates:
-            if 256 % bk != 0:
+    for bm in block_m_candidates:
+        # gluon_pipe (num_warps=8, warps_per_cta=[4,2]): BM % 64 == 0.
+        if bm % 64 != 0:
+            continue
+        for bn in block_n_candidates:
+            # BN % 32 == 0 (4×2 warps × [16,8] tile).
+            if bn % 32 != 0:
                 continue
-
-            for nw, ns in warps_stages:
-                # Smem filter: reject configs that don't fit the per-block
-                # optin smem budget.  Uses the 2.75x calibrated Triton smem
-                # tax for INT8 IMMA.
-                smem_per_stage = bk * (bm + bn)
-                smem_total_naive = smem_per_stage * ns
-                smem_total_est = int(smem_total_naive * 2.75)
-                if smem_total_est > shared_mem_per_sm:
+            for bk in block_k_candidates:
+                if 256 % bk != 0 or bk % 16 != 0:
                     continue
-
-                # 32x256 BK32 on small Ampere can exceed smem at S>=3.
-                if bm == 32 and bn >= 256 and bk == 32 and ns > 2:
-                    continue
-
-                if num_sms <= 32 and bm >= 256 and nw == 4:
-                    continue
-
-                cfg_kwargs = {
-                    "BLOCK_M": bm,
-                    "BLOCK_N": bn,
-                    "BLOCK_K": bk,
-                    "GROUP_M": gm,
-                }
-                key = (bm, bn, bk, gm, nw, ns)
-                if key in seen:
-                    continue
-                seen.add(key)
-                configs.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
+                for ns in stages_candidates:
+                    nw = 8  # gluon_pipe is num_warps=8 only
+                    cfg_kwargs = {
+                        "BLOCK_M": bm,
+                        "BLOCK_N": bn,
+                        "BLOCK_K": bk,
+                        "GROUP_M": group_m,
+                    }
+                    key = (bm, bn, bk, group_m, nw, ns)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    configs.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
     return configs
+
+
+def _gluon_k2_num_bufs(cfg):
+    """Pipeline depth (NUM_BUFS) for the gluon_pipe K2 kernel = cfg.stages."""
+    return max(2, cfg.num_stages)
+
+
+def _gluon_k2_fold_every(cfg):
+    """FOLD_EVERY for the gluon_pipe K2 kernel.
+
+    Defaults to GROUPS_PER_TILE = GROUP_SIZE / BLOCK_K (one int32→fp32 fold
+    per group), the safe default the standalone benchmark uses when a config
+    carries no explicit FE knob.
+    """
+    return GROUP_SIZE // cfg.kwargs["BLOCK_K"]
+
+
+def _gluon_k2_signature(output_fp16):
+    """GluonASTSource signature dict for the K2 gluon_pipe kernel.
+
+    Mirrors the proven signature from ``benchmark_k2_tuning_space_hybrid.py``'s
+    ``aot_resources``: runtime args carry their element/scalar type, constexpr
+    params are declared as ``'constexpr'``.  Both declarations are accepted by
+    GluonASTSource (the constexpr type entries are redundant with the
+    ``constexprs`` value dict but harmless, and keep this path byte-identical
+    to the benchmarked one).
+    """
+    y_type = '*fp16' if output_fp16 else '*fp32'
+    return {
+        'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32', 'W_q_ptr': '*i8',
+        'W_scale_ptr': '*fp32', 'Bias_ptr': '*fp32', 'Y_ptr': y_type,
+        'M': 'i32', 'N': 'i32', 'K': 'i32', 'NUM_TILES': 'i32',
+        'stride_xqm': 'i32', 'stride_xqk': 'i32',
+        'stride_xsm': 'i32', 'stride_xsg': 'i32',
+        'stride_wn': 'i32', 'stride_wk': 'i32',
+        'stride_ym': 'i32', 'stride_yn': 'i32',
+        'BLOCK_M': 'constexpr', 'BLOCK_N': 'constexpr', 'BLOCK_K': 'constexpr',
+        'GROUP_SIZE': 'constexpr', 'GROUP_M': 'constexpr',
+        'NUM_BUFS': 'constexpr', 'FOLD_EVERY': 'constexpr',
+        'HAS_BIAS': 'constexpr', 'OUTPUT_FP16': 'constexpr',
+    }
+
+
+def _gluon_k2_constexprs(cfg, output_fp16):
+    """GluonASTSource constexprs dict for one K2 config + dtype variant."""
+    return {
+        'BLOCK_M': cfg.kwargs['BLOCK_M'],
+        'BLOCK_N': cfg.kwargs['BLOCK_N'],
+        'BLOCK_K': cfg.kwargs['BLOCK_K'],
+        'GROUP_SIZE': GROUP_SIZE,
+        'GROUP_M': cfg.kwargs['GROUP_M'],
+        'NUM_BUFS': _gluon_k2_num_bufs(cfg),
+        'FOLD_EVERY': _gluon_k2_fold_every(cfg),
+        'HAS_BIAS': True,
+        'OUTPUT_FP16': output_fp16,
+    }
+
+
+def _gluon_aot_compile_k2(cfg, output_fp16, target_arch):
+    """AOT-compile one K2 gluon_pipe config and return its CompiledKernel.
+
+    Mirrors the standalone benchmark's ``aot_resources`` Gluon path: builds a
+    GluonASTSource from the config + dtype variant and compiles via
+    ``triton.compiler.compile`` with ``num_warps=8, num_stages=1`` (the
+    pipeline depth is encoded in the kernel's NUM_BUFS constexpr, not the
+    Triton num_stages option).  The returned CompiledKernel exposes
+    ``.asm['cubin']``, ``.metadata.shared`` and ``.name`` for cubin
+    harvesting, ABI extraction and spill validation.
+    """
+    _require_gluon_for_k2()
+    from triton.compiler import compile as triton_compile
+    from triton.backends.compiler import GPUTarget
+    # GluonASTSource expects the @gluon.jit wrapper object directly (it carries
+    # .arg_names and the other metadata the compile path needs) — do NOT unwrap
+    # .fn (the raw Python function has no .arg_names).  This matches the
+    # standalone benchmark's aot_resources: fn=variant_spec.fn.
+    src = GluonASTSource(
+        fn=kernel2_gemm_dequant,
+        signature=_gluon_k2_signature(output_fp16),
+        constexprs=_gluon_k2_constexprs(cfg, output_fp16),
+    )
+    target = GPUTarget(backend='cuda', arch=target_arch, warp_size=32)
+    return triton_compile(src, target=target,
+                          options={'num_warps': 8, 'num_stages': 1})
 
 
 def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
@@ -329,66 +397,38 @@ _K1_CONFIGS: list = []
 _K2_CONFIGS: list = []
 
 
-# ─── H_4 Kronecker butterfly (direct regular Hadamard transform) ──────────
+# ─── TC-based regular Hadamard rotation (H_16 ⊗ H_16) ─────────────────────
 #
-# This is the K1 rotation primitive, revised per CONVROT_INT8_DEEP_DIVE_V2.md §3.
+# This is the K1 rotation primitive: the tensor-core (TC) based regular
+# Hadamard transform, reverted from the H4-Kronecker in-register butterfly
+# that the last commit introduced.  The ConvRot regular Hadamard
+# H_{256, regular} is factored as the Kronecker product of two 16×16 regular
+# Hadamard blocks:
 #
-# The ConvRot regular Hadamard H_{256, regular} is the 4-fold Kronecker power of
-# the H4 base block:
+#       H_{256, regular} = H_16 ⊗ H_16    (normalized by 1/√256 = 1/16)
 #
-#       | 1  1  1 -1 |
-#  H4 = | 1  1 -1  1 |        (every row/column sums to 2 — "regular")
-#       | 1 -1  1  1 |
-#       |-1  1  1  1 |
+# The 16×16 H_16 factor is synthesized once per kernel invocation from an
+# identity seed by two calls to ``_hadamard_butterfly_stage`` (log_4(16) = 2
+# stages), then cast to FP16 so the rotation is computed by ``tl.dot`` on the
+# Ampere FP16 tensor cores (mma.16x16x16 / mma.16x8x16).  A 256-element row is
+# reshaped to (16, 16) and rotated by two FP16 matmuls (X · H_16, then its
+# transpose · H_16); because H_16 is FP16, a split-FP16 decomposition (hi/lo
+# halves) is used to recover full FP32 input dynamic range — the same accuracy
+# technique the historical TC K1 path shipped with.
 #
-#  H_{256, regular} = H4 ⊗ H4 ⊗ H4 ⊗ H4    (normalized by 1/√256 = 1/16)
+# This TC path is the v6 baseline: it offloads the 8192 multiply-adds of the
+# rotation to the tensor cores (freeing the FP32 ALU pipeline) and keeps the
+# per-thread register footprint small (the rotation is staged through shared
+# memory via the MMA fragments, not held in registers as a 256-wide tile).
 #
-# The previous FWHT+sign-flip decomposition (CONVROT_INT8_PERFORMANCE_REPORT.md
-# §2) factored this as P256 · H_sylvester · D256 and required three constant
-# tables (D256, perm256, sign256) plus a tl.gather.  The v2 deep-dive showed
-# this is unnecessarily indirect: ``_hadamard_butterfly_stage`` — already in
-# the codebase, originally written only to synthesize the dense h16 matrix for
-# the old tensor-core path — implements one stage of the H4-Kronecker butterfly
-# *directly on the data*.  Calling it 4 times (log_4(256) = 4 stages) on a
-# (SUBCHUNK, 256) FP32 tile reproduces x @ H_{256, regular}.T exactly, with:
+# ─── Register budget ───────────────────────────────────────────────────────
 #
-#   * **zero** extra constant tables (no D256 / perm256 / sign256)
-#   * **zero** tl.gather / tl.permute-as-scatter
-#   * identical arithmetic cost (1024 add/sub — same total FLOPs, just a
-#     different factorization of the same linear operator)
-#   * pure FP32 throughout → the split-FP16 accuracy hack is structurally
-#     unnecessary, not just "less needed"
-#
-# Verified numerically to float64 machine precision (max abs diff < 4e-15 vs
-# direct H256r @ x).  See CONVROT_INT8_DEEP_DIVE_V2.md §3.1–§3.3.
-#
-# ─── Register budget (v2 §3.4, rigorously re-derived) ────────────────────
-#
-# Triton's BlockedEncoding assigns elements to threads as a bijection: for a
-# tile of E elements distributed over T threads/CTA, each thread holds exactly
-# E/T elements in registers.  You do NOT get to pick "lanes per row"
-# independently of the tile shape — the two are locked together.
-#
-# For the butterfly primitive, the worst-instant live-set is 2× the resting
-# per-thread element count (v0..v3 and h0..h3 are all live simultaneously
-# between computing h0 and the final join).  So the safe tile size for one
-# butterfly call is:
-#
-#     SUBCHUNK × 256 / T  ≤  ~120 regs/thread  (leaving headroom for epilogue)
-#
-# At T = 256 threads/CTA (the standard num_warps=8 config):
-#     SUBCHUNK = 16  →  16 resting,  32 peak   ← recommended default (matches
-#                                                 the existing kernel's own
-#                                                 SUBCHUNK, known-good)
-#     SUBCHUNK = 32  →  32 resting,  64 peak   ← safe, fewer loop iterations
-#     SUBCHUNK = 64  →  64 resting, 128 peak   ← tight, only if maxnreg allows
-#     SUBCHUNK ≥ 128 →  exceeds 255-reg cap    ← IMPOSSIBLE
-#
-# The K1 kernel therefore processes the BLOCK_M-row tile in NUM_SUB = BLOCK_M /
-# SUBCHUNK sequential slices, exactly the idiom the existing tensor-core path
-# already used.  This is purely a register-pressure control knob — slicing is
-# bit-identical to whole-tile because rows are fully independent under this
-# transform (verified, max abs diff = 0.0 in float64).
+# The TC rotation operates on a (SUBCHUNK, 256) FP32 tile that is reshaped to
+# (SUBCHUNK*16, 16) for the matmul.  SUBCHUNK=16 (the historical default)
+# gives a (256, 16) FP16 operand per tl.dot — exactly one mma.16x16x16 tile
+# per warp group, ~32 resting regs/thread, well under the 255 cap.  The K1
+# kernel therefore processes the BLOCK_M-row tile in NUM_SUB = BLOCK_M /
+# SUBCHUNK sequential slices, the same idiom the TC path has always used.
 
 @triton.jit
 def _hadamard_butterfly_stage(
@@ -423,16 +463,47 @@ def _hadamard_butterfly_stage(
 
 
 @triton.jit
-def _convrot_rotate_256_subchunk(x_slice, SUBCHUNK: tl.constexpr, GROUP_SIZE: tl.constexpr):
-    """Apply the full 4-stage regular Hadamard rotation to a (SUBCHUNK, GROUP_SIZE) slice.
+def _generate_h16_fp16():
+    """Synthesize the 16×16 regular Hadamard factor H_16 in FP16.
 
-    log_4(256) = 4 stages.  The 0.5 factor per stage folds the 1/√256 = 1/16
-    normalization, so no separate scale multiply is needed.
+    Builds H_16 by applying ``_hadamard_butterfly_stage`` twice (log_4(16) = 2
+    stages) to a 16×16 identity seed.  The 0.5 factor per stage folds the
+    1/√16 = 1/4 normalization, so the result is the normalized H_16 used as the
+    TC rotation operand.  Cast to FP16 so ``tl.dot`` maps to FP16 tensor cores.
     """
-    rotated = x_slice
-    for stage in tl.static_range(0, 4):
-        rotated = _hadamard_butterfly_stage(rotated, SUBCHUNK, GROUP_SIZE, stage)
-    return rotated
+    rows = tl.arange(0, 16)[:, None]
+    cols = tl.arange(0, 16)[None, :]
+    identity16 = tl.where(rows == cols, 1.0, 0.0).to(tl.float32)
+    h = identity16
+    for stage in tl.static_range(0, 2):
+        h = _hadamard_butterfly_stage(h, 16, 16, stage)
+    return h.to(tl.float16)
+
+
+@triton.jit
+def _rotate_256_tensorcore(x_tile, h16, SUBCHUNK: tl.constexpr):
+    """Apply the regular Hadamard H_256 = H_16 ⊗ H_16 rotation via FP16 tensor cores.
+
+    A (SUBCHUNK, 256) FP32 tile is reshaped to (SUBCHUNK, 16, 16) and rotated
+    by two FP16 ``tl.dot`` matmuls: first X · H_16 along the inner 16 axis,
+    then (transposed result) · H_16 along the outer 16 axis.  Because H_16 is
+    FP16, a split-FP16 (hi/lo) decomposition of the FP32 operand is used so the
+    full FP32 dynamic range is preserved through the FP16 MMA — the same
+    accuracy technique the historical TC K1 path shipped with.
+    """
+    X = tl.reshape(x_tile, (SUBCHUNK, 16, 16))
+    X_flat = tl.reshape(X, (SUBCHUNK * 16, 16))
+    X_hi = X_flat.to(tl.float16)
+    X_lo = (X_flat - X_hi.to(tl.float32)).to(tl.float16)
+    A_flat = tl.dot(X_hi, h16) + tl.dot(X_lo, h16)
+    A = tl.reshape(A_flat, (SUBCHUNK, 16, 16))
+    A_T = tl.permute(A, (0, 2, 1))
+    A_T_flat = tl.reshape(A_T, (SUBCHUNK * 16, 16))
+    A_T_hi = A_T_flat.to(tl.float16)
+    A_T_lo = (A_T_flat - A_T_hi.to(tl.float32)).to(tl.float16)
+    B_flat = tl.dot(A_T_hi, h16) + tl.dot(A_T_lo, h16)
+    B = tl.reshape(B_flat, (SUBCHUNK, 16, 16))
+    return tl.reshape(tl.permute(B, (0, 2, 1)), (SUBCHUNK, 256))
 
 
 @triton.autotune(configs=_K1_CONFIGS, key=["M", "K", "INPUT_FP16", "CONTIG_XK"])
@@ -450,13 +521,18 @@ def kernel1_convrot_quant(
 ):
     """K1 — ConvRot regular Hadamard rotation + per-group INT8 quantization.
 
-    Rotation implementation (v2 §3):
-      4 sequential calls to ``_hadamard_butterfly_stage`` per SUBCHUNK-row
-      slice.  Pure FP32 add/sub — no tensor cores, no FP16 split, no gather.
+    Rotation implementation (TC-based, H_16 ⊗ H_16):
+      The 256-element regular Hadamard rotation is factored as H_16 ⊗ H_16 and
+      computed by two FP16 ``tl.dot`` matmuls on the Ampere tensor cores via
+      ``_rotate_256_tensorcore``.  A split-FP16 (hi/lo) decomposition of the
+      FP32 operand preserves full dynamic range through the FP16 MMA.  The
+      16×16 H_16 factor is synthesized once per invocation by
+      ``_generate_h16_fp16``.
 
-    Register safety (v2 §3.4):
-      SUBCHUNK=16 slicing keeps peak register usage at ~32-128/thread
-      (measured via ptxas -v, well under the 255 cap, zero spills).
+    Register safety:
+      SUBCHUNK=16 slicing keeps the per-``tl.dot`` operand at (256, 16) FP16
+      — one mma.16x16x16 tile per warp group, ~32 resting regs/thread, well
+      under the 255 cap.
 
     Persistent grid (v2 §4.1):
       The loop strides by ``tl.num_programs(0)`` (the actual launched grid
@@ -478,6 +554,10 @@ def kernel1_convrot_quant(
     # Selects the rounding implementation below without touching the launch
     # ABI or the autotune key space.
     IS_INTERPRETER: tl.constexpr = _IS_TRITON_INTERPRETER
+
+    # Synthesize the 16×16 regular Hadamard factor once per kernel invocation.
+    # H_256 = H_16 ⊗ H_16; the rotation itself is two FP16 tl.dot matmuls.
+    h16 = _generate_h16_fp16()
 
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_k_groups = K // GROUP_SIZE
@@ -513,8 +593,8 @@ def kernel1_convrot_quant(
             if INPUT_FP16:
                 x_block = x_block.to(tl.float32)
 
-            # v2 §3: 4-stage H4 Kronecker butterfly = exact regular Hadamard.
-            rotated_x = _convrot_rotate_256_subchunk(x_block, SUBCHUNK, GROUP_SIZE)
+            # TC-based rotation (H_16 ⊗ H_16) via FP16 tensor cores.
+            rotated_x = _rotate_256_tensorcore(x_block, h16, SUBCHUNK)
 
             # Per-row max-abs for the INT8 scale.
             block_max = tl.max(tl.abs(rotated_x), axis=1)
@@ -570,118 +650,228 @@ def kernel1_convrot_quant(
             tl.store(xs_ptr_block, scale, mask=mask_m)
 
 
-@triton.autotune(configs=_K2_CONFIGS, key=["M", "N", "K", "OUTPUT_FP16"])
-@triton.jit
-def kernel2_gemm_dequant(
-    X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
-    M, N, K,
-    stride_xqm, stride_xqk,
-    stride_xsm, stride_xsg,
-    stride_wn, stride_wk,
-    stride_ym, stride_yn,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    OUTPUT_FP16: tl.constexpr,
-):
-    """K2 — plain INT8 GEMM + late per-group xs fold ("hybrid_direct" variant).
+# ─── K2: Gluon ``gluon_pipe`` pipelined kernel (the shipped K2 path) ───────
+#
+# Replaces the historical ``hybrid_direct`` @triton.jit/@triton.autotune K2
+# kernel with the Gluon explicit-layout ``k2_gluon_pipelined`` variant from
+# ``benchmark_k2_tuning_space_hybrid.py``.  It is a persistent, multi-stage
+# cp.async pipelined INT8 GEMM + late per-group xs dequant fold targeting
+# Ampere mma_v2 (sm80/sm86/sm89), num_warps=8 (warps_per_cta=[4, 2]).
+#
+# Optimizations vs the plain hybrid_direct kernel:
+#   (a) PERSISTENT tile loop — one CTA per SM walks GROUP_M-swizzled tiles for
+#       L2 reuse (the X-slab stays hot).  The kernel takes a NUM_TILES runtime
+#       arg and the host launches a 1D grid of min(num_tiles, num_sms).
+#   (b) Multi-stage cp.async pipeline (NUM_BUFS = cfg.stages buffers, prefetch
+#       distance NUM_BUFS-1, one commit group per k-step).  The i32-view
+#       workaround (loads as int32, reinterprets as int8 in smem) sidesteps
+#       Triton 3.7.1's int8 cp.async <4B lowering bug.
+#   (c) Explicit gl.convert_layout to a coalesced BlockedLayout before the
+#       epilogue store — eliminates the FP32-output bank-conflict / write-
+#       amplification tax the uncoalesced MMA-layout store was paying.
+#   (d) FOLD_EVERY int32-folded accumulation: GROUPS_PER_TILE / FOLD_EVERY
+#       int32 accumulations are converted+multiplied by xs at once, instead
+#       of one per K-sub-step.
+#   (e) cache_modifier=".ca" on the tiny X_scale / W_scale / Bias loads so
+#       they survive in L2 against the streaming X_q/W_q traffic, and ".cs"
+#       streaming store on Y (write-once, never read).
+#
+# W_q layout is [N, K] row-major ("NK"); the transpose is free via
+# smem.permute((1, 0)).  HAS_BIAS is compile-time True (the single shipped K2
+# cubin); no-bias plugin instances pass a workspace zero-bias vector.
+# OUTPUT_FP16 is a compile-time constexpr; the shipped cubin is FP32 output
+# (DTYPE_CONFIGS = [("FP32IO", False, False)]).
+#
+# Tuning grid (pinned, user-specified): BM∈{64,128}, BN∈{64,128},
+# BK∈{32,64}, stages(NUM_BUFS)∈{2,3} → 16 configs, all num_warps=8.
 
-    This is the benchmarked ``hybrid_direct`` kernel from
-    ``benchmark_k2_tuning_space_hybrid.py``: it combines the historical
-    pre-patch [N, K] W_q layout (loaded with ``tl.trans(wq)`` in-kernel) with
-    the current-kernel unmasked / late-xs / occupancy-scaled persistent-grid
-    optimizations.  It intentionally has no boundary masks, no modulo-remapped
-    row/column indices, and no boundary-specialized variants.
+if GLUON_AVAILABLE:
+    # Module-level alias so the kernel body can reference ``cp.`` like the
+    # standalone benchmark script (cp.async_copy_global_to_shared, etc.).
+    cp = _gluon_async_copy
 
-    The TensorRT plugin pads the activation workspace and executes a tiny
-    padded tail launch when the runtime M is not divisible by BLOCK_M, so
-    every K2 invocation sees an M that is exactly tile-aligned.  Production
-    ConvRot weights have K divisible by GROUP_SIZE=256 and N divisible by the
-    selected BLOCK_N; the plugin rejects unsupported N rather than shipping a
-    masked fallback.
+    @gluon.jit
+    def kernel2_gemm_dequant(
+        X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
+        M, N, K, NUM_TILES,
+        stride_xqm, stride_xqk,
+        stride_xsm, stride_xsg,
+        stride_wn, stride_wk,
+        stride_ym, stride_yn,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
+        GROUP_SIZE: gl.constexpr, GROUP_M: gl.constexpr, NUM_BUFS: gl.constexpr,
+        FOLD_EVERY: gl.constexpr, HAS_BIAS: gl.constexpr, OUTPUT_FP16: gl.constexpr,
+    ):
+        """K2 — Gluon gluon_pipe: persistent, multi-stage cp.async pipeline.
 
-    Bias handling: HAS_BIAS is compile-time-hardwired to True (the single
-    shipped K2 cubin).  No-bias plugin instances pass a workspace zero-bias
-    vector so the same cubin handles both cases.
+        NUM_BUFS smem buffers, prefetch distance NUM_BUFS-1, one commit group
+        per k-step and a single barrier per step (CUTLASS-style).  NUM_BUFS is
+        wired from cfg.stages by the extraction driver; FOLD_EVERY is wired
+        from cfg (defaults to GROUPS_PER_TILE = GROUP_SIZE / BLOCK_K when the
+        config carries no explicit FE).  See the long comment above the
+        definition for the full optimization rationale.
+        """
+        gl.static_assert(GROUP_SIZE % BLOCK_K == 0,
+                         "GROUP_SIZE must be a multiple of BLOCK_K")
+        gl.static_assert(GROUP_SIZE % 256 == 0 or GROUP_SIZE == 256,
+                         "Only GROUP_SIZE=256 is supported")
+        GROUPS_PER_TILE: gl.constexpr = GROUP_SIZE // BLOCK_K
+        gl.static_assert(GROUPS_PER_TILE % FOLD_EVERY == 0,
+                         "FOLD_EVERY must divide GROUPS_PER_TILE")
+        FOLDS_PER_GROUP: gl.constexpr = GROUPS_PER_TILE // FOLD_EVERY
+        BK32: gl.constexpr = BLOCK_K // 4  # BLOCK_K in i32 units
 
-    sm86 optimization notes (Nsight Compute profiled):
+        # ── Layouts (num_warps=8: warps_per_cta=[4, 2]) ───────────────────
+        mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
+            version=[2, 0], warps_per_cta=[4, 2], instr_shape=[16, 8])
+        a_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mma_layout, k_width=4)
+        b_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mma_layout, k_width=4)
 
-      1. ``xs`` is loaded ONCE per group, outside the sub-MMA loop — xs is a
-         per-group quantity and doesn't change between sub-MMAs.
+        # i32 copy layout: 4 x i32 = 16B per thread along K, coalesced.
+        copy_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 4], threads_per_warp=[8, 4],
+            warps_per_cta=[8, 1], order=[1, 0])
 
-      2. ``W_scale`` and bias are epilogue-only, dead throughout the K loop.
-         Both are tagged ``eviction_policy="evict_last"`` because they are
-         reused across tiles via the L2 super-group swizzle.
+        # Coalesced epilogue store layout (16B-aligned, one 128B cache-line
+        # transaction per warp for FP32 output).
+        store_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 4], threads_per_warp=[8, 4],
+            warps_per_cta=[4, 2], order=[1, 0])
 
-      3. ``eviction_policy`` is DROPPED on xq/wq loads (Nsight showed L1 hit
-         rate ~3% — the hints add LSU overhead for zero benefit on streaming
-         INT8 operands that never fit L1).
+        # Tighter swizzle (per_phase=2): workaround for the bank-conflict
+        # pattern reported in triton issue #8149.
+        smem32: gl.constexpr = gl.SwizzledSharedLayout(vec=4, per_phase=2, max_phase=4, order=[1, 0])
+        smem8: gl.constexpr = gl.SwizzledSharedLayout(vec=16, per_phase=2, max_phase=4, order=[1, 0])
 
-      4. Persistent grid stride uses ``tl.num_programs(0)`` so the kernel
-         matches the host's occupancy-scaled launch geometry
-         (``min(num_tiles, num_sms * max_active_ctas_per_sm)``) without
-         carrying a runtime NUM_SMS argument.
+        a_buf = gl.allocate_shared_memory(gl.int32, [NUM_BUFS, BLOCK_M, BK32], smem32)
+        w_buf = gl.allocate_shared_memory(gl.int32, [NUM_BUFS, BLOCK_N, BK32], smem32)
+
+        # Persistent tile loop: each CTA walks multiple GROUP_M-swizzled tiles
+        # (identical ordering to hybrid_direct) so the X slab stays hot in L2.
+        num_pid_m = gl.cdiv(M, BLOCK_M)
+        num_pid_n = gl.cdiv(N, BLOCK_N)
+        num_pid_in_group = GROUP_M * num_pid_n
+
+        start_pid = gl.program_id(0)
+        grid_x = gl.num_programs(0)
+
+        # Static per-kernel iterators (only tile_id is loop-variant).
+        rm_cp_base = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, copy_layout))
+        rn_cp_base = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, copy_layout))
+        rk_cp = gl.arange(0, BK32, layout=gl.SliceLayout(0, copy_layout))
+        rm_acc_base = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mma_layout))
+        rn_acc_base = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mma_layout))
+        rm_store_base = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, store_layout))
+        rn_store_base = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, store_layout))
+
+        # Global pointers viewed as i32 (rows 16B-aligned, K a multiple of 64).
+        Xq32 = X_q_ptr.cast(gl.pointer_type(gl.int32))
+        Wq32 = W_q_ptr.cast(gl.pointer_type(gl.int32))
+        sxm32 = stride_xqm // 4
+        swn32 = stride_wn // 4
+
+        num_steps = K // BLOCK_K
+        num_groups = K // GROUP_SIZE
+
+        for tile_id in range(start_pid, NUM_TILES, grid_x):
+            group_id = tile_id // num_pid_in_group
+            first_pid_m = group_id * GROUP_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+            pid_m = first_pid_m + (tile_id % num_pid_in_group) % group_size_m
+            pid_n = (tile_id % num_pid_in_group) // group_size_m
+
+            pid_m_off = pid_m * BLOCK_M
+            pid_n_off = pid_n * BLOCK_N
+
+            rm_cp = pid_m_off + rm_cp_base
+            rn_cp = pid_n_off + rn_cp_base
+            rm_acc = pid_m_off + rm_acc_base
+            rn_acc = pid_n_off + rn_acc_base
+
+            acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=mma_layout)
+
+            # ── Prologue: fill NUM_BUFS-1 stages, one commit group each ──
+            for s in gl.static_range(0, NUM_BUFS - 1):
+                off32 = s * BK32
+                a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
+                w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
+                cp.async_copy_global_to_shared(a_buf.index(s), a_ptrs)
+                cp.async_copy_global_to_shared(w_buf.index(s), w_ptrs)
+                cp.commit_group()
+
+            # ── Main K-loop, grouped by GROUP_SIZE=256, folded by FOLD_EVERY ─
+            for g in range(num_groups):
+                # X_scale: tiny (M × n_groups) tensor, pin in L2 with .ca.
+                xs = gl.load(X_scale_ptr + g * stride_xsg + rm_acc * stride_xsm,
+                             cache_modifier=".ca")
+
+                for fold in gl.static_range(0, FOLDS_PER_GROUP):
+                    int32_acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.int32, layout=mma_layout)
+                    for sub in gl.static_range(0, FOLD_EVERY):
+                        step = g * GROUPS_PER_TILE + fold * FOLD_EVERY + sub
+                        buf = step % NUM_BUFS
+                        # Issue the prefetch NUM_BUFS-1 steps ahead (masked at tail).
+                        pf = step + NUM_BUFS - 1
+                        in_range = pf < num_steps
+                        pbuf = pf % NUM_BUFS
+                        off32 = pf * BK32
+                        a_pf = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
+                        w_pf = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
+                        valid_a = gl.full([BLOCK_M, BK32], in_range, gl.int1, layout=copy_layout)
+                        valid_w = gl.full([BLOCK_N, BK32], in_range, gl.int1, layout=copy_layout)
+                        cp.async_copy_global_to_shared(a_buf.index(pbuf), a_pf, mask=valid_a)
+                        cp.async_copy_global_to_shared(w_buf.index(pbuf), w_pf, mask=valid_w)
+                        cp.commit_group()
+                        # This step's buffer is the oldest outstanding group.
+                        cp.wait_group(NUM_BUFS - 1)
+                        gl.barrier()
+                        a8 = a_buf.index(buf)._reinterpret(gl.int8, [BLOCK_M, BLOCK_K], smem8)
+                        w8 = w_buf.index(buf)._reinterpret(gl.int8, [BLOCK_N, BLOCK_K], smem8)
+                        a = a8.load(a_layout)
+                        b = w8.permute((1, 0)).load(b_layout)
+                        int32_acc = _gluon_mma_v2(a, b, int32_acc)
+                    # One fp32 convert + mul per FOLD, not per sub-step.
+                    acc += int32_acc.to(gl.float32) * xs[:, None]
+
+            # ── Epilogue: dequant scale, bias, convert_layout, streaming store ─
+            # W_scale and Bias are tiny (N,) tensors; pin in L2 with .ca.
+            ws = gl.load(W_scale_ptr + rn_acc, cache_modifier=".ca")
+            acc = acc * ws[None, :]
+            if HAS_BIAS:
+                bias = gl.load(Bias_ptr + rn_acc, cache_modifier=".ca")
+                acc += bias[None, :]
+
+            # Convert MMA-fragment-distributed accumulator to a coalesced
+            # store layout (eliminates the FP32-output write-amplification tax).
+            acc_store = gl.convert_layout(acc, store_layout)
+            rm_store = pid_m_off + rm_store_base
+            rn_store = pid_n_off + rn_store_base
+            y_ptrs = Y_ptr + rm_store[:, None] * stride_ym + rn_store[None, :] * stride_yn
+            # Streaming store (.cs): Y is write-once/never-read.
+            if OUTPUT_FP16:
+                gl.store(y_ptrs, acc_store.to(gl.float16), cache_modifier=".cs")
+            else:
+                gl.store(y_ptrs, acc_store.to(gl.float32), cache_modifier=".cs")
+else:
+    # Gluon unavailable: define a sentinel so attribute lookups fail loudly
+    # with a clear message at extraction time (see _require_gluon_for_k2).
+    kernel2_gemm_dequant = None
+
+
+def _require_gluon_for_k2():
+    """Abort with a clear message if the Gluon dialect is unavailable.
+
+    The K2 kernel is now the Gluon ``gluon_pipe`` variant; there is no
+    @triton.jit fallback.  Any K2 extraction / launch path must call this
+    before touching ``kernel2_gemm_dequant``.
     """
-    tl.static_assert(GROUP_SIZE == 256, "Only GROUP_SIZE=256 is supported")
-    tl.static_assert(GROUP_SIZE % BLOCK_K == 0, "GROUP_SIZE must be a multiple of BLOCK_K")
-    GROUPS_PER_TILE: tl.constexpr = GROUP_SIZE // BLOCK_K
-
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_tiles = num_pid_m * num_pid_n
-    num_pid_in_group = GROUP_M * num_pid_n
-
-    start_pid = tl.program_id(0)
-    grid_x = tl.num_programs(0)
-    for tile_id in tl.range(start_pid, num_tiles, grid_x):
-        group_id = tile_id // num_pid_in_group
-        first_pid_m = group_id * GROUP_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-        pid_n = (tile_id % num_pid_in_group) // group_size_m
-
-        pid_m_off = pid_m * BLOCK_M
-        pid_n_off = pid_n * BLOCK_N
-
-        rm = pid_m_off + tl.arange(0, BLOCK_M)
-        rn = pid_n_off + tl.arange(0, BLOCK_N)
-
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for k_group_start in tl.range(0, K, GROUP_SIZE):
-            group_idx = k_group_start // GROUP_SIZE
-            # Load xs ONCE per group (outside the sub-MMA loop).
-            xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + rm * stride_xsm
-            xs = tl.load(xs_ptr_block, eviction_policy="evict_last")
-
-            int32_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-            for sub in tl.static_range(0, GROUPS_PER_TILE):
-                k_offset = k_group_start + sub * BLOCK_K
-                cols_k = k_offset + tl.arange(0, BLOCK_K)
-                # Unmasked loads; no eviction_policy hint on streaming INT8.
-                xq = tl.load(X_q_ptr + rm[:, None] * stride_xqm + cols_k[None, :] * stride_xqk)
-                # W_q is [N, K] row-major (canonical Linear layout); consume
-                # it with tl.trans(wq) so the IMMA is fed [BM,BK] x [BK,BN].
-                wq = tl.load(W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
-                int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
-
-            acc += int32_acc.to(tl.float32) * xs[:, None]
-
-        # W_scale and bias are epilogue-only, outside the K loop.  HAS_BIAS is
-        # compile-time True (see BIAS_CONFIGS below); no-bias plugin instances
-        # pass a zero-filled FP32 bias vector from workspace.
-        ws = tl.load(W_scale_ptr + rn, eviction_policy="evict_last")
-        acc = acc * ws[None, :]
-        bias = tl.load(Bias_ptr + rn, eviction_policy="evict_last")
-        acc += bias[None, :]
-
-        y_ptr_block = Y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn
-        if OUTPUT_FP16:
-            tl.store(y_ptr_block, acc.to(tl.float16))
-        else:
-            tl.store(y_ptr_block, acc.to(tl.float32))
+    if not GLUON_AVAILABLE:
+        raise SystemExit(
+            "[extract_jit_cubins_autotune] K2 requires the Triton Gluon dialect "
+            "(triton.experimental.gluon), which failed to import: "
+            f"{getattr(_GLUON_IMPORT_ERR, '__name__', 'Exception')}: "
+            f"{_GLUON_IMPORT_ERR}. Install Triton >= 3.7 with the CUDA backend."
+        )
 
 
 GROUP_SIZE = 256
@@ -700,15 +890,24 @@ TILE_NAME = "PersistentG256"
 #       instead of shipping masked K2 variants.  Only the bias-enabled K2
 #       cubin ships; no-bias plugin instances pass a workspace zero-bias
 #       vector.
-CONVROT_INT8_CUBIN_HEADER_VERSION = 7
+#   8 — K1 reverted to the v6 TC-based rotation (H_16⊗H_16) via FP16 tensor
+#       cores; the H4 in-register butterfly is dropped.  The v7 K1
+#       infrastructure (CONTIG_XK toggle, IS_INTERPRETER rounding fallback,
+#       occupancy-driven persistent grid, masked stores) is retained.  K2 is
+#       replaced by the Gluon ``gluon_pipe`` pipelined kernel
+#       (``k2_gluon_pipelined``): persistent tile loop, multi-stage cp.async
+#       pipeline, coalesced FP32 epilogue store, FOLD_EVERY int32-folded
+#       accumulation.  The K2 tuning grid is pinned to BM∈{64,128},
+#       BN∈{64,128}, BK∈{32,64}, stages∈{2,3} (num_warps=8), FP32 output.
+CONVROT_INT8_CUBIN_HEADER_VERSION = 8
 # K2 is always compiled with HAS_BIAS=True.  For no-bias ONNX layers, the C++
 # plugin passes a zero-filled FP32 bias vector from workspace.
 BIAS_CONFIGS = [("BIAS", True)]
 DTYPE_CONFIGS = [("FP32IO", False, False)]
 # Real DiT decoder K2 shapes, expressed as (M, K, N).  M=3000 is not
 # divisible by all candidate BLOCK_M values; extract_k2 pads the benchmark M
-# to 3072 so the plain/unmasked K2 can be autotuned safely while staying within
-# 2.4% of the production work.
+# to 3072 so the (unmasked) Gluon gluon_pipe K2 persistent tile loop can be
+# autotuned safely while staying within 2.4% of the production work.
 #
 # The first entry is the primary compromise shape used for the single shipped
 # K2 cubin: it is one of the two dominant MLP projections and stresses wide-N
@@ -722,7 +921,8 @@ AUTOTUNE_SHAPES_K2 = [
     (3000, 2560, 1024),  # dit.self_attn.k_proj
     (3000, 4096, 2560),  # dit.self_attn.o_proj
 ]
-K2_AUTOTUNE_M_ALIGNMENT = 128  # max generated K2 BLOCK_M; avoids OOB in plain K2
+K2_AUTOTUNE_M_ALIGNMENT = 128  # max generated K2 BLOCK_M; avoids OOB in the
+                                # unmasked Gluon gluon_pipe persistent tile loop
 
 # Patch review §H2: autotune grid must mirror the production launch geometry.
 #
@@ -919,6 +1119,7 @@ _LAUNCH_ARG_ENUM = {
     "M": "kM",
     "N": "kN",
     "K": "kK",
+    "NUM_TILES": "kNUM_TILES",
     "stride_xm": "kStride_xm",
     "stride_xk": "kStride_xk",
     "stride_xqm": "kStride_xqm",
@@ -942,7 +1143,7 @@ _QUANT_ARG_NAMES = {
 
 _GEMM_ARG_NAMES = {
     "X_q_ptr", "X_scale_ptr", "W_q_ptr", "W_scale_ptr", "Bias_ptr", "Y_ptr",
-    "M", "N", "K",
+    "M", "N", "K", "NUM_TILES",
     "stride_xqm", "stride_xqk", "stride_xsm", "stride_xsg",
     "stride_wn", "stride_wk", "stride_ym", "stride_yn",
 }
@@ -1484,53 +1685,53 @@ def _parallel_precompile_k1(configs, input_fp16):
         print(f"    [parallel-compile] Warning: parallel precompilation fallback ({e})", flush=True)
 
 
-def _init_k2_worker(output_fp16):
+def _init_k2_worker(output_fp16, target_arch):
     import torch
     try:
         torch.set_num_threads(1)
     except Exception:
         pass
-    out_dtype = torch.float16 if output_fp16 else torch.float32
     _K2_WORKER_STATE.output_fp16 = output_fp16
+    _K2_WORKER_STATE.target_arch = target_arch
+    # Gluon AOT compile (GluonASTSource) needs no device tensors — it compiles
+    # from the signature/constexprs alone.  The dummy tensors below are kept
+    # only so hasattr() guards in legacy callers don't break.
     _K2_WORKER_STATE.xq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
-    _K2_WORKER_STATE.xs = torch.empty((1, 1), device="cuda", dtype=torch.float32)
-    _K2_WORKER_STATE.wq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
-    _K2_WORKER_STATE.ws = torch.empty((1,), device="cuda", dtype=torch.float32)
-    _K2_WORKER_STATE.bias = torch.empty((1,), device="cuda", dtype=torch.float32)
-    _K2_WORKER_STATE.y = torch.empty((1, 1), device="cuda", dtype=out_dtype)
 
 
 def _worker_precompile_k2(config_tuple):
+    """AOT-compile one K2 gluon_pipe config to warm the compile cache.
+
+    The Gluon kernel is compiled from its signature + constexprs via
+    GluonASTSource (no @triton.autotune cache to warm).  Compiling here, ahead
+    of the custom bench loop, surfaces compile errors early and populates
+    Triton's on-disk compile cache so the benchmarker's first launch of each
+    config is a cache hit.
+    """
     if not hasattr(_K2_WORKER_STATE, "xq"):
         return 0
-    from triton import Config
-    kwargs, nw, ns, mr = config_tuple
+    cfg, = config_tuple
     output_fp16 = _K2_WORKER_STATE.output_fp16
     try:
-        cfg = Config(kwargs, num_warps=nw, num_stages=ns, maxnreg=mr)
-        # W_q is [N, K] row-major: stride_wn=K=2560, stride_wk=1.
-        kernel2_gemm_dequant.fn.warmup(
-            _K2_WORKER_STATE.xq, _K2_WORKER_STATE.xs, _K2_WORKER_STATE.wq,
-            _K2_WORKER_STATE.ws, _K2_WORKER_STATE.bias, _K2_WORKER_STATE.y,
-            1024, 2560, 2560,
-            2560, 1, 1, 1024, 2560, 1, 2560, 1,
-            GROUP_SIZE=256, OUTPUT_FP16=output_fp16,
-            **cfg.all_kwargs(),
-            grid=(1, 1, 1)
-        )
+        _gluon_aot_compile_k2(cfg, output_fp16, _K2_WORKER_STATE.target_arch)
     except Exception:
+        # Compile failures are not fatal here — the spill filter and the
+        # custom benchmarker both report them per-config.  Precompile is best
+        # effort (warm the cache, surface obvious errors early).
         pass
-    finally:
-        _flush_compiled_kernel_cache(kernel2_gemm_dequant)
     return 1
 
 
-def _parallel_precompile_k2(configs, output_fp16):
+def _parallel_precompile_k2(configs, output_fp16, target_arch):
+    if not GLUON_AVAILABLE:
+        print("    [parallel-compile] K2 skipped: Gluon dialect unavailable", flush=True)
+        return
     num_workers = int(os.environ.get("HOTSTEP_AUTOTUNE_WORKERS", min(mp.cpu_count(), len(configs), 16)))
     if num_workers <= 1 or not configs:
         return
-    print(f"    [parallel-compile] Precompiling {len(configs)} K2 configs across {num_workers} threads...", flush=True)
-    tuples = [(c.kwargs, c.num_warps, c.num_stages, getattr(c, "maxnreg", None)) for c in configs]
+    print(f"    [parallel-compile] Precompiling {len(configs)} K2 (gluon_pipe) "
+          f"configs across {num_workers} threads...", flush=True)
+    tuples = [(c,) for c in configs]
     done = 0
     total = len(configs)
     # Sparse newline-terminated progress (every ~10%): carriage-return
@@ -1540,7 +1741,7 @@ def _parallel_precompile_k2(configs, output_fp16):
         with ThreadPool(
             processes=num_workers,
             initializer=_init_k2_worker,
-            initargs=(output_fp16,)
+            initargs=(output_fp16, target_arch)
         ) as pool:
             for _ in pool.imap_unordered(_worker_precompile_k2, tuples, chunksize=1):
                 done += 1
@@ -1692,14 +1893,31 @@ def _detect_spills(kernel, function_name: str = "") -> dict:
 
 def _compile_kernel_for_spill_check(jit_fn, signature, constexprs, num_warps,
                                      num_stages, maxnreg, target_arch):
-    """Compile a single config for spill analysis (no autotune, no launch)."""
+    """Compile a single config for spill analysis (no autotune, no launch).
+
+    Dispatches to the Gluon AOT compile path (GluonASTSource) when ``jit_fn``
+    is a Gluon kernel (the K2 ``gluon_pipe`` path), and to the standard
+    Triton ASTSource path otherwise (the K1 @triton.jit path).  Gluon kernels
+    ignore ``maxnreg`` (register allocation is driven by the explicit layouts)
+    and pass ``num_stages=1`` to the compiler (the pipeline depth is encoded
+    in the kernel's NUM_BUFS constexpr, not the Triton num_stages option).
+    """
     from triton.compiler import compile as triton_compile
     from triton.compiler.compiler import ASTSource
     from triton.backends.compiler import GPUTarget
 
+    target = GPUTarget(backend='cuda', arch=target_arch, warp_size=32)
+
+    if _is_gluon_kernel(jit_fn):
+        # GluonASTSource expects the @gluon.jit wrapper object directly (it
+        # carries .arg_names and the other metadata the compile path needs) —
+        # do NOT unwrap .fn (the raw Python function has no .arg_names).
+        src = GluonASTSource(fn=jit_fn, signature=signature, constexprs=constexprs)
+        options = {'num_warps': num_warps, 'num_stages': 1}
+        return triton_compile(src, target=target, options=options)
+
     fn = jit_fn.fn if hasattr(jit_fn, 'fn') else jit_fn
     src = ASTSource(fn=fn, signature=signature, constexprs=constexprs)
-    target = GPUTarget(backend='cuda', arch=target_arch, warp_size=32)
     options = {'num_warps': num_warps, 'num_stages': num_stages}
     if maxnreg is not None:
         options['maxnreg'] = maxnreg
@@ -1727,7 +1945,11 @@ def _worker_check_spills(task):
             cfg.num_warps, cfg.num_stages,
             getattr(cfg, 'maxnreg', None),
             _SPILL_CHECK_STATE.target_arch)
-        spill_info = _detect_spills(kernel, _SPILL_CHECK_STATE.fn_name)
+        # Prefer the compiled kernel's own symbol name (robust for both the
+        # @triton.jit K1 path and the @gluon.jit K2 path, whose cubin symbol
+        # may differ from the Python function name).
+        fn_name = getattr(kernel, "name", None) or _SPILL_CHECK_STATE.fn_name
+        spill_info = _detect_spills(kernel, fn_name)
         spill_info["shared_bytes"] = int(getattr(kernel.metadata, "shared", 0) or 0)
         return (cfg, variant_label, spill_info, None)
     except Exception as e:
@@ -1758,24 +1980,21 @@ def _spill_check_variants(stage):
             }
             yield (dtype_suffix, signature,
                    {'GROUP_SIZE': 256, 'INPUT_FP16': input_fp16, 'CONTIG_XK': True})
-    else:  # k2
-        # HAS_BIAS is compile-time-hardwired in the shipped K2 cubin
-        # (see BIAS_CONFIGS).  Iterating BIAS_CONFIGS keeps the label scheme
-        # in sync with the extraction summary and the C++ cubin lookup.
+    else:  # k2 — Gluon gluon_pipe kernel signature
+        # The K2 kernel is the Gluon ``k2_gluon_pipelined`` variant: a
+        # persistent tile loop that takes a NUM_TILES runtime arg between K
+        # and the strides, and NUM_BUFS / FOLD_EVERY / GROUP_M / HAS_BIAS /
+        # OUTPUT_FP16 as constexprs.  HAS_BIAS is compile-time-hardwired True
+        # (BIAS_CONFIGS); iterating BIAS_CONFIGS keeps the label scheme in
+        # sync with the extraction summary and the C++ cubin lookup.  The
+        # signature is reused from _gluon_k2_signature so the spill-check
+        # compile path and the AOT cubin-harvest path feed GluonASTSource an
+        # identical, benchmark-proven signature.
         for bias_suffix, _has_bias in BIAS_CONFIGS:
             for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
-                y_type = '*fp16' if output_fp16 else '*fp32'
-                signature = {
-                    'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32', 'W_q_ptr': '*i8',
-                    'W_scale_ptr': '*fp32', 'Bias_ptr': '*fp32', 'Y_ptr': y_type,
-                    'M': 'i32', 'N': 'i32', 'K': 'i32',
-                    'stride_xqm': 'i32', 'stride_xqk': 'i32',
-                    'stride_xsm': 'i32', 'stride_xsg': 'i32',
-                    'stride_wn': 'i32', 'stride_wk': 'i32',
-                    'stride_ym': 'i32', 'stride_yn': 'i32',
-                }
-                yield (f"{bias_suffix}_{dtype_suffix}", signature,
-                       {'GROUP_SIZE': 256,
+                yield (f"{bias_suffix}_{dtype_suffix}",
+                       _gluon_k2_signature(output_fp16),
+                       {'GROUP_SIZE': 256, 'HAS_BIAS': True,
                         'OUTPUT_FP16': output_fp16})
 
 
@@ -1799,7 +2018,13 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
 
     def make_constexprs(cfg, extra):
         out = dict(extra)
-        out.update(cfg.kwargs)  # BLOCK_M[/BLOCK_N/BLOCK_K/GROUP_M]
+        out.update(cfg.kwargs)  # BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M
+        if stage == "k2":
+            # Gluon gluon_pipe kernel also takes NUM_BUFS (= stages) and
+            # FOLD_EVERY (= GROUPS_PER_TILE by default) as constexprs; both
+            # are config-specific.
+            out["NUM_BUFS"] = _gluon_k2_num_bufs(cfg)
+            out["FOLD_EVERY"] = _gluon_k2_fold_every(cfg)
         return out
 
     # Build the task list: (config, variant_label, signature, constexprs)
@@ -1953,35 +2178,44 @@ K2_BENCH_TOPN = int(os.environ.get("HOTSTEP_K2_BENCH_TOPN", "5"))
 
 
 def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
-    """Launch one K2 config with the occupancy-scaled production grid.
+    """Launch one K2 gluon_pipe config with the persistent production grid.
 
-    Uses ``kernel2_gemm_dequant.fn[grid](...)`` (the raw JITFunction, no
-    autotune wrapping) with the config's constexprs passed explicitly so
-    each call is a straight launch — no measurement is done here.
+    The Gluon kernel is a persistent tile loop: it takes a NUM_TILES runtime
+    arg and is launched on a 1D grid of min(num_tiles, num_sms) CTAs (one CTA
+    per SM walks GROUP_M-swizzled tiles).  Config constexprs (BLOCK_M/N/K,
+    GROUP_M, NUM_BUFS, FOLD_EVERY, HAS_BIAS, OUTPUT_FP16) and num_warps=8 are
+    passed as kernel metadata; no @triton.autotune wrapping is involved.
     """
+    _require_gluon_for_k2()
     xq, xs, wq, ws, bias, y = tensors
-    num_tiles = triton.cdiv(M, cfg.kwargs["BLOCK_M"]) * triton.cdiv(N, cfg.kwargs["BLOCK_N"])
-    # Per-config occupancy (populated by the spill/compile filter) mirrors the
-    # production launch geometry; fall back to AUTOTUNE_OCCUPANCY_ASSUMPTION
-    # if the map was skipped (e.g. tests injecting a manual config list).
+    bm = cfg.kwargs["BLOCK_M"]
+    bn = cfg.kwargs["BLOCK_N"]
+    num_tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
+    # Persistent grid mirrors the production launch geometry: occupancy-driven
+    # min(num_tiles, num_sms * max_active_ctas_per_sm).  The per-config
+    # occupancy is populated by the spill/compile filter; fall back to the
+    # AUTOTUNE_OCCUPANCY_ASSUMPTION if the map was skipped.
     ctas = _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
     grid_x = _autotune_grid_x(num_tiles, num_sms, ctas)
-    kwargs = dict(cfg.kwargs)
-    kwargs["GROUP_SIZE"] = GROUP_SIZE
-    kwargs["OUTPUT_FP16"] = output_fp16
-    kwargs["num_warps"] = cfg.num_warps
-    kwargs["num_stages"] = cfg.num_stages
-    mr = getattr(cfg, "maxnreg", None)
-    if mr is not None:
-        kwargs["maxnreg"] = mr
-    kernel2_gemm_dequant.fn[(grid_x,)](
+    grid = (grid_x,)
+    meta = dict(
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=cfg.kwargs["BLOCK_K"],
+        GROUP_SIZE=GROUP_SIZE, GROUP_M=cfg.kwargs["GROUP_M"],
+        NUM_BUFS=_gluon_k2_num_bufs(cfg),
+        FOLD_EVERY=_gluon_k2_fold_every(cfg),
+        HAS_BIAS=True, OUTPUT_FP16=output_fp16,
+        num_warps=cfg.num_warps,
+    )
+    # Gluon pipelined kernel arg order (matches the kernel signature):
+    #   xq, xs, wq, ws, bias, y, M, N, K, NUM_TILES, <strides...>
+    kernel2_gemm_dequant[grid](
         xq, xs, wq, ws, bias, y,
-        M, N, K,
-        K, 1,
-        1, M,
-        K, 1,        # W_q [N, K] row-major
-        N, 1,
-        **kwargs,
+        M, N, K, num_tiles,
+        K, 1,          # X_q [M, K] row-major
+        1, M,          # X_scale [n_groups, M]
+        K, 1,          # W_q [N, K] row-major
+        N, 1,          # Y [M, N] row-major
+        **meta,
     )
     return grid_x
 
@@ -2184,8 +2418,8 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
     for bias_suffix, _has_bias in BIAS_CONFIGS:
         for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
             config_name = f"{bias_suffix}_{dtype_suffix}"
-            print(f"\n  K2 G256 {config_name} (custom-bench selection)...", flush=True)
-            _parallel_precompile_k2(_K2_CONFIGS, output_fp16)
+            print(f"\n  K2 G256 {config_name} (gluon_pipe custom-bench selection)...", flush=True)
+            _parallel_precompile_k2(_K2_CONFIGS, output_fp16, arch)
             out_dtype = torch.float16 if output_fp16 else torch.float32
             M_real, K, N = AUTOTUNE_SHAPES_K2[0]
             # Plain K2 has no M masks.  Autotune the same production-like work
@@ -2195,13 +2429,14 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             M = ((M_real + K2_AUTOTUNE_M_ALIGNMENT - 1) // K2_AUTOTUNE_M_ALIGNMENT) * K2_AUTOTUNE_M_ALIGNMENT
             if M != M_real:
                 print(f"    [K2 autotune] primary shape M={M_real}, K={K}, N={N}; "
-                      f"using padded M={M} for plain/unmasked K2 safety", flush=True)
+                      f"using padded M={M} for unmasked Gluon gluon_pipe K2 safety", flush=True)
             xq = torch.randint(-127, 128, (M, K), device="cuda", dtype=torch.int8)
             n_groups = K // GROUP_SIZE
             xs = torch.rand((n_groups, M), device="cuda", dtype=torch.float32) * 0.02 + 0.001
-            # W_q is [N, K] row-major (canonical Linear layout).  The
-            # hybrid_direct K2 kernel handles the transpose in-kernel with
-            # tl.trans(wq), so nothing about the exported weight layout
+            # W_q is [N, K] row-major (canonical Linear layout).  The Gluon
+            # gluon_pipe K2 kernel handles the transpose in-kernel via a free
+            # smem.permute((1, 0)) on the [N, K] shared-memory view (no tl.trans,
+            # no extra copy), so nothing about the exported weight layout
             # changes.
             wq = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
             ws = torch.rand((N,), device="cuda", dtype=torch.float32) * 0.02 + 0.001
@@ -2226,20 +2461,14 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                 )
             _print_k2_bench_topn(bench_results, M, K, N)
 
-            # Force Triton to compile and cache the picked winner so
-            # _get_compiled_kernel_for_cfg can retrieve its CompiledKernel.
-            # (The custom bench already ran the winner — the cache entry is
-            # present — but we re-launch to be defensive against a possible
-            # cache-flush from the spill filter running between passes.)
-            _launch_k2_for_bench(best_cfg, tensors, M, N, K, num_sms, output_fp16)
-            torch.cuda.synchronize()
-
-            kernel, best_cfg, cache_dir = _get_compiled_kernel_for_cfg(
-                kernel2_gemm_dequant, best_cfg,
-                debug_dump=debug_dump,
-                GROUP_SIZE=GROUP_SIZE,
-                OUTPUT_FP16=output_fp16,
-            )
+            # AOT-compile the picked winner via GluonASTSource to harvest its
+            # cubin directly (the Gluon kernel has no @triton.autotune cache to
+            # walk, unlike the old hybrid_direct path).  The custom bench
+            # already ran the winner, so this recompile is a cache hit and
+            # yields the CompiledKernel for header emission, ABI extraction and
+            # spill validation.
+            kernel = _gluon_aot_compile_k2(best_cfg, output_fp16, arch)
+            cache_dir = _get_kernel_cache_dir(kernel)
 
             block_m = best_cfg.kwargs["BLOCK_M"]
             block_n = best_cfg.kwargs["BLOCK_N"]
@@ -2656,7 +2885,7 @@ def write_header(k1_results, k2_results, output_path):
         "inline void* selectGemmLaunchParam(",
         "    ConvRotLaunchArgId id,",
         "    void*& xq_ptr, void*& xs_ptr, void*& wq_param, void*& ws_param, void*& bias_param, void*& y_ptr,",
-        "    int32_t& M, int32_t& N, int32_t& K,",
+        "    int32_t& M, int32_t& N, int32_t& K, int32_t& num_tiles,",
         "    int32_t& stride_xqm, int32_t& stride_xqk,",
         "    int32_t& stride_xsm, int32_t& stride_xsg,",
         "    int32_t& stride_wn, int32_t& stride_wk,",
@@ -2671,6 +2900,7 @@ def write_header(k1_results, k2_results, output_path):
         "        case ConvRotLaunchArgId::kM: return &M;",
         "        case ConvRotLaunchArgId::kN: return &N;",
         "        case ConvRotLaunchArgId::kK: return &K;",
+        "        case ConvRotLaunchArgId::kNUM_TILES: return &num_tiles;",
         "        case ConvRotLaunchArgId::kStride_xqm: return &stride_xqm;",
         "        case ConvRotLaunchArgId::kStride_xqk: return &stride_xqk;",
         "        case ConvRotLaunchArgId::kStride_xsm: return &stride_xsm;",
@@ -2751,6 +2981,9 @@ def write_header(k1_results, k2_results, output_path):
         "    uint32_t const grid_m = ceilDivU32(M, d.block_m);",
         "    uint32_t const grid_n = ceilDivU32(N, d.block_n);",
         "    uint32_t const total_tiles = grid_m * grid_n;",
+        "    // K2 gluon_pipe is a persistent tile loop: it takes a NUM_TILES",
+        "    // runtime arg (i32).  Pass the total tile count as that arg.",
+        "    int32_t const num_tiles = static_cast<int32_t>(total_tiles);",
         "    // §1.1: see launchConvRotQuant — occupancy-driven grid sizing.",
         "    //        Patch review §5: must pass the real block size, not 0.",
         "    uint32_t const block_threads = d.block_x * d.block_y * d.block_z;",
@@ -2766,7 +2999,7 @@ def write_header(k1_results, k2_results, output_path):
         "        void* slot = selectGemmLaunchParam(",
         "            d.runtime_args[i].id,",
         "            xq_ptr, xs_ptr, wq_param, ws_param, bias_param, y_ptr,",
-        "            M, N, K,",
+        "            M, N, K, const_cast<int32_t&>(num_tiles),",
         "            stride_xqm, stride_xqk, stride_xsm, stride_xsg,",
         "            stride_wn, stride_wk, stride_ym, stride_yn);",
         "        if (slot == nullptr) return CUDA_ERROR_INVALID_VALUE;",
@@ -2830,11 +3063,14 @@ def main():
 
     global _K1_CONFIGS, _K2_CONFIGS
     _K1_CONFIGS[:] = _estimate_k1_configs(num_sms, l2_bytes, shared_mem_per_sm, AUTOTUNE_SHAPES_K2)
-    # Arch-dispatched K2 config builder.  Pass arch so the config space is
-    # tailored to the target GPU's smem budget, L2 size, and CTA cap.
+    # K2 config grid is pinned by the user (BM∈{64,128}, BN∈{64,128},
+    # BK∈{32,64}, stages∈{2,3}, num_warps=8) — see _estimate_k2_configs.
+    # The SM-aware tile injector is intentionally NOT applied to K2: the
+    # gluon_pipe kernel requires num_warps=8 and the injected candidates
+    # (num_warps=4, non-gluon-compatible tiles) would be rejected wholesale
+    # by the gluon config gate.  K1 still uses the heuristic builder.
     _K2_CONFIGS[:] = _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm,
                                           AUTOTUNE_SHAPES_K2, arch=arch)
-    _K2_CONFIGS[:] = _add_sm_aware_tile_candidates(_K2_CONFIGS, num_sms, AUTOTUNE_SHAPES_K2)
 
     # ── Register spill filtering (patch review §8) ───────────────────────
     # Triton will SILENTLY spill registers to local memory (DRAM) when a
@@ -2847,13 +3083,17 @@ def main():
     _K1_CONFIGS[:] = _filter_spilling_configs(_K1_CONFIGS, kernel1_convrot_quant, "k1", arch)
     _K2_CONFIGS[:] = _filter_spilling_configs(_K2_CONFIGS, kernel2_gemm_dequant, "k2", arch)
 
+    # K1 is a @triton.autotune kernel — bind the filtered config list back so
+    # the launch dispatch (extract_k1) autotunes over the survivors.  K2 is the
+    # Gluon gluon_pipe kernel (no @triton.autotune wrapping); the filtered list
+    # is consumed directly by the custom benchmarker, so there is no .configs
+    # attribute to set.
     kernel1_convrot_quant.configs = _K1_CONFIGS
-    kernel2_gemm_dequant.configs = _K2_CONFIGS
 
     print(f"[extract_jit_cubins_autotune] GROUP_SIZE={GROUP_SIZE}", flush=True)
     print(f"[extract_jit_cubins_autotune] K2 max shared cap: {K2_MAX_SHARED_BYTES if K2_MAX_SHARED_BYTES > 0 else 'disabled'} bytes", flush=True)
     print(f"[extract_jit_cubins_autotune] K1 configs: {len(_K1_CONFIGS)} (heuristic-pruned + spill-filtered)", flush=True)
-    print(f"[extract_jit_cubins_autotune] K2 configs: {len(_K2_CONFIGS)} (heuristic-pruned + SM-aware + spill-filtered)", flush=True)
+    print(f"[extract_jit_cubins_autotune] K2 configs: {len(_K2_CONFIGS)} (gluon_pipe grid: BM/BN/BK/stages, spill-filtered)", flush=True)
     # Per-config occupancy summary (K2 only).  The K2 autotune grid uses these
     # so each candidate is measured under the actual CTAs/SM it will get in
     # production — e.g. a 96 KB-shared config runs at 1 CTA/SM, not 2 CTA/SM.

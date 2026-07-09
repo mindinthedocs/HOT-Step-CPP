@@ -40,8 +40,9 @@ import numpy as np
 #
 # 256 matches the PyTorch/ComfyUI reference and divides the DiT allowlist
 # dimensions (hidden_size=2048, intermediate_size=6144) cleanly. The TRT CUDA
-# kernel applies the regular Hadamard via H4 Kronecker butterflies, so it no
-# longer stages a dense group_size×group_size H matrix in shared memory.
+# K1 kernel applies the regular Hadamard as a tensor-core rotation
+# (H_16 ⊗ H_16 via FP16 tl.dot), so it no longer stages a dense
+# group_size×group_size H matrix in shared memory.
 #
 # Override via --convrot-group-size or HOTSTEP_CONVROT_GROUP_SIZE env var
 # for experiments with smaller/faster groups.

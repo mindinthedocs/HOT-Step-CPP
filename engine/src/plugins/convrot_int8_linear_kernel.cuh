@@ -9,8 +9,10 @@
  * ConvRot rotation kernel
  * -----------------------
  * One block per row of x [K]. Each block:
- *   1. Applies the regular Hadamard as H4 Kronecker butterflies per group
- *      (the H input is kept for graph/API compatibility but is not staged)
+ *   1. Applies the regular Hadamard rotation as a TC-based H_16 ⊗ H_16
+ *      transform per group (the H input is kept for graph/API compatibility
+ *      but is not staged — the 16×16 H_16 factor is synthesized in-register
+ *      from an identity seed)
  *   2. Computes per-row max-abs from the rotated values
  *   3. Computes per-row max-abs → scale = max(|x_rot|) / 127
  *   4. Recomputes the rotation and quantizes:

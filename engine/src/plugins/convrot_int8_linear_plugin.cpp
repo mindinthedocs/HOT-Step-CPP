@@ -14,10 +14,13 @@
  *   workload too. Keeping one execution family also shrinks the cubin header
  *   and removes M-dependent runtime dispatch state.
  *
- * Rotation design (butterfly, not dense H-matrix matmul):
- *   The Hadamard rotation H_{GROUP_SIZE} is decomposed into log_4(GROUP_SIZE)
- *   successive H_4 butterfly stages, all performed in registers. This avoids
- *   materializing a dense [GROUP_SIZE x GROUP_SIZE] H matrix in shared memory.
+ * Rotation design (TC-based, not dense H-matrix matmul):
+ *   The Hadamard rotation H_{GROUP_SIZE} is factored as H_16 ⊗ H_16 and
+ *   computed by two FP16 ``tl.dot`` matmuls on the Ampere tensor cores (with
+ *   a split-FP16 hi/lo decomposition of the FP32 operand for full dynamic
+ *   range).  The 16×16 H_16 factor is synthesized in-register from an identity
+ *   seed; no dense [GROUP_SIZE × GROUP_SIZE] H matrix is staged in shared
+ *   memory.
  *
  * Cubin dispatch:
  *   At onShapeChange(), the plugin verifies the concrete runtime M/K/N and
@@ -44,7 +47,7 @@
 
 #if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
 // ── Cubin header version guard ─────────────────────────────────────────────
-// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 7.
+// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 8.
 // Version 3 added per-cubin tile dimensions; version 4 additionally reflects
 // the intentionally smaller cubin inventory: G256 only (plus optional G0 sentinel), and no specialized M1
 // cubins. Referencing removed G0/G256/M1 symbols here would make the plugin
@@ -70,10 +73,22 @@
 //            the plugin pads/splits runtime M on the host side instead of
 //            shipping masked K2 variants.  Only the bias-enabled K2 cubin
 //            ships; no-bias plugin instances pass a workspace zero-bias vector.
+// Version 8: K1 reverted to the v6 TC-based rotation (H_16⊗H_16) via FP16
+//            tensor cores; the v7 H4 in-register butterfly is dropped (the v7
+//            K1 infrastructure — CONTIG_XK toggle, IS_INTERPRETER rounding
+//            fallback, occupancy-driven persistent grid, masked stores — is
+//            retained).  K2 is replaced by the Gluon ``gluon_pipe`` pipelined
+//            kernel (@gluon.jit): persistent tile loop with NUM_TILES runtime
+//            arg, multi-stage cp.async pipeline (NUM_BUFS = stages), coalesced
+//            FP32 epilogue store, FOLD_EVERY int32-folded accumulation.  The K2
+//            tuning grid is pinned to BM∈{64,128}, BN∈{64,128}, BK∈{32,64},
+//            stages∈{2,3} (num_warps=8).  The generated launch stub computes
+//            NUM_TILES internally from M/N/block_m/block_n; the plugin's
+//            launchConvRotGemm call signature is unchanged.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 7
-#  error "Cubin header version >= 7 required (hybrid_direct K2, host-side M padding, single bias-enabled K2 cubin, direct H4 K1 rotation, occupancy-scaled persistent grid). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 8
+#  error "Cubin header version >= 8 required (Gluon gluon_pipe K2 with NUM_TILES runtime arg + persistent cp.async pipeline, TC-based H_16⊗H_16 K1 rotation, host-side M padding, single bias-enabled K2 cubin, occupancy-scaled persistent grid). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -187,10 +202,12 @@ inline CUresult launchConvRotGemm(ConvRotCubinDesc const&, CUfunction, CUstream,
 // the arch/dtype mismatch warning rather than failing).
 namespace {
 
-// K2 is intentionally plain/unmasked.  Workspace sizing therefore reserves
-// enough activation padding for any generated K2 BLOCK_M currently emitted by
-// extract_jit_cubins_autotune.py.  Runtime enqueue rejects a future cubin with
-// a larger tile instead of risking workspace overflow.
+// K2 is the Gluon ``gluon_pipe`` persistent tile loop (no boundary masks).
+// Workspace sizing therefore reserves enough activation padding for any
+// generated K2 BLOCK_M currently emitted by extract_jit_cubins_autotune.py
+// (the pinned tuning grid is BM∈{64,128}, so 256 is a safe ceiling).
+// Runtime enqueue rejects a future cubin with a larger tile instead of
+// risking workspace overflow.
 constexpr int32_t kMaxK2WorkspacePadBlockM = 256;
 
 int32_t queryDeviceComputeCapability() {
@@ -563,8 +580,10 @@ unsigned int getDeviceMaxDynamicSharedMem() {
 //     when the process exits.
 //
 // With this cache, the first DiT step loads only the unique two-kernel cubins
-// needed by the engine (for example, K1_G256_FP32IO plus the G256 FP32IO K2
-// BIAS/NOBIAS variants when both bias modes occur).
+// needed by the engine: K1_G256_FP32IO plus the single G256 FP32IO K2
+// (bias-enabled) cubin.  No-bias layers reuse the same K2 cubin and pass a
+// zero-filled bias vector from workspace, so there is no separate NOBIAS K2
+// variant (see the zero-bias handling in getWorkspaceSize / enqueue).
 // Subsequent steps hit the cache — zero cuModuleLoadData calls, zero
 // cuModuleGetFunction calls, zero cuFuncSetAttribute calls. initTriton()
 // becomes a single mutex + hash lookup (~200 ns).
@@ -918,8 +937,9 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
     int32_t const scale_groups = activationScaleGroups(K, m_group_size);
     size_t x_q_size = alignUp(static_cast<size_t>(maxMPadded) * static_cast<size_t>(K), 16);
     // X_scale is now FP32 and uses the transposed [n_groups, M_padded]
-    // layout.  M is padded in workspace so the plain/unmasked K2 kernel can
-    // read complete BLOCK_M tiles without touching unallocated memory.
+    // layout.  M is padded in workspace so the (unmasked) Gluon gluon_pipe K2
+    // persistent tile loop can read complete BLOCK_M tiles without touching
+    // unallocated memory.
     size_t x_scale_size = alignUp(
         static_cast<size_t>(maxMPadded) * static_cast<size_t>(scale_groups) * sizeof(float),
         16);
@@ -930,7 +950,8 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
         static_cast<size_t>(kMaxK2WorkspacePadBlockM) * static_cast<size_t>(m_out_features) *
             dtypeSizeBytesFromId(m_output_dtype_id),
         16);
-    // Version 7 ships only the bias-enabled K2 cubin.  No-bias layers pass this
+    // Version 8 ships only the bias-enabled K2 cubin (HAS_BIAS is a compile-time
+    // constexpr in the Gluon gluon_pipe kernel).  No-bias layers pass this
     // zero-filled FP32 vector as Bias_ptr so one K2 cubin handles both cases.
     size_t zero_bias_size = m_has_bias ? 0 : alignUp(
         static_cast<size_t>(m_out_features) * sizeof(float),
@@ -1104,8 +1125,9 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         int32_t stride_xm = K;
         int32_t stride_xk = 1;
         // W_q is the canonical Linear [out_features, in_features] = [N, K]
-        // row-major initializer.  K2 handles the transpose in-kernel via
-        // tl.trans(wq) (hybrid_direct variant).
+        // row-major initializer.  The Gluon gluon_pipe K2 kernel handles the
+        // transpose in-kernel via a free smem.permute((1, 0)) on the [N, K]
+        // shared-memory view (no tl.trans, no extra copy).
         int32_t stride_wn = K;
         int32_t stride_wk = 1;
         int32_t stride_ym = N;
@@ -1132,7 +1154,7 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         if (gemm_block_m > kMaxK2WorkspacePadBlockM || (N % gemm_block_n) != 0) {
 #ifdef HOTSTEP_DIAGNOSTICS
             hotstep::diag::log(
-                "[ConvRotInt8Linear] enqueue REJECT: plain K2 requires BLOCK_M<=%d "
+                "[ConvRotInt8Linear] enqueue REJECT: Gluon gluon_pipe K2 requires BLOCK_M<=%d "
                 "and N divisible by BLOCK_N (M=%d, N=%d, BLOCK_M=%d, BLOCK_N=%d).\n",
                 kMaxK2WorkspacePadBlockM, M, N, gemm_block_m, gemm_block_n);
             hotstep::diag::flush();
@@ -1172,8 +1194,8 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         // X_scale workspace layout: TRANSPOSED [n_groups, M_padded] row-major.
         // K1 is launched with the real M (so it never reads padded input rows)
         // but stores actual rows with stride_xsg=M_padded.  The padded tail
-        // rows are zeroed below and consumed only by the plain/unmasked K2
-        // tail launch.
+        // rows are zeroed below and consumed only by the (unmasked) Gluon
+        // gluon_pipe K2 persistent tile loop's tail launch.
         int32_t stride_xsm = 1;
         int32_t stride_xsg = M_padded;
 
@@ -1279,10 +1301,11 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
                 m_max_ctas_per_sm_gemm);  // occupancy cached in initTriton() (H1)
         };
 
-        // Plain K2 has no boundary masks.  Run the aligned prefix directly into
-        // TensorRT's output, then (only when needed) run the final padded tile
-        // into workspace and copy back the real tail rows.  This keeps the
-        // output tensor's public shape unchanged without a masked K2 variant.
+        // The Gluon gluon_pipe K2 is a persistent tile loop with no boundary
+        // masks.  Run the aligned prefix directly into TensorRT's output, then
+        // (only when needed) run the final padded tile into workspace and copy
+        // back the real tail rows.  This keeps the output tensor's public shape
+        // unchanged without a masked K2 variant.
         int32_t const M_aligned = M - (M % gemm_block_m);
         if (M_aligned > 0) {
             status = launch_gemm(xq_ptr, xs_ptr, y_ptr, M_aligned);
@@ -1594,8 +1617,11 @@ bool ConvRotInt8LinearPlugin::initTriton() {
     }
 
     // ── Query device SM count for persistent-kernel grid computation ──
-    // Used only for host-side grid sizing; the kernels stride their
-    // persistent loops by tl.num_programs(0), so no NUM_SMS kernel arg.
+    // Used only for host-side grid sizing; neither kernel takes NUM_SMS as a
+    // runtime arg.  K1 strides its persistent loop by tl.num_programs(0);
+    // K2 (Gluon gluon_pipe) takes a NUM_TILES runtime arg and strides by
+    // gl.num_programs(0).  The generated launch stubs compute
+    // min(num_tiles, num_sms * max_active_ctas_per_sm) for both.
     if (m_num_sms == 0) {
         int32_t dev = 0;
         cuCtxGetDevice(&dev);

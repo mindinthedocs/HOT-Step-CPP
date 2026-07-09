@@ -3,9 +3,11 @@
  *
  * The ConvRot INT8 TensorRT plugin now uses two AOT-compiled Triton kernels:
  *
- *   1. kernel1_convrot_quant — in-register H_4 butterfly rotation plus
- *      per-K-group dynamic INT8 activation quantization into workspace.
- *   2. kernel2_gemm_dequant  — INT8 GEMM over that workspace with per-group
+ *   1. kernel1_convrot_quant — TC-based (H_16 ⊗ H_16) FP16-tensor-core
+ *      rotation plus per-K-group dynamic INT8 activation quantization into
+ *      workspace.
+ *   2. kernel2_gemm_dequant  — Gluon gluon_pipe persistent, multi-stage
+ *      cp.async pipelined INT8 GEMM over that workspace with per-group
  *      activation dequantization, per-channel weight scales, and optional bias.
  *
  * The same two-kernel BK64/BM128/BN128 path is used for every runtime M,
