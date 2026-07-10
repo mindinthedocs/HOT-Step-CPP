@@ -34,7 +34,7 @@ ONNX custom-op identity
   * attributes: group_size, in_features, out_features, has_bias,
     input_dtype, output_dtype, plugin_version, plugin_namespace, preferred_format
 
-The v2 contract defaults to FP16 plugin I/O. Kernel-side tactic and layout
+The v3 contract supports selective FP32/FP16 boundaries, fused epilogues, and shared K1 quantization. Kernel-side tactic and layout
 optimizations are intentionally decoupled from ONNX export: the ONNX node emits
 the stable dtype/shape contract once, and TRT selects any current or future
 plugin tactic during engine build.
@@ -51,6 +51,7 @@ from .convrot_int8_plugin import (
     CONVROT_INT8_LINEAR_PLUGIN_VERSION,
     conv_rot_int8_linear_reference,
     make_convrot_int8_linear_onnx_node,
+    make_convrot_quantize_onnx_node,
     register_plugins,
     is_registered,
 )
@@ -61,6 +62,7 @@ __all__ = [
     "CONVROT_INT8_LINEAR_PLUGIN_VERSION",
     "conv_rot_int8_linear_reference",
     "make_convrot_int8_linear_onnx_node",
+    "make_convrot_quantize_onnx_node",
     "register_plugins",
     "is_registered",
 ]

@@ -212,9 +212,7 @@ def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, 
     not smem/registers).  FOLD_EVERY defaults to GROUPS_PER_TILE = 256 / BK
     (one int32→fp32 fold per group); NUM_BUFS = stages.
 
-    Output dtype is FP32 (DTYPE_CONFIGS = [("FP32IO", False, False)]); the
-    kernel's OUTPUT_FP16 constexpr is wired from the dtype config at compile
-    time, not from the tuning grid.
+    Output dtype and fused epilogue are selected from K2_VARIANTS; the kernel's OUTPUT_FP16 and EPILOGUE_KIND constexprs are wired at compile time.
 
     The arch/smem heuristics that used to prune the @triton.autotune K2 space
     are no longer applied here: the gluon kernel's explicit shared-memory
@@ -222,6 +220,13 @@ def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, 
     SHARED field), and the custom benchmarker times each survivor so the
     winner is picked on measured throughput, not on a smem-tax estimate.
     """
+    # Per-shape-family autotuning: the full BM/BN ∈ {64, 128} grid is searched.
+    # 128×128 is NOT universally forced — the original profiling was done on
+    # gate_proj only; smaller-N shapes (K/V, O, small-M) may prefer 64×64 or
+    # 64×128 for better wave quantization and L2 reuse.  BN=128 remains
+    # mandatory for QK_NORM/QK_NORM_ROPE (head-local RMSNorm needs a complete
+    # 128-wide head in one CTA); that pruning happens in
+    # _k2_configs_for_variant() below.
     block_m_candidates = [64, 128]
     block_n_candidates = [64, 128]
     block_k_candidates = [32, 64]
@@ -272,20 +277,35 @@ def _gluon_k2_fold_every(cfg):
     return GROUP_SIZE // cfg.kwargs["BLOCK_K"]
 
 
-def _gluon_k2_signature(output_fp16):
-    """GluonASTSource signature dict for the K2 gluon_pipe kernel.
+# K2 epilogue variants.  Keep the numeric values synchronized with
+# ConvRotEpilogueKind in engine/src/plugins/convrot_int8_linear_plugin.h.
+EPILOGUE_PLAIN = 0
+EPILOGUE_QK_NORM = 1
+EPILOGUE_QK_NORM_ROPE = 2
+EPILOGUE_RESIDUAL = 3
+EPILOGUE_GATED_RESIDUAL = 4
 
-    Mirrors the proven signature from ``benchmark_k2_tuning_space_hybrid.py``'s
-    ``aot_resources``: runtime args carry their element/scalar type, constexpr
-    params are declared as ``'constexpr'``.  Both declarations are accepted by
-    GluonASTSource (the constexpr type entries are redundant with the
-    ``constexprs`` value dict but harmless, and keep this path byte-identical
-    to the benchmarked one).
+
+def _gluon_k2_signature(output_fp16):
+    """GluonASTSource signature for all K2 epilogue variants.
+
+    Aux pointers have a stable ABI and are ignored at compile time when the
+    selected EPILOGUE_KIND does not need them:
+
+      QK_NORM:          Aux0 = RMS gamma[128]
+      QK_NORM_ROPE:     Aux0 = gamma, Aux1 = cos[M,128], Aux2 = sin[M,128]
+      RESIDUAL:         Aux0 = residual[M,N]
+      GATED_RESIDUAL:   Aux0 = residual[M,N], Aux1 = gate[N]
+
+    A stable ABI keeps the generated C++ launch stubs simple and permits one
+    plugin implementation to dispatch all variants.
     """
     y_type = '*fp16' if output_fp16 else '*fp32'
     return {
         'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32', 'W_q_ptr': '*i8',
         'W_scale_ptr': '*fp32', 'Bias_ptr': '*fp32', 'Y_ptr': y_type,
+        'Aux0_ptr': '*fp32', 'Aux1_ptr': '*fp32', 'Aux2_ptr': '*fp32',
+        'Epsilon': 'fp32', 'RowsPerBatch': 'i32', 'RowOffset': 'i32', 'TotalRows': 'i32',
         'M': 'i32', 'N': 'i32', 'K': 'i32', 'NUM_TILES': 'i32',
         'stride_xqm': 'i32', 'stride_xqk': 'i32',
         'stride_xsm': 'i32', 'stride_xsg': 'i32',
@@ -295,11 +315,12 @@ def _gluon_k2_signature(output_fp16):
         'GROUP_SIZE': 'constexpr', 'GROUP_M': 'constexpr',
         'NUM_BUFS': 'constexpr', 'FOLD_EVERY': 'constexpr',
         'HAS_BIAS': 'constexpr', 'OUTPUT_FP16': 'constexpr',
+        'EPILOGUE_KIND': 'constexpr',
     }
 
 
-def _gluon_k2_constexprs(cfg, output_fp16):
-    """GluonASTSource constexprs dict for one K2 config + dtype variant."""
+def _gluon_k2_constexprs(cfg, output_fp16, epilogue_kind=EPILOGUE_PLAIN):
+    """GluonASTSource constexprs dict for one K2 config and epilogue."""
     return {
         'BLOCK_M': cfg.kwargs['BLOCK_M'],
         'BLOCK_N': cfg.kwargs['BLOCK_N'],
@@ -310,10 +331,12 @@ def _gluon_k2_constexprs(cfg, output_fp16):
         'FOLD_EVERY': _gluon_k2_fold_every(cfg),
         'HAS_BIAS': True,
         'OUTPUT_FP16': output_fp16,
+        'EPILOGUE_KIND': epilogue_kind,
     }
 
 
-def _gluon_aot_compile_k2(cfg, output_fp16, target_arch):
+def _gluon_aot_compile_k2(cfg, output_fp16, target_arch,
+                           epilogue_kind=EPILOGUE_PLAIN):
     """AOT-compile one K2 gluon_pipe config and return its CompiledKernel.
 
     Mirrors the standalone benchmark's ``aot_resources`` Gluon path: builds a
@@ -334,7 +357,7 @@ def _gluon_aot_compile_k2(cfg, output_fp16, target_arch):
     src = GluonASTSource(
         fn=kernel2_gemm_dequant,
         signature=_gluon_k2_signature(output_fp16),
-        constexprs=_gluon_k2_constexprs(cfg, output_fp16),
+        constexprs=_gluon_k2_constexprs(cfg, output_fp16, epilogue_kind),
     )
     target = GPUTarget(backend='cuda', arch=target_arch, warp_size=32)
     return triton_compile(src, target=target,
@@ -679,8 +702,8 @@ def kernel1_convrot_quant(
 # W_q layout is [N, K] row-major ("NK"); the transpose is free via
 # smem.permute((1, 0)).  HAS_BIAS is compile-time True (the single shipped K2
 # cubin); no-bias plugin instances pass a workspace zero-bias vector.
-# OUTPUT_FP16 is a compile-time constexpr; the shipped cubin is FP32 output
-# (DTYPE_CONFIGS = [("FP32IO", False, False)]).
+# OUTPUT_FP16 and EPILOGUE_KIND are compile-time constexprs; selective
+# FP32/FP16 boundary and fused-epilogue cubins are emitted.
 #
 # Tuning grid (pinned, user-specified): BM∈{64,128}, BN∈{64,128},
 # BK∈{32,64}, stages(NUM_BUFS)∈{2,3} → 16 configs, all num_warps=8.
@@ -693,6 +716,7 @@ if GLUON_AVAILABLE:
     @gluon.jit
     def kernel2_gemm_dequant(
         X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
+        Aux0_ptr, Aux1_ptr, Aux2_ptr, Epsilon, RowsPerBatch, RowOffset, TotalRows,
         M, N, K, NUM_TILES,
         stride_xqm, stride_xqk,
         stride_xsm, stride_xsg,
@@ -701,6 +725,7 @@ if GLUON_AVAILABLE:
         BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr, BLOCK_K: gl.constexpr,
         GROUP_SIZE: gl.constexpr, GROUP_M: gl.constexpr, NUM_BUFS: gl.constexpr,
         FOLD_EVERY: gl.constexpr, HAS_BIAS: gl.constexpr, OUTPUT_FP16: gl.constexpr,
+        EPILOGUE_KIND: gl.constexpr,
     ):
         """K2 — Gluon gluon_pipe: persistent, multi-stage cp.async pipeline.
 
@@ -841,6 +866,51 @@ if GLUON_AVAILABLE:
                 bias = gl.load(Bias_ptr + rn_acc, cache_modifier=".ca")
                 acc += bias[None, :]
 
+            # Specialized output epilogues.  Q/K normalization is legal only
+            # for BN=128: one CTA owns exactly one complete attention head for
+            # every row in its M tile, so the RMS reduction is CTA-local.
+            if EPILOGUE_KIND == 1 or EPILOGUE_KIND == 2:
+                gl.static_assert(BLOCK_N == 128,
+                                 "Q/K RMSNorm epilogues require BLOCK_N=128")
+                rms = gl.sum(acc * acc, axis=1) / 128.0
+                inv_rms = gl.rsqrt(rms + Epsilon)
+                head_d = rn_acc % 128
+                gamma = gl.load(Aux0_ptr + head_d, cache_modifier=".ca")
+                acc = acc * inv_rms[:, None] * gamma[None, :]
+
+                if EPILOGUE_KIND == 2:
+                    # rotate_half(x) = concat(-x[...,64:], x[...,:64]).
+                    # gl.split operates on a trailing dimension of size two,
+                    # hence the reshape/permute pair around it.
+                    acc_halves = gl.reshape(acc, [BLOCK_M, 2, 64])
+                    acc_pairs = gl.permute(acc_halves, [0, 2, 1])
+                    acc_lo, acc_hi = gl.split(acc_pairs)
+                    rot_pairs = gl.join(-acc_hi, acc_lo)
+                    rotated = gl.reshape(
+                        gl.permute(rot_pairs, [0, 2, 1]), [BLOCK_M, 128])
+                    rotated = gl.convert_layout(rotated, mma_layout)
+                    global_row = gl.minimum(rm_acc + RowOffset, TotalRows - 1)
+                    rope_row = global_row % RowsPerBatch
+                    rope_off = rope_row[:, None] * 128 + head_d[None, :]
+                    rope_cos = gl.load(Aux1_ptr + rope_off, cache_modifier=".ca")
+                    rope_sin = gl.load(Aux2_ptr + rope_off, cache_modifier=".ca")
+                    acc = acc * rope_cos + rotated * rope_sin
+            elif EPILOGUE_KIND == 3:
+                residual = gl.load(
+                    Aux0_ptr + rm_acc[:, None] * N + rn_acc[None, :],
+                    cache_modifier=".ca")
+                acc += residual
+            elif EPILOGUE_KIND == 4:
+                residual = gl.load(
+                    Aux0_ptr + rm_acc[:, None] * N + rn_acc[None, :],
+                    cache_modifier=".ca")
+                global_row = gl.minimum(rm_acc + RowOffset, TotalRows - 1)
+                batch_idx = global_row // RowsPerBatch
+                gate = gl.load(
+                    Aux1_ptr + batch_idx[:, None] * N + rn_acc[None, :],
+                    cache_modifier=".ca")
+                acc = residual + acc * gate
+
             # Convert MMA-fragment-distributed accumulator to a coalesced
             # store layout (eliminates the FP32-output write-amplification tax).
             acc_store = gl.convert_layout(acc, store_layout)
@@ -899,11 +969,30 @@ TILE_NAME = "PersistentG256"
 #       pipeline, coalesced FP32 epilogue store, FOLD_EVERY int32-folded
 #       accumulation.  The K2 tuning grid is pinned to BM∈{64,128},
 #       BN∈{64,128}, BK∈{32,64}, stages∈{2,3} (num_warps=8), FP32 output.
-CONVROT_INT8_CUBIN_HEADER_VERSION = 8
+CONVROT_INT8_CUBIN_HEADER_VERSION = 9
 # K2 is always compiled with HAS_BIAS=True.  For no-bias ONNX layers, the C++
 # plugin passes a zero-filled FP32 bias vector from workspace.
 BIAS_CONFIGS = [("BIAS", True)]
-DTYPE_CONFIGS = [("FP32IO", False, False)]
+
+# K1 and K2 boundary dtypes are independent. K1 only reads the public
+# activation, while K2 only writes the public output; the internal boundary is
+# always X_q INT8 + X_scale FP32.  Keeping the inventories separate avoids
+# duplicating identical cubins merely to represent mixed FP32->FP16 and
+# FP16->FP32 plugin boundaries.
+INPUT_DTYPE_CONFIGS = [
+    ("FP32IN", False, 1),
+    ("FP16IN", True, 10),
+]
+
+# name, output_fp16, epilogue_kind, output ONNX dtype id
+K2_VARIANTS = [
+    ("PLAIN_FP32", False, EPILOGUE_PLAIN, 1),
+    ("PLAIN_FP16", True, EPILOGUE_PLAIN, 10),
+    ("QKNORM_FP16", True, EPILOGUE_QK_NORM, 10),
+    ("QKNORMROPE_FP16", True, EPILOGUE_QK_NORM_ROPE, 10),
+    ("RESIDUAL_FP32", False, EPILOGUE_RESIDUAL, 1),
+    ("GATEDRESIDUAL_FP32", False, EPILOGUE_GATED_RESIDUAL, 1),
+]
 # Real DiT decoder K2 shapes, expressed as (M, K, N).  M=3000 is not
 # divisible by all candidate BLOCK_M values; extract_k2 pads the benchmark M
 # to 3072 so the (unmasked) Gluon gluon_pipe K2 persistent tile loop can be
@@ -921,8 +1010,67 @@ AUTOTUNE_SHAPES_K2 = [
     (3000, 2560, 1024),  # dit.self_attn.k_proj
     (3000, 4096, 2560),  # dit.self_attn.o_proj
 ]
-K2_AUTOTUNE_M_ALIGNMENT = 128  # max generated K2 BLOCK_M; avoids OOB in the
-                                # unmasked Gluon gluon_pipe persistent tile loop
+K2_AUTOTUNE_M_ALIGNMENT = 128
+
+
+# ─── K2 shape families (fusion_analysis.md §10.2) ──────────────────────────
+# Each family covers a distinct GEMM geometry in the DiT decoder.  The
+# extractor benchmarks every applicable (variant, family) pair and emits a
+# separate cubin per pair.  At runtime, the C++ plugin selects the cubin
+# whose family_K / family_N matches the actual weight dimensions.
+#
+# K and N are weight-dimension constants (in_features / out_features) that
+# don't change at runtime, so an exact match is correct.  M is the runtime
+# sequence length and is handled by host-side padding.
+K2_SHAPE_FAMILIES = [
+    # (family_name,    M_real, K,     N,     M_align,  description)
+    ("GATE_UP",        3000,   2560,  9728,  128,      "mlp gate_proj / up_proj"),
+    ("DOWN",           3000,   9728,  2560,  128,      "mlp down_proj"),
+    ("SELF_Q",         3000,   2560,  4096,  128,      "self_attn q_proj"),
+    ("SELF_K",         3000,   2560,  1024,  128,      "self_attn k_proj"),
+    ("SELF_V",         3000,   2560,  1024,  128,      "self_attn v_proj"),
+    ("SELF_O",         3000,   4096,  2560,  128,      "self_attn o_proj"),
+    ("CROSS_Q",        3000,   2560,  4096,  128,      "cross_attn q_proj"),
+    ("CROSS_KV",       3000,   2560,  1024,  128,      "cross_attn k/v_proj"),
+    ("CROSS_O",        3000,   4096,  2560,  128,      "cross_attn o_proj"),
+    ("SMALL_M",        1,      2560,  2560,  128,      "time_embed / patch_embed M=1"),
+    ("PATCH_CONCAT",   1,      2560,  15360, 128,      "patch_embed_concat M=1 N=15360"),
+]
+
+
+def _k2_family_for_variant(variant_name: str) -> list:
+    """Return shape family names applicable to a K2 variant.
+
+    QK_NORM / QK_NORM_ROPE: self-attn Q and K only (head_dim=128, BN=128).
+    PLAIN_FP16: V, cross-Q, cross-K/V.
+    PLAIN_FP32: small embeddings.
+    RESIDUAL / GATED_RESIDUAL: O and down projections.
+    """
+    if variant_name in ("QKNORM_FP16", "QKNORMROPE_FP16"):
+        return ["SELF_Q", "SELF_K"]
+    if variant_name == "PLAIN_FP16":
+        return ["SELF_V", "CROSS_Q", "CROSS_KV"]
+    if variant_name == "PLAIN_FP32":
+        return ["SMALL_M", "PATCH_CONCAT"]
+    if variant_name in ("RESIDUAL_FP32", "GATEDRESIDUAL_FP32"):
+        return ["SELF_O", "CROSS_O", "DOWN"]
+    return []
+
+
+def _k2_configs_for_variant(variant_name: str) -> list:
+    """Return the spill-filtered tuning grid for a variant.
+
+    Uses the global _K2_CONFIGS list (populated and spill-filtered in main())
+    rather than re-estimating, so only configs that actually compile without
+    register spills are benchmarked.
+
+    QK_NORM / QK_NORM_ROPE: BN=128 mandatory (head-local RMSNorm requires a
+    complete 128-wide head in one CTA).
+    All others: full BM/BN ∈ {64, 128} grid.
+    """
+    if variant_name in ("QKNORM_FP16", "QKNORMROPE_FP16"):
+        return [c for c in _K2_CONFIGS if c.kwargs["BLOCK_N"] == 128]
+    return list(_K2_CONFIGS)
 
 # Patch review §H2: autotune grid must mirror the production launch geometry.
 #
@@ -1116,6 +1264,13 @@ _LAUNCH_ARG_ENUM = {
     "W_scale_ptr": "kW_scale_ptr",
     "Bias_ptr": "kBias_ptr",
     "Y_ptr": "kY_ptr",
+    "Aux0_ptr": "kAux0_ptr",
+    "Aux1_ptr": "kAux1_ptr",
+    "Aux2_ptr": "kAux2_ptr",
+    "Epsilon": "kEpsilon",
+    "RowsPerBatch": "kRowsPerBatch",
+    "RowOffset": "kRowOffset",
+    "TotalRows": "kTotalRows",
     "M": "kM",
     "N": "kN",
     "K": "kK",
@@ -1134,6 +1289,7 @@ _LAUNCH_ARG_ENUM = {
 
 _POINTER_ARG_NAMES = {
     "X_ptr", "X_q_ptr", "X_scale_ptr", "W_q_ptr", "W_scale_ptr", "Bias_ptr", "Y_ptr",
+    "Aux0_ptr", "Aux1_ptr", "Aux2_ptr",
 }
 
 _QUANT_ARG_NAMES = {
@@ -1143,6 +1299,7 @@ _QUANT_ARG_NAMES = {
 
 _GEMM_ARG_NAMES = {
     "X_q_ptr", "X_scale_ptr", "W_q_ptr", "W_scale_ptr", "Bias_ptr", "Y_ptr",
+    "Aux0_ptr", "Aux1_ptr", "Aux2_ptr", "Epsilon", "RowsPerBatch", "RowOffset", "TotalRows",
     "M", "N", "K", "NUM_TILES",
     "stride_xqm", "stride_xqk", "stride_xsm", "stride_xsg",
     "stride_wn", "stride_wk", "stride_ym", "stride_yn",
@@ -1266,7 +1423,8 @@ def _extract_kernel_abi(kernel, stage_name: str):
             raise RuntimeError(f"Argument {name} is not valid for {stage_name} launch stubs")
         if name in _POINTER_ARG_NAMES and kind != "ptr":
             raise RuntimeError(f"Expected pointer type for {name}, got {sig_type}")
-        if name not in _POINTER_ARG_NAMES and sig_type not in {"i32", "u32"}:
+        expected_scalars = {"fp32"} if name == "Epsilon" else {"i32", "u32"}
+        if name not in _POINTER_ARG_NAMES and sig_type not in expected_scalars:
             raise RuntimeError(f"Expected 32-bit scalar type for {name}, got {sig_type}")
         item["kind"] = kind
         item["enum"] = _LAUNCH_ARG_ENUM[name]
@@ -1685,13 +1843,14 @@ def _parallel_precompile_k1(configs, input_fp16):
         print(f"    [parallel-compile] Warning: parallel precompilation fallback ({e})", flush=True)
 
 
-def _init_k2_worker(output_fp16, target_arch):
+def _init_k2_worker(output_fp16, epilogue_kind, target_arch):
     import torch
     try:
         torch.set_num_threads(1)
     except Exception:
         pass
     _K2_WORKER_STATE.output_fp16 = output_fp16
+    _K2_WORKER_STATE.epilogue_kind = epilogue_kind
     _K2_WORKER_STATE.target_arch = target_arch
     # Gluon AOT compile (GluonASTSource) needs no device tensors — it compiles
     # from the signature/constexprs alone.  The dummy tensors below are kept
@@ -1713,7 +1872,9 @@ def _worker_precompile_k2(config_tuple):
     cfg, = config_tuple
     output_fp16 = _K2_WORKER_STATE.output_fp16
     try:
-        _gluon_aot_compile_k2(cfg, output_fp16, _K2_WORKER_STATE.target_arch)
+        _gluon_aot_compile_k2(
+            cfg, output_fp16, _K2_WORKER_STATE.target_arch,
+            _K2_WORKER_STATE.epilogue_kind)
     except Exception:
         # Compile failures are not fatal here — the spill filter and the
         # custom benchmarker both report them per-config.  Precompile is best
@@ -1722,7 +1883,7 @@ def _worker_precompile_k2(config_tuple):
     return 1
 
 
-def _parallel_precompile_k2(configs, output_fp16, target_arch):
+def _parallel_precompile_k2(configs, output_fp16, epilogue_kind, target_arch):
     if not GLUON_AVAILABLE:
         print("    [parallel-compile] K2 skipped: Gluon dialect unavailable", flush=True)
         return
@@ -1741,7 +1902,7 @@ def _parallel_precompile_k2(configs, output_fp16, target_arch):
         with ThreadPool(
             processes=num_workers,
             initializer=_init_k2_worker,
-            initargs=(output_fp16, target_arch)
+            initargs=(output_fp16, epilogue_kind, target_arch)
         ) as pool:
             for _ in pool.imap_unordered(_worker_precompile_k2, tuples, chunksize=1):
                 done += 1
@@ -1963,13 +2124,13 @@ def _spill_check_variants(stage):
     holds an extra (BLOCK_N,) fp32 tile in the epilogue, and FP16 IO changes
     both load widths and conversion sequences.  A config is only kept if it
     is spill-free in EVERY variant that will actually be extracted (per
-    shipped BIAS_CONFIGS × DTYPE_CONFIGS), otherwise a config could pass the gate on
+    shipped K2_VARIANTS), otherwise a config could pass the gate on
     the NOBIAS/FP32 variant and then spill in the BIAS variant that ships.
 
     Yields (label, signature, extra_constexprs) tuples.
     """
     if stage == "k1":
-        for dtype_suffix, input_fp16, _ in DTYPE_CONFIGS:
+        for dtype_suffix, input_fp16, _dtype_id in INPUT_DTYPE_CONFIGS:
             x_type = '*fp16' if input_fp16 else '*fp32'
             signature = {
                 'X_ptr': x_type, 'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32',
@@ -1991,11 +2152,12 @@ def _spill_check_variants(stage):
         # compile path and the AOT cubin-harvest path feed GluonASTSource an
         # identical, benchmark-proven signature.
         for bias_suffix, _has_bias in BIAS_CONFIGS:
-            for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
-                yield (f"{bias_suffix}_{dtype_suffix}",
+            for variant_name, output_fp16, epilogue_kind, _dtype_id in K2_VARIANTS:
+                yield (f"{bias_suffix}_{variant_name}",
                        _gluon_k2_signature(output_fp16),
                        {'GROUP_SIZE': 256, 'HAS_BIAS': True,
-                        'OUTPUT_FP16': output_fp16})
+                        'OUTPUT_FP16': output_fp16,
+                        'EPILOGUE_KIND': epilogue_kind})
 
 
 def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
@@ -2004,7 +2166,7 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
     ZERO TOLERANCE: any config with STACK > 0 (from cuobjdump) or any
     PTX-level ld.local/st.local is rejected.  No thresholds.
 
-    Every SHIPPED constexpr variant (currently bias-enabled K2 only × DTYPE_CONFIGS) is
+    Every SHIPPED constexpr variant (currently bias-enabled K2_VARIANTS) is
     checked — a config survives only if it is spill-free in all of them
     (see _spill_check_variants).
 
@@ -2177,7 +2339,8 @@ K2_BENCH_ITERS = int(os.environ.get("HOTSTEP_K2_BENCH_ITERS", "50"))
 K2_BENCH_TOPN = int(os.environ.get("HOTSTEP_K2_BENCH_TOPN", "5"))
 
 
-def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
+def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
+                         epilogue_kind=EPILOGUE_PLAIN):
     """Launch one K2 gluon_pipe config with the persistent production grid.
 
     The Gluon kernel is a persistent tile loop: it takes a NUM_TILES runtime
@@ -2187,7 +2350,7 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
     passed as kernel metadata; no @triton.autotune wrapping is involved.
     """
     _require_gluon_for_k2()
-    xq, xs, wq, ws, bias, y = tensors
+    xq, xs, wq, ws, bias, y, aux0, aux1, aux2 = tensors
     bm = cfg.kwargs["BLOCK_M"]
     bn = cfg.kwargs["BLOCK_N"]
     num_tiles = triton.cdiv(M, bm) * triton.cdiv(N, bn)
@@ -2204,12 +2367,14 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
         NUM_BUFS=_gluon_k2_num_bufs(cfg),
         FOLD_EVERY=_gluon_k2_fold_every(cfg),
         HAS_BIAS=True, OUTPUT_FP16=output_fp16,
+        EPILOGUE_KIND=epilogue_kind,
         num_warps=cfg.num_warps,
     )
     # Gluon pipelined kernel arg order (matches the kernel signature):
     #   xq, xs, wq, ws, bias, y, M, N, K, NUM_TILES, <strides...>
     kernel2_gemm_dequant[grid](
         xq, xs, wq, ws, bias, y,
+        aux0, aux1, aux2, 1.0e-6, M, 0, M,
         M, N, K, num_tiles,
         K, 1,          # X_q [M, K] row-major
         1, M,          # X_scale [n_groups, M]
@@ -2221,7 +2386,7 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
 
 
 def _bench_k2_config(cfg, tensors, M, N, K, num_sms, output_fp16,
-                     warmup=None, iters=None):
+                     epilogue_kind=EPILOGUE_PLAIN, warmup=None, iters=None):
     """Time a single K2 config with warmup + CUDA events, returning (ms, grid).
 
     Mirrors ``benchmark_k2_tuning_space_hybrid.py``'s per-config loop: one
@@ -2239,24 +2404,25 @@ def _bench_k2_config(cfg, tensors, M, N, K, num_sms, output_fp16,
         iters = K2_BENCH_ITERS
 
     # 1 compile-and-launch call to force JIT + cache population.
-    grid_x = _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+    grid_x = _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16, epilogue_kind)
     torch.cuda.synchronize()
     for _ in range(warmup):
-        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16, epilogue_kind)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16, epilogue_kind)
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / iters
     return ms, grid_x
 
 
-def _bench_k2_configs_custom(configs, tensors, M, N, K, num_sms, output_fp16):
+def _bench_k2_configs_custom(configs, tensors, M, N, K, num_sms, output_fp16,
+                             epilogue_kind=EPILOGUE_PLAIN):
     """Custom-benchmark every config and return (best_cfg, results_sorted).
 
     ``results_sorted`` is a list of ``(cfg, ms, grid_x, error)`` tuples ordered
@@ -2277,7 +2443,8 @@ def _bench_k2_configs_custom(configs, tensors, M, N, K, num_sms, output_fp16):
 
     for i, cfg in enumerate(configs, start=1):
         try:
-            ms, grid_x = _bench_k2_config(cfg, tensors, M, N, K, num_sms, output_fp16)
+            ms, grid_x = _bench_k2_config(
+                cfg, tensors, M, N, K, num_sms, output_fp16, epilogue_kind)
             results.append((cfg, ms, grid_x, None))
         except Exception as e:
             results.append((cfg, float("inf"), 0, f"{type(e).__name__}: {e}"))
@@ -2316,7 +2483,7 @@ def extract_k1(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
     results = {}
     if num_sms == 0:
         num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    for dtype_suffix, input_fp16, _ in DTYPE_CONFIGS:
+    for dtype_suffix, input_fp16, _dtype_id in INPUT_DTYPE_CONFIGS:
         print(f"\n  K1 G256 {dtype_suffix} (autotuning)...", flush=True)
         _parallel_precompile_k1(_K1_CONFIGS, input_fp16)
         dtype = torch.float16 if input_fp16 else torch.float32
@@ -2416,137 +2583,131 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
     # BIAS_CONFIGS).  We still iterate BIAS_CONFIGS so the label scheme in the
     # extraction summary and the generated cubin lookup stays uniform.
     for bias_suffix, _has_bias in BIAS_CONFIGS:
-        for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
-            config_name = f"{bias_suffix}_{dtype_suffix}"
-            print(f"\n  K2 G256 {config_name} (gluon_pipe custom-bench selection)...", flush=True)
-            _parallel_precompile_k2(_K2_CONFIGS, output_fp16, arch)
+        for variant_name, output_fp16, epilogue_kind, _output_dtype_id in K2_VARIANTS:
+            families = _k2_family_for_variant(variant_name)
+            if not families:
+                print(f"\n  K2 G256 {bias_suffix}_{variant_name}: no applicable shape families, skipping", flush=True)
+                continue
+            variant_configs = _k2_configs_for_variant(variant_name)
+            _parallel_precompile_k2(variant_configs, output_fp16, epilogue_kind, arch)
             out_dtype = torch.float16 if output_fp16 else torch.float32
-            M_real, K, N = AUTOTUNE_SHAPES_K2[0]
+
+            for family_name, M_real, K, N, M_align, desc in K2_SHAPE_FAMILIES:
+                if family_name not in families:
+                    continue
+                config_name = f"{bias_suffix}_{variant_name}_{family_name}"
+                print(f"\n  K2 G256 {config_name} ({desc})", flush=True)
             # Plain K2 has no M masks.  Autotune the same production-like work
             # with M padded to the largest generated BLOCK_M so every candidate
             # can run safely; this mirrors the plugin's host-side padding while
             # keeping the benchmark within 2.4% of M=3000.
-            M = ((M_real + K2_AUTOTUNE_M_ALIGNMENT - 1) // K2_AUTOTUNE_M_ALIGNMENT) * K2_AUTOTUNE_M_ALIGNMENT
-            if M != M_real:
-                print(f"    [K2 autotune] primary shape M={M_real}, K={K}, N={N}; "
-                      f"using padded M={M} for unmasked Gluon gluon_pipe K2 safety", flush=True)
-            xq = torch.randint(-127, 128, (M, K), device="cuda", dtype=torch.int8)
-            n_groups = K // GROUP_SIZE
-            xs = torch.rand((n_groups, M), device="cuda", dtype=torch.float32) * 0.02 + 0.001
-            # W_q is [N, K] row-major (canonical Linear layout).  The Gluon
-            # gluon_pipe K2 kernel handles the transpose in-kernel via a free
-            # smem.permute((1, 0)) on the [N, K] shared-memory view (no tl.trans,
-            # no extra copy), so nothing about the exported weight layout
-            # changes.
-            wq = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
-            ws = torch.rand((N,), device="cuda", dtype=torch.float32) * 0.02 + 0.001
-            # HAS_BIAS is hardwired True in the shipped cubin; always pass a
-            # real bias tensor to autotune so the fused epilogue is measured.
-            bias = torch.randn((N,), device="cuda", dtype=torch.float32)
-            y = torch.empty((M, N), device="cuda", dtype=out_dtype)
-            # Bypass Triton's @autotune measurement (its internal do_bench is
-            # too noisy at the ~2% level, causing mis-ranking of adjacent K2
-            # configs) and use the fixed-budget CUDA-event benchmark loop
-            # from ``benchmark_k2_tuning_space_hybrid.py`` instead.  Every
-            # config is launched at its per-config occupancy-scaled grid
-            # (see ``_autotune_grid_x_for_k2`` for the geometry rationale).
-            tensors = (xq, xs, wq, ws, bias, y)
-            best_cfg, bench_results = _bench_k2_configs_custom(
-                _K2_CONFIGS, tensors, M, N, K, num_sms, output_fp16)
-            if best_cfg is None:
-                raise SystemExit(
-                    f"[custom-bench] K2 {config_name}: no config successfully "
-                    f"benchmarked. Config space was likely rejected wholesale "
-                    f"by the spill filter — check the [spill-check] log above."
+                M = ((M_real + M_align - 1) // M_align) * M_align
+                if M != M_real:
+                    print(f"    [K2 autotune] family={family_name} M={M_real}, K={K}, N={N}; "
+                          f"using padded M={M} for unmasked Gluon gluon_pipe K2 safety", flush=True)
+                xq = torch.randint(-127, 128, (M, K), device="cuda", dtype=torch.int8)
+                n_groups = K // GROUP_SIZE
+                xs = torch.rand((n_groups, M), device="cuda", dtype=torch.float32) * 0.02 + 0.001
+                wq = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
+                ws = torch.rand((N,), device="cuda", dtype=torch.float32) * 0.02 + 0.001
+                bias = torch.randn((N,), device="cuda", dtype=torch.float32)
+                y = torch.empty((M, N), device="cuda", dtype=out_dtype)
+                aux0 = torch.randn((M, N), device="cuda", dtype=torch.float32)
+                aux1 = torch.randn((max(M * 128, N),), device="cuda", dtype=torch.float32)
+                aux2 = torch.randn((M * 128,), device="cuda", dtype=torch.float32)
+                tensors = (xq, xs, wq, ws, bias, y, aux0, aux1, aux2)
+                best_cfg, bench_results = _bench_k2_configs_custom(
+                    variant_configs, tensors, M, N, K, num_sms, output_fp16,
+                    epilogue_kind)
+                if best_cfg is None:
+                    raise SystemExit(
+                        f"[custom-bench] K2 {config_name}: no config successfully "
+                        f"benchmarked. Config space was likely rejected wholesale "
+                        f"by the spill filter — check the [spill-check] log above."
+                    )
+                _print_k2_bench_topn(bench_results, M, K, N)
+
+                kernel = _gluon_aot_compile_k2(
+                    best_cfg, output_fp16, arch, epilogue_kind)
+                cache_dir = _get_kernel_cache_dir(kernel)
+
+                block_m = best_cfg.kwargs["BLOCK_M"]
+                block_n = best_cfg.kwargs["BLOCK_N"]
+                block_k_winning = best_cfg.kwargs["BLOCK_K"]
+                group_m = best_cfg.kwargs["GROUP_M"]
+                nw = best_cfg.num_warps
+                ns = best_cfg.num_stages
+                mr = getattr(best_cfg, "maxnreg", None)
+                cubin = kernel.asm["cubin"]
+                shared = kernel.metadata.shared
+                if K2_MAX_SHARED_BYTES > 0 and int(shared) > K2_MAX_SHARED_BYTES:
+                    raise SystemExit(
+                        f"[shared-check] K2 {config_name} custom-bench winner uses shared={int(shared)}B "
+                        f"> K2_MAX_SHARED_BYTES={K2_MAX_SHARED_BYTES}B. Refusing to write a "
+                        f"high-shared 1-CTA/SM cubin into the generated header; adjust the config "
+                        f"space or set HOTSTEP_K2_MAX_SHARED_BYTES=0 for experiments."
+                    )
+                abi = _extract_kernel_abi(kernel, "gemm")
+
+                spill_info = _detect_spills(kernel, abi["function_name"])
+                if spill_info["spilling"]:
+                    raise SystemExit(
+                        f"[spill-check] K2 {config_name} custom-bench winner SPILLS "
+                        f"({spill_info['method']}: local_bytes={spill_info['local_bytes']}, "
+                        f"ptx_spills={spill_info['ptx_spills']}, regs={spill_info['registers']}). "
+                        f"Config: BM={block_m} BN={block_n} BK={block_k_winning} "
+                        f"GM={group_m} W={nw} S={ns} MR={mr}. "
+                        f"Zero tolerance: refusing to write a spilling cubin into "
+                        f"the generated header."
+                    )
+                spill_status = f"no spills ({spill_info['method']}, regs={spill_info['registers']})"
+
+                occ_ctas = _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(best_cfg))
+                occ_note = f", occupancy={occ_ctas} CTA/SM" if occ_ctas else ""
+                win_row = next(((c, ms, g) for c, ms, g, e in bench_results
+                                if c is best_cfg and e is None), None)
+                win_note = ""
+                if win_row is not None:
+                    real_ops = 2.0 * M * K * N
+                    _, win_ms, win_grid = win_row
+                    win_tops = real_ops / (win_ms * 1e-3) / 1e12
+                    win_note = f", {win_ms:.4f} ms, {win_tops:.2f} TOPS, grid={win_grid}"
+                print(f"  -> Custom-bench winner: BM={block_m} BN={block_n} BK={block_k_winning} GM={group_m} "
+                      f"W={nw} S={ns} MR={mr}{occ_note}{win_note}", flush=True)
+                print(
+                    f"     shared={shared/1024:.0f}KB, cubin={len(cubin)}B, "
+                    f"runtime_args={len(abi['runtime_signature'])}, scratch_ptrs={abi['scratch_ptr_count']}, "
+                    f"reqntid={abi['block']}, {spill_status}",
+                    flush=True,
                 )
-            _print_k2_bench_topn(bench_results, M, K, N)
-
-            # AOT-compile the picked winner via GluonASTSource to harvest its
-            # cubin directly (the Gluon kernel has no @triton.autotune cache to
-            # walk, unlike the old hybrid_direct path).  The custom bench
-            # already ran the winner, so this recompile is a cache hit and
-            # yields the CompiledKernel for header emission, ABI extraction and
-            # spill validation.
-            kernel = _gluon_aot_compile_k2(best_cfg, output_fp16, arch)
-            cache_dir = _get_kernel_cache_dir(kernel)
-
-            block_m = best_cfg.kwargs["BLOCK_M"]
-            block_n = best_cfg.kwargs["BLOCK_N"]
-            block_k_winning = best_cfg.kwargs["BLOCK_K"]
-            group_m = best_cfg.kwargs["GROUP_M"]
-            nw = best_cfg.num_warps
-            ns = best_cfg.num_stages
-            mr = getattr(best_cfg, "maxnreg", None)
-            cubin = kernel.asm["cubin"]
-            shared = kernel.metadata.shared
-            if K2_MAX_SHARED_BYTES > 0 and int(shared) > K2_MAX_SHARED_BYTES:
-                raise SystemExit(
-                    f"[shared-check] K2 {config_name} custom-bench winner uses shared={int(shared)}B "
-                    f"> K2_MAX_SHARED_BYTES={K2_MAX_SHARED_BYTES}B. Refusing to write a "
-                    f"high-shared 1-CTA/SM cubin into the generated header; adjust the config "
-                    f"space or set HOTSTEP_K2_MAX_SHARED_BYTES=0 for experiments."
-                )
-            abi = _extract_kernel_abi(kernel, "gemm")
-
-            # Post-autotune spill validation: authoritative cuobjdump check
-            # on the exact winning cubin, fatal on spill (see extract_k1).
-            spill_info = _detect_spills(kernel, abi["function_name"])
-            if spill_info["spilling"]:
-                raise SystemExit(
-                    f"[spill-check] K2 {config_name} custom-bench winner SPILLS "
-                    f"({spill_info['method']}: local_bytes={spill_info['local_bytes']}, "
-                    f"ptx_spills={spill_info['ptx_spills']}, regs={spill_info['registers']}). "
-                    f"Config: BM={block_m} BN={block_n} BK={block_k_winning} "
-                    f"GM={group_m} W={nw} S={ns} MR={mr}. "
-                    f"Zero tolerance: refusing to write a spilling cubin into "
-                    f"the generated header."
-                )
-            spill_status = f"no spills ({spill_info['method']}, regs={spill_info['registers']})"
-
-            occ_ctas = _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(best_cfg))
-            occ_note = f", occupancy={occ_ctas} CTA/SM" if occ_ctas else ""
-            # Winning ms/TOPS from the custom bench are recorded so the
-            # summary log shows the exact per-launch time that drove the
-            # selection.
-            win_row = next(((c, ms, g) for c, ms, g, e in bench_results
-                            if c is best_cfg and e is None), None)
-            win_note = ""
-            if win_row is not None:
-                real_ops = 2.0 * M * K * N
-                _, win_ms, win_grid = win_row
-                win_tops = real_ops / (win_ms * 1e-3) / 1e12
-                win_note = f", {win_ms:.4f} ms, {win_tops:.2f} TOPS, grid={win_grid}"
-            print(f"  -> Custom-bench winner: BM={block_m} BN={block_n} BK={block_k_winning} GM={group_m} "
-                  f"W={nw} S={ns} MR={mr}{occ_note}{win_note}", flush=True)
-            print(
-                f"     shared={shared/1024:.0f}KB, cubin={len(cubin)}B, "
-                f"runtime_args={len(abi['runtime_signature'])}, scratch_ptrs={abi['scratch_ptr_count']}, "
-                f"reqntid={abi['block']}, {spill_status}",
-                flush=True,
-            )
-            if cache_dir is not None:
-                print(f"     cache_dir: {cache_dir}", flush=True)
-                print(f"       (PTX/IR for diagnosis: "
-                      f"{Path(cache_dir) / (abi['function_name'] + '.ptx')} , "
-                      f"{Path(cache_dir) / (abi['function_name'] + '.ttgir')})",
-                      flush=True)
-            else:
-                print("     cache_dir: <unavailable — set HOTSTEP_TRITON_CACHE_DEBUG=1>",
-                      flush=True)
-            results[config_name] = {
-                "cubin": cubin,
-                "shared": shared,
-                "block_m": int(block_m),
-                "block_n": int(block_n),
-                "block_k": int(block_k_winning),
-                "group_m": int(group_m),
-                "num_warps": nw,
-                "num_stages": ns,
-                "maxnreg": mr,
-                "abi": abi,
-                "cache_dir": str(cache_dir) if cache_dir is not None else None,
-                "function_name": abi["function_name"],
-            }
+                if cache_dir is not None:
+                    print(f"     cache_dir: {cache_dir}", flush=True)
+                    print(f"       (PTX/IR for diagnosis: "
+                          f"{Path(cache_dir) / (abi['function_name'] + '.ptx')} , "
+                          f"{Path(cache_dir) / (abi['function_name'] + '.ttgir')})",
+                          flush=True)
+                else:
+                    print("     cache_dir: <unavailable — set HOTSTEP_TRITON_CACHE_DEBUG=1>",
+                          flush=True)
+                results[config_name] = {
+                    "cubin": cubin,
+                    "shared": shared,
+                    "block_m": int(block_m),
+                    "block_n": int(block_n),
+                    "block_k": int(block_k_winning),
+                    "group_m": int(group_m),
+                    "num_warps": nw,
+                    "num_stages": ns,
+                    "maxnreg": mr,
+                    "abi": abi,
+                    "cache_dir": str(cache_dir) if cache_dir is not None else None,
+                    "function_name": abi["function_name"],
+                    "epilogue_kind": int(epilogue_kind),
+                    "output_dtype_id": int(_output_dtype_id),
+                    "family_name": family_name,
+                    "family_K": int(K),
+                    "family_N": int(N),
+                }
     return results
 
 
@@ -2565,8 +2726,10 @@ def _format_cubin_as_c_array(cubin_bytes: bytes) -> list[str]:
 
 def write_header(k1_results, k2_results, output_path):
     max_scratch_ptrs = max(
-        [k1_results[d]["abi"]["scratch_ptr_count"] for d, _, _ in DTYPE_CONFIGS]
-        + [k2_results[f"{b}_{d}"]["abi"]["scratch_ptr_count"] for b, _ in BIAS_CONFIGS for d, _, _ in DTYPE_CONFIGS],
+        [k1_results[d]["abi"]["scratch_ptr_count"]
+         for d, _, _ in INPUT_DTYPE_CONFIGS]
+        + [k2_results[k]["abi"]["scratch_ptr_count"]
+           for k in k2_results],
         default=0,
     )
 
@@ -2588,8 +2751,10 @@ def write_header(k1_results, k2_results, output_path):
         f"#define CONVROT_INT8_TRITON_ABI_TRAILING_SCRATCH_PTRS {max_scratch_ptrs}",
         "",
     ]
-    for dtype_suffix, _, _ in DTYPE_CONFIGS:
-        header_lines.append(f"#define CONVROT_INT8_HAS_DTYPE_{dtype_suffix} 1")
+    for dtype_suffix, _, _ in INPUT_DTYPE_CONFIGS:
+        header_lines.append(f"#define CONVROT_INT8_HAS_INPUT_{dtype_suffix} 1")
+    for variant_name, _, _, _ in K2_VARIANTS:
+        header_lines.append(f"#define CONVROT_INT8_HAS_K2_{variant_name} 1")
     header_lines.append("#define CONVROT_INT8_HAS_M1_SPECIALIZED 0")
     header_lines.append("")
 
@@ -2625,7 +2790,7 @@ def write_header(k1_results, k2_results, output_path):
         header_lines.append(f"constexpr int {prefix}_{cn}_RUNTIME_PARAM_COUNT = {len(r['abi']['runtime_signature'])};")
         header_lines.append(f"constexpr int {prefix}_{cn}_SCRATCH_PTR_COUNT = {int(r['abi']['scratch_ptr_count'])};")
 
-    for dtype_suffix, _, _ in DTYPE_CONFIGS:
+    for dtype_suffix, _input_fp16, input_dtype_id in INPUT_DTYPE_CONFIGS:
         r = k1_results[dtype_suffix]
         cn = f"K1_{TILE_NAME}_G{GROUP_SIZE}_{dtype_suffix}"
         prefix = "kCONVROT_INT8_KERNEL1"
@@ -2636,8 +2801,9 @@ def write_header(k1_results, k2_results, output_path):
         header_lines += ["};", ""]
         arg_symbol = f"kCONVROT_INT8_RUNTIME_ARGS_{cn}"
         emit_runtime_arg_array(arg_symbol, r["abi"]["runtime_signature"])
-        input_dtype_id = 10 if dtype_suffix == "FP16IO" else 1
-        output_dtype_id = input_dtype_id
+        # K1 is selected by public input dtype only. Its outputs are always
+        # internal INT8 + FP32 scales, so output_dtype_id is a wildcard.
+        output_dtype_id = -1
         block_x, block_y, block_z = r["abi"]["block"]
         desc_entries.append({
             "name": f"CONVROT_{cn}",
@@ -2649,6 +2815,7 @@ def write_header(k1_results, k2_results, output_path):
             "has_bias": "false",
             "input_dtype": input_dtype_id,
             "output_dtype": output_dtype_id,
+            "epilogue_kind": EPILOGUE_PLAIN,
             "block_m": int(r['block_m']),
             "block_n": 1,
             "block_k": int(r['block_k']),
@@ -2667,48 +2834,58 @@ def write_header(k1_results, k2_results, output_path):
         total += 1
 
     for bias_suffix, has_bias in BIAS_CONFIGS:
-        for dtype_suffix, _, _ in DTYPE_CONFIGS:
-            r = k2_results[f"{bias_suffix}_{dtype_suffix}"]
-            cn = f"K2_{TILE_NAME}_G{GROUP_SIZE}_{bias_suffix}_{dtype_suffix}"
-            prefix = "kCONVROT_INT8_KERNEL2"
-            emit_common_constants(prefix, cn, r)
-            header_lines.append(f"constexpr int {prefix}_{cn}_BLOCK_N = {r['block_n']};")
-            header_lines.append(f"constexpr int {prefix}_{cn}_BLOCK_K = {r.get('block_k', DEFAULT_BLOCK_K)};")
-            header_lines.append(f"constexpr int {prefix}_{cn}_GROUP_M = {r.get('group_m', -1)};")
-            header_lines.append(f"alignas(16) constexpr unsigned char {prefix}_{cn}[] = {{")
-            header_lines.extend(_format_cubin_as_c_array(r['cubin']))
-            header_lines += ["};", ""]
-            arg_symbol = f"kCONVROT_INT8_RUNTIME_ARGS_{cn}"
-            emit_runtime_arg_array(arg_symbol, r["abi"]["runtime_signature"])
-            input_dtype_id = 10 if dtype_suffix == "FP16IO" else 1
-            output_dtype_id = input_dtype_id
-            block_x, block_y, block_z = r["abi"]["block"]
-            desc_entries.append({
-                "name": f"CONVROT_{cn}",
-                "array": f"{prefix}_{cn}",
-                "size": f"{prefix}_{cn}_SIZE",
-                "stage": "ConvRotKernelStage::kGemm",
-                "function": r["abi"]["function_name"],
-                "group_size": GROUP_SIZE,
-                "has_bias": "true" if has_bias else "false",
-                "input_dtype": input_dtype_id,
-                "output_dtype": output_dtype_id,
-                "block_m": int(r['block_m']),
-                "block_n": int(r['block_n']),
-                "block_k": int(r.get('block_k', DEFAULT_BLOCK_K)),
-                "group_m": int(r.get('group_m', -1)),
-                "block_x": block_x,
-                "block_y": block_y,
-                "block_z": block_z,
-                "shared": int(r['shared']),
-                "num_warps": int(r['num_warps']),
-                "num_stages": int(r.get('num_stages', -1)),
-                "maxnreg": maxnreg_value(r),
-                "runtime_args": arg_symbol,
-                "runtime_arg_count": len(r["abi"]["runtime_signature"]),
-                "scratch_ptr_count": int(r["abi"]["scratch_ptr_count"]),
-            })
-            total += 1
+        for variant_name, _output_fp16, epilogue_kind, output_dtype_id in K2_VARIANTS:
+            families = _k2_family_for_variant(variant_name)
+            for family_name, M_real, K_fam, N_fam, M_align, _desc in K2_SHAPE_FAMILIES:
+                if family_name not in families:
+                    continue
+                result_key = f"{bias_suffix}_{variant_name}_{family_name}"
+                if result_key not in k2_results:
+                    continue
+                r = k2_results[result_key]
+                cn = f"K2_{TILE_NAME}_G{GROUP_SIZE}_{bias_suffix}_{variant_name}_{family_name}"
+                prefix = "kCONVROT_INT8_KERNEL2"
+                emit_common_constants(prefix, cn, r)
+                header_lines.append(f"constexpr int {prefix}_{cn}_BLOCK_N = {r['block_n']};")
+                header_lines.append(f"constexpr int {prefix}_{cn}_BLOCK_K = {r.get('block_k', DEFAULT_BLOCK_K)};")
+                header_lines.append(f"constexpr int {prefix}_{cn}_GROUP_M = {r.get('group_m', -1)};")
+                header_lines.append(f"alignas(16) constexpr unsigned char {prefix}_{cn}[] = {{")
+                header_lines.extend(_format_cubin_as_c_array(r['cubin']))
+                header_lines += ["};", ""]
+                arg_symbol = f"kCONVROT_INT8_RUNTIME_ARGS_{cn}"
+                emit_runtime_arg_array(arg_symbol, r["abi"]["runtime_signature"])
+                # K2 is selected by output dtype + epilogue kind + shape family.
+                input_dtype_id = -1
+                block_x, block_y, block_z = r["abi"]["block"]
+                desc_entries.append({
+                    "name": f"CONVROT_{cn}",
+                    "array": f"{prefix}_{cn}",
+                    "size": f"{prefix}_{cn}_SIZE",
+                    "stage": "ConvRotKernelStage::kGemm",
+                    "function": r["abi"]["function_name"],
+                    "group_size": GROUP_SIZE,
+                    "has_bias": "true" if has_bias else "false",
+                    "input_dtype": input_dtype_id,
+                    "output_dtype": output_dtype_id,
+                    "epilogue_kind": int(epilogue_kind),
+                    "family_K": int(K_fam),
+                    "family_N": int(N_fam),
+                    "block_m": int(r['block_m']),
+                    "block_n": int(r['block_n']),
+                    "block_k": int(r.get('block_k', DEFAULT_BLOCK_K)),
+                    "group_m": int(r.get('group_m', -1)),
+                    "block_x": block_x,
+                    "block_y": block_y,
+                    "block_z": block_z,
+                    "shared": int(r['shared']),
+                    "num_warps": int(r['num_warps']),
+                    "num_stages": int(r.get('num_stages', -1)),
+                    "maxnreg": maxnreg_value(r),
+                    "runtime_args": arg_symbol,
+                    "runtime_arg_count": len(r["abi"]["runtime_signature"]),
+                    "scratch_ptr_count": int(r["abi"]["scratch_ptr_count"]),
+                })
+                total += 1
 
     header_lines += [
         "namespace hotstep::convrot_int8_generated {",
@@ -2736,8 +2913,11 @@ def write_header(k1_results, k2_results, output_path):
         "    ConvRotKernelStage stage;",
         "    int32_t group_size;",
         "    bool has_bias;",
-        "    int32_t input_dtype_id;",
-        "    int32_t output_dtype_id;",
+        "    int32_t input_dtype_id;   // -1 = stage does not depend on input dtype",
+        "    int32_t output_dtype_id;  // -1 = stage does not depend on output dtype",
+        "    int32_t epilogue_kind;",
+        "    int32_t family_K;         // K2 only: benchmarked K (in_features); -1 = any",
+        "    int32_t family_N;         // K2 only: benchmarked N (out_features); -1 = any",
         "    int32_t block_m;",
         "    int32_t block_n;",
         "    int32_t block_k;",
@@ -2754,7 +2934,7 @@ def write_header(k1_results, k2_results, output_path):
         "    uint32_t trailing_scratch_ptr_count;",
         "};",
         "",
-        "inline constexpr size_t kConvRotMaxLaunchParams = 25;",
+        "inline constexpr size_t kConvRotMaxLaunchParams = 32;",
         "",
     ]
     header_lines.extend(runtime_arg_arrays)
@@ -2765,7 +2945,8 @@ def write_header(k1_results, k2_results, output_path):
             "    {" +
             f'"{d["name"]}", {d["array"]}, {d["size"]}, "{d["function"]}", ' +
             f'{d["stage"]}, {d["group_size"]}, {d["has_bias"]}, ' +
-            f'{d["input_dtype"]}, {d["output_dtype"]}, ' +
+            f'{d["input_dtype"]}, {d["output_dtype"]}, {d["epilogue_kind"]}, ' +
+            f'{d.get("family_K", -1)}, {d.get("family_N", -1)}, ' +
             f'{d["block_m"]}, {d["block_n"]}, {d["block_k"]}, {d["group_m"]}, ' +
             f'{d["block_x"]}u, {d["block_y"]}u, {d["block_z"]}u, ' +
             f'{d["shared"]}, {d["num_warps"]}, {d["num_stages"]}, {d["maxnreg"]}, ' +
@@ -2779,16 +2960,31 @@ def write_header(k1_results, k2_results, output_path):
         "",
         "inline constexpr ConvRotCubinDesc const* findConvRotCubin(",
         "    ConvRotKernelStage stage, int32_t group_size, bool has_bias,",
-        "    int32_t input_dtype_id, int32_t output_dtype_id) {",
+        "    int32_t input_dtype_id, int32_t output_dtype_id, int32_t epilogue_kind,",
+        "    int32_t K = -1, int32_t N = -1) {",
+        "    ConvRotCubinDesc const* best = nullptr;",
+        "    ConvRotCubinDesc const* fallback = nullptr;",
         "    for (size_t i = 0; i < kConvRotCubinCount; ++i) {",
         "        ConvRotCubinDesc const& d = kConvRotCubins[i];",
-        "        if (d.stage == stage && d.group_size == group_size &&",
-        "            d.has_bias == has_bias && d.input_dtype_id == input_dtype_id &&",
-        "            d.output_dtype_id == output_dtype_id) {",
-        "            return &d;",
+        "        bool const input_match = d.input_dtype_id < 0 || d.input_dtype_id == input_dtype_id;",
+        "        bool const output_match = d.output_dtype_id < 0 || d.output_dtype_id == output_dtype_id;",
+        "        bool const base_match = d.stage == stage && d.group_size == group_size &&",
+        "            d.has_bias == has_bias && input_match && output_match &&",
+        "            d.epilogue_kind == epilogue_kind;",
+        "        if (!base_match) continue;",
+        "        bool const k_match = d.family_K < 0 || K < 0 || d.family_K == K;",
+        "        bool const n_match = d.family_N < 0 || N < 0 || d.family_N == N;",
+        "        if (k_match && n_match) {",
+        "            if (best == nullptr) { best = &d; }",
+        "            else if ((d.family_K >= 0 && best->family_K < 0) ||",
+        "                     (d.family_N >= 0 && best->family_N < 0)) { best = &d; }",
         "        }",
+        "        // Track first base match as fallback for layers whose (K,N)",
+        "        // doesn't match any benchmarked shape family (e.g. small",
+        "        // embedding layers with K=256).",
+        "        if (fallback == nullptr) { fallback = &d; }",
         "    }",
-        "    return nullptr;",
+        "    return best != nullptr ? best : fallback;",
         "}",
         "",
         "inline uint32_t ceilDivU32(int32_t x, int32_t y) {",
@@ -2885,7 +3081,9 @@ def write_header(k1_results, k2_results, output_path):
         "inline void* selectGemmLaunchParam(",
         "    ConvRotLaunchArgId id,",
         "    void*& xq_ptr, void*& xs_ptr, void*& wq_param, void*& ws_param, void*& bias_param, void*& y_ptr,",
-        "    int32_t& M, int32_t& N, int32_t& K, int32_t& num_tiles,",
+        "    void*& aux0_param, void*& aux1_param, void*& aux2_param, float& epsilon,",
+        "    int32_t& rows_per_batch, int32_t& row_offset, int32_t& total_rows,",
+        "    int32_t& M, int32_t& N, int32_t& K, int32_t& num_tiles,"
         "    int32_t& stride_xqm, int32_t& stride_xqk,",
         "    int32_t& stride_xsm, int32_t& stride_xsg,",
         "    int32_t& stride_wn, int32_t& stride_wk,",
@@ -2897,6 +3095,13 @@ def write_header(k1_results, k2_results, output_path):
         "        case ConvRotLaunchArgId::kW_scale_ptr: return &ws_param;",
         "        case ConvRotLaunchArgId::kBias_ptr: return &bias_param;",
         "        case ConvRotLaunchArgId::kY_ptr: return &y_ptr;",
+        "        case ConvRotLaunchArgId::kAux0_ptr: return &aux0_param;",
+        "        case ConvRotLaunchArgId::kAux1_ptr: return &aux1_param;",
+        "        case ConvRotLaunchArgId::kAux2_ptr: return &aux2_param;",
+        "        case ConvRotLaunchArgId::kEpsilon: return &epsilon;",
+        "        case ConvRotLaunchArgId::kRowsPerBatch: return &rows_per_batch;",
+        "        case ConvRotLaunchArgId::kRowOffset: return &row_offset;",
+        "        case ConvRotLaunchArgId::kTotalRows: return &total_rows;",
         "        case ConvRotLaunchArgId::kM: return &M;",
         "        case ConvRotLaunchArgId::kN: return &N;",
         "        case ConvRotLaunchArgId::kK: return &K;",
@@ -2963,6 +3168,8 @@ def write_header(k1_results, k2_results, output_path):
         "    ConvRotCubinDesc const& d, CUfunction func, CUstream stream,",
         "    void* xq_ptr, void* xs_ptr, int8_t const* wq_ptr,",
         "    float const* ws_ptr, void const* bias_ptr, void* y_ptr,",
+        "    void const* aux0_ptr, void const* aux1_ptr, void const* aux2_ptr, float epsilon,",
+        "    int32_t rows_per_batch, int32_t row_offset, int32_t total_rows,",
         "    int32_t M, int32_t N, int32_t K, int32_t num_sms,",
         "    int32_t stride_xqm, int32_t stride_xqk,",
         "    int32_t stride_xsm, int32_t stride_xsg,",
@@ -2978,6 +3185,9 @@ def write_header(k1_results, k2_results, output_path):
         "    void* wq_param = const_cast<int8_t*>(wq_ptr);",
         "    void* ws_param = const_cast<float*>(ws_ptr);",
         "    void* bias_param = const_cast<void*>(bias_ptr);",
+        "    void* aux0_param = const_cast<void*>(aux0_ptr);",
+        "    void* aux1_param = const_cast<void*>(aux1_ptr);",
+        "    void* aux2_param = const_cast<void*>(aux2_ptr);",
         "    uint32_t const grid_m = ceilDivU32(M, d.block_m);",
         "    uint32_t const grid_n = ceilDivU32(N, d.block_n);",
         "    uint32_t const total_tiles = grid_m * grid_n;",
@@ -2999,7 +3209,8 @@ def write_header(k1_results, k2_results, output_path):
         "        void* slot = selectGemmLaunchParam(",
         "            d.runtime_args[i].id,",
         "            xq_ptr, xs_ptr, wq_param, ws_param, bias_param, y_ptr,",
-        "            M, N, K, const_cast<int32_t&>(num_tiles),",
+        "            aux0_param, aux1_param, aux2_param, epsilon,",
+        "            rows_per_batch, row_offset, total_rows, M, N, K, const_cast<int32_t&>(num_tiles),",
         "            stride_xqm, stride_xqk, stride_xsm, stride_xsg,",
         "            stride_wn, stride_wk, stride_ym, stride_yn);",
         "        if (slot == nullptr) return CUDA_ERROR_INVALID_VALUE;",
@@ -3022,11 +3233,26 @@ def write_header(k1_results, k2_results, output_path):
 
 def main():
     import torch
+    import shutil
     if not torch.cuda.is_available():
         print("ERROR: CUDA not available. Must run on target GPU.", file=sys.stderr)
         return 1
 
     debug_dump = bool(int(os.environ.get("HOTSTEP_TRITON_CACHE_DEBUG", "0")))
+
+    # Clear the Triton JIT cache at startup so every kernel is recompiled from
+    # scratch.  Stale cache entries from a previous extraction (different config
+    # grid, different constexprs, different Triton version) can cause incorrect
+    # cubins to be harvested or spill-check false negatives.  The cache is
+    # either TRITON_CACHE_DIR or ~/.triton/cache.
+    triton_cache_dir = os.environ.get("TRITON_CACHE_DIR")
+    if not triton_cache_dir:
+        triton_cache_dir = os.path.join(os.path.expanduser("~"), ".triton", "cache")
+    if os.path.isdir(triton_cache_dir):
+        print(f"[extract_jit_cubins_autotune] Clearing Triton cache: {triton_cache_dir}", flush=True)
+        shutil.rmtree(triton_cache_dir, ignore_errors=True)
+    else:
+        print(f"[extract_jit_cubins_autotune] Triton cache dir not present (nothing to clear): {triton_cache_dir}", flush=True)
 
     print(f"[extract_jit_cubins_autotune] Triton version: {triton.__version__}", flush=True)
     print(f"[extract_jit_cubins_autotune] Device: {torch.cuda.get_device_name()}", flush=True)
@@ -3127,7 +3353,7 @@ def main():
 
     # ── Winner cache directory summary (for PTX/IR/SASS diagnosis) ──────
     print("\n=== Autotune winner cache directories (PTX/IR for diagnosis) ===", flush=True)
-    for dtype_suffix, _, _ in DTYPE_CONFIGS:
+    for dtype_suffix, _, _ in INPUT_DTYPE_CONFIGS:
         r = k1_results.get(dtype_suffix, {})
         cd = r.get("cache_dir")
         fn = r.get("function_name", "<unknown>")
@@ -3137,15 +3363,20 @@ def main():
         else:
             print(f"  K1 {dtype_suffix}:  <cache_dir unavailable>", flush=True)
     for bias_suffix, _ in BIAS_CONFIGS:
-        for dtype_suffix, _, _ in DTYPE_CONFIGS:
-            r = k2_results.get(f"{bias_suffix}_{dtype_suffix}", {})
-            cd = r.get("cache_dir")
-            fn = r.get("function_name", "<unknown>")
-            if cd:
-                print(f"  K2 {bias_suffix}_{dtype_suffix}:  {cd}", flush=True)
-                print(f"      function: {fn}", flush=True)
-            else:
-                print(f"  K2 {bias_suffix}_{dtype_suffix}:  <cache_dir unavailable>", flush=True)
+        for variant_name, _, _, _ in K2_VARIANTS:
+            families = _k2_family_for_variant(variant_name)
+            for family_name, _, _, _, _, _ in K2_SHAPE_FAMILIES:
+                if family_name not in families:
+                    continue
+                r = k2_results.get(f"{bias_suffix}_{variant_name}_{family_name}", {})
+                cd = r.get("cache_dir")
+                fn = r.get("function_name", "<unknown>")
+                label = f"{bias_suffix}_{variant_name}_{family_name}"
+                if cd:
+                    print(f"  K2 {label}:  {cd}", flush=True)
+                    print(f"      function: {fn}", flush=True)
+                else:
+                    print(f"  K2 {label}:  <cache_dir unavailable>", flush=True)
     return 0
 
 if __name__ == "__main__":

@@ -136,6 +136,7 @@ def _gluon_k2_meta(BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, NUM_BUFS, FOLD_EVERY=None
         "GROUP_SIZE": m.GROUP_SIZE, "GROUP_M": GROUP_M,
         "NUM_BUFS": NUM_BUFS, "FOLD_EVERY": FOLD_EVERY,
         "HAS_BIAS": True, "OUTPUT_FP16": False,
+        "EPILOGUE_KIND": m.EPILOGUE_PLAIN,
         "num_warps": 8,
     }
 
@@ -349,6 +350,7 @@ class TestK2GemmDequant(unittest.TestCase):
         #   xq, xs, wq, ws, bias, y, M, N, K, NUM_TILES, <strides...>
         m.kernel2_gemm_dequant[grid](
             xq, xs, wq_N_K, ws, bias_arg, y,
+            ws, ws, ws, 1.0e-6, M, 0, M,
             M, N, K, num_tiles,
             K, 1,          # X_q [M, K] row-major
             1, M,          # X_scale [n_groups, M]
@@ -436,6 +438,7 @@ class TestK2HostPadding(unittest.TestCase):
         # W_q is [N, K] row-major (stride_wn=K, stride_wk=1).
         m.kernel2_gemm_dequant[grid](
             xq, xs, wq, ws, bias, y_pad,
+            ws, ws, ws, 1.0e-6, M, 0, M,
             M_PAD, N, K, num_tiles,
             K, 1, 1, M_PAD,
             K, 1,
@@ -608,6 +611,7 @@ class TestEndToEndPipeline(unittest.TestCase):
         grid = (min(num_tiles, 1),)
         m.kernel2_gemm_dequant[grid](
             xq, xs, wq_t, ws_t, bias_t, y,
+            ws_t, ws_t, ws_t, 1.0e-6, M, 0, M,
             M, N, K, num_tiles,
             K, 1, 1, M,
             K, 1,   # W_q [N, K] row-major: wn=K, wk=1

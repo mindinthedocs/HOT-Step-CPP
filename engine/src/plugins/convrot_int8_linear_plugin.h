@@ -32,7 +32,7 @@
 namespace hotstep {
 
 constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_NAME = "ConvRotInt8Linear";
-constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_VERSION = "2";
+constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_VERSION = "3";
 constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE = "hotstep";
 
 constexpr char const* const kFIELD_GROUP_SIZE = "group_size";
@@ -44,6 +44,19 @@ constexpr char const* const kFIELD_OUTPUT_DTYPE = "output_dtype";
 constexpr char const* const kFIELD_INPUT_DTYPE_ID = "input_dtype_id";
 constexpr char const* const kFIELD_OUTPUT_DTYPE_ID = "output_dtype_id";
 constexpr char const* const kFIELD_PREFERRED_FORMAT = "preferred_format";
+constexpr char const* const kFIELD_EPILOGUE_KIND = "epilogue_kind";
+constexpr char const* const kFIELD_EPSILON = "epsilon";
+constexpr char const* const kFIELD_PREQUANTIZED = "prequantized";
+constexpr char const* const kFIELD_QUANTIZE_ONLY = "quantize_only";
+
+// Keep synchronized with EPILOGUE_* in extract_jit_cubins_autotune.py.
+enum class ConvRotEpilogueKind : int32_t {
+    kPLAIN = 0,
+    kQKNORM = 1,
+    kQKNORM_ROPE = 2,
+    kRESIDUAL = 3,
+    kGATED_RESIDUAL = 4,
+};
 
 /*
  * ConvRotInt8LinearPlugin — IPluginV3 wrapper around AOT-compiled Triton
@@ -68,9 +81,13 @@ class ConvRotInt8LinearPlugin
 public:
     ConvRotInt8LinearPlugin(int32_t group_size, int32_t in_features,
                             int32_t out_features, int32_t has_bias,
-                            int32_t input_dtype_id = 10,
-                            int32_t output_dtype_id = 10,
-                            std::string preferred_format = "HWC8");
+                            int32_t input_dtype_id = 1,
+                            int32_t output_dtype_id = 1,
+                            std::string preferred_format = "HWC8",
+                            int32_t epilogue_kind = 0,
+                            float epsilon = 1.0e-6f,
+                            int32_t prequantized = 0,
+                            int32_t quantize_only = 0);
     ConvRotInt8LinearPlugin(void const* data, size_t length);
     ~ConvRotInt8LinearPlugin() override;
 
@@ -139,8 +156,12 @@ private:
     int32_t m_has_bias{0};
     // ONNX TensorProto dtype ids: FLOAT=1, FLOAT16=10, BFLOAT16=16.
     int32_t m_input_dtype_id{10};
-    int32_t m_output_dtype_id{10};
+    int32_t m_output_dtype_id{1};
     std::string m_preferred_format{"HWC8"};
+    int32_t m_epilogue_kind{static_cast<int32_t>(ConvRotEpilogueKind::kPLAIN)};
+    float m_epsilon{1.0e-6f};
+    int32_t m_prequantized{0};
+    int32_t m_quantize_only{0};
     std::string m_namespace{kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE};
 
     // Runtime shape and tactic state
@@ -148,6 +169,7 @@ private:
     int32_t m_M{0};
     int32_t m_K{0};
     int32_t m_N{0};
+    int32_t m_rows_per_batch{0};
 
 
     // Kernel 1: activation rotation + quantization. m_desc_quant points to a

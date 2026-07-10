@@ -554,6 +554,185 @@ def _remove_initializer_graph_inputs(model_proto) -> int:
     return before - len(model_proto.graph.input)
 
 
+def _graph_sparse_initializer_names(graph) -> set[str]:
+    return {getattr(init, "values", init).name for init in getattr(graph, "sparse_initializer", []) if getattr(getattr(init, "values", init), "name", "")}
+
+
+def _topologically_sort_graph_nodes(graph, *, graph_label: str = "graph") -> dict:
+    """Stable topological sort for an ONNX GraphProto's node list.
+
+    ONNX checker validates nodes in order: every non-empty node input must be
+    either a graph input/initializer or an output of a previously listed node.
+    Several export-time fusion passes insert nodes relative to local patterns;
+    this final canonicalization restores the GraphProto node invariant before
+    serialization without otherwise changing tensor names or initializers.
+    """
+    nodes = list(graph.node)
+    if len(nodes) <= 1:
+        return {"nodes_before": len(nodes), "nodes_reordered": 0, "already_sorted": True}
+
+    available = (
+        {value.name for value in graph.input if value.name}
+        | {init.name for init in graph.initializer if init.name}
+        | _graph_sparse_initializer_names(graph)
+    )
+    produced_in_graph = {output for node in nodes for output in node.output if output}
+
+    pending = list(range(len(nodes)))
+    emitted: list = []
+    emitted_indices: list[int] = []
+
+    while pending:
+        progress = False
+        next_pending: list[int] = []
+        for idx in pending:
+            node = nodes[idx]
+            missing = [name for name in node.input if name and name not in available]
+            if missing:
+                next_pending.append(idx)
+                continue
+            emitted.append(node)
+            emitted_indices.append(idx)
+            available.update(output for output in node.output if output)
+            progress = True
+        if progress:
+            pending = next_pending
+            continue
+
+        # No node could be emitted.  Report the first genuinely unresolved input
+        # with enough context to distinguish a cycle/order problem from a pass
+        # that accidentally deleted a producer.
+        idx = pending[0]
+        node = nodes[idx]
+        unsatisfied = [name for name in node.input if name and name not in available]
+        missing_producers = [name for name in unsatisfied if name not in produced_in_graph]
+        later_producers = [name for name in unsatisfied if name in produced_in_graph]
+        raise SystemExit(
+            f"cannot topologically sort {graph_label}: node {node.name or idx!r} "
+            f"({node.op_type}) has unsatisfied input(s) {unsatisfied}; "
+            f"missing_producers={missing_producers}, produced_by_later_nodes={later_producers}"
+        )
+
+    if emitted_indices == list(range(len(nodes))):
+        return {"nodes_before": len(nodes), "nodes_reordered": 0, "already_sorted": True}
+
+    del graph.node[:]
+    graph.node.extend(emitted)
+    moved = sum(1 for new_idx, old_idx in enumerate(emitted_indices) if new_idx != old_idx)
+    return {"nodes_before": len(nodes), "nodes_reordered": moved, "already_sorted": False}
+
+
+def _topologically_sort_model_graph(model_proto) -> dict:
+    report = _topologically_sort_graph_nodes(model_proto.graph, graph_label=getattr(model_proto.graph, "name", "graph") or "graph")
+    if report["nodes_reordered"]:
+        print(
+            f"[export_dit] Topologically sorted ONNX graph: "
+            f"moved {report['nodes_reordered']} / {report['nodes_before']} nodes"
+        )
+    return report
+
+
+def _remove_dead_graph_nodes(model_proto) -> dict:
+    """Remove nodes that no longer feed any graph output (mark-and-sweep).
+
+    Fusion passes intentionally delete producer/consumer islands and reconnect
+    the live endpoints.  PyTorch's exported SDPA decomposition leaves helper
+    nodes such as CastLike/Sqrt around the scaled-QK path; once Q/K projection
+    epilogues are fused, those helpers may reference tensors whose producers
+    were removed.  A reverse liveness sweep removes these dead islands before
+    the final ONNX checker/topological-sort pass.
+
+    This implementation is **order-independent** (mark-and-sweep with fixpoint
+    propagation).  A single-reverse-pass variant would be incorrect here
+    because the fusion passes rewire ConvRotInt8Linear plugin inputs to
+    consume upstream tensors (RoPE cos/sin, residual addends) without moving
+    the producer nodes before the plugins in the node list.  A producer can
+    legitimately appear AFTER its consumer in the post-fusion graph, so a
+    single reverse sweep would mark the producer as dead before reaching the
+    consumer that keeps it alive.
+
+    Algorithm:
+      1. Seed ``live_values`` with graph outputs + initializer names.
+      2. Fixpoint-propagate liveness: any node with at least one output in
+         ``live_values`` is live; its inputs are added to ``live_values``.
+         Repeat until no changes.  This is O(V*E) worst-case but converges
+         in 2-4 iterations for typical post-fusion graphs.
+      3. Sweep: remove every node whose outputs are all NOT in
+         ``live_values``.  Preserve output-less nodes (custom side effects).
+    """
+    nodes = list(model_proto.graph.node)
+    if not nodes:
+        return {"nodes_before": 0, "dead_nodes_removed": 0, "nodes_after": 0}
+
+    # Step 1: seed the live set.
+    live_values = {value.name for value in model_proto.graph.output if value.name}
+    live_values.update(init.name for init in model_proto.graph.initializer if init.name)
+
+    # Build a producer map: tensor name -> node that produces it.
+    # (A tensor can only have one producer in a valid ONNX graph.)
+    producer_of: dict[str, object] = {}
+    for node in nodes:
+        for o in node.output:
+            if o:
+                producer_of[o] = node
+
+    # Step 2: fixpoint liveness propagation.
+    # We iterate over the live set itself (a worklist), finding the producer
+    # of each live tensor and marking its inputs live.  This converges because
+    # the live set only grows and is bounded by the total number of tensors.
+    worklist = list(live_values)
+    seen = set(live_values)
+    while worklist:
+        tensor = worklist.pop()
+        producer = producer_of.get(tensor)
+        if producer is None:
+            continue  # graph input, initializer, or already-removed producer
+        for inp in producer.input:
+            if inp and inp not in seen:
+                seen.add(inp)
+                live_values.add(inp)
+                worklist.append(inp)
+
+    # Step 3: sweep — remove nodes whose outputs are all dead.
+    kept = []
+    removed_names: list[str] = []
+    for node in nodes:
+        outputs = [name for name in node.output if name]
+        # Preserve output-less nodes (custom side effects); otherwise a node
+        # is live iff at least one of its outputs is in the live set.
+        keep = not outputs or any(name in live_values for name in outputs)
+        if keep:
+            kept.append(node)
+        else:
+            removed_names.append(node.name or outputs[0])
+
+    if not removed_names:
+        return {"nodes_before": len(nodes), "dead_nodes_removed": 0, "nodes_after": len(nodes)}
+
+    del model_proto.graph.node[:]
+    model_proto.graph.node.extend(kept)
+    print(
+        f"[export_dit] Removed {len(removed_names)} dead ONNX nodes before final check "
+        f"(examples: {removed_names[:8]})"
+    )
+    return {
+        "nodes_before": len(nodes),
+        "dead_nodes_removed": len(removed_names),
+        "nodes_after": len(kept),
+        "examples": removed_names[:32],
+    }
+
+
+def _dump_source_onnx_graph_without_weights(source_path: str) -> str:
+    """Persist the pre-rewrite graph shell next to export_dit.py for inspection."""
+    import shutil
+
+    dump_path = Path(__file__).resolve().with_name("export_dit_source_graph_no_weights.onnx")
+    shutil.copyfile(source_path, dump_path)
+    print(f"[export_dit] Source ONNX graph without weights dumped to {dump_path}")
+    return str(dump_path)
+
+
 def _external_initializer(name: str, data_type: int, dims: list[int], location: str, offset: int, length: int):
     from onnx import TensorProto, helper
 
@@ -967,7 +1146,9 @@ def _w8a8_plugin_boundary_dtype() -> str:
     if value in {"FP16", "FLOAT16", "HALF"}:
         return "FP16"
     if value in {"BF16", "BFLOAT16"}:
-        return "BF16"
+        raise SystemExit(
+            "full BF16 plugin boundaries are intentionally disabled; use the selective FP32/FP16 policy"
+        )
     if value in {"FP32", "FLOAT", "FLOAT32"}:
         return "FP32"
     raise SystemExit(
@@ -1514,16 +1695,16 @@ def _externalize_initializers_from_safetensors(
         rewrite_report = _w8a8_rewrite_dispatch(model_proto, quant_report)
         if not rewrite_report.get("rewritten_nodes"):
             raise SystemExit("W8A8 quantized weights but rewrote zero MatMul/Gemm nodes")
+        shared_quant_report = _share_w8a8_convrot_quantization(model_proto)
+        rewrite_report["shared_activation_quantization"] = shared_quant_report
+        if shared_quant_report["shared_quantizers"] == 0:
+            raise SystemExit("failed to create any shared W8A8 ConvRot quantizers")
 
     sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model_proto)
     if sequence_rewrite_report["split_to_sequence_rewritten"]:
         rewrite_report["sequence_split_rewrite"] = sequence_rewrite_report
-    if precision == "w8a8" and w8a8_boundary_dtype != "FP32":
-        # The SplitToSequence compatibility pass may introduce new Split/
-        # Identity/Squeeze nodes after the initial plugin rewrite. In lowp test
-        # modes, run the island type-fix pass once more so TensorRT strongly
-        # typed parsing does not see Add/Mul/etc. with mixed dtypes.
-        rewrite_report["fp16_island_rewrite_after_sequence"] = _rewrite_w8a8_fp16_islands(model_proto, set(), w8a8_boundary_dtype)
+    # Selective W8A8 boundaries deliberately avoid blanket low-precision
+    # propagation after Split lowering; sensitive reductions remain FP32.
     # Attention rewrite: replace decomposed SDPA (MatMul+Softmax+MatMul)
     # with a single ONNX Attention-23 op running in FP16 internally.
     # This is mandatory for the attention block — matches GGML Q8_0's
@@ -1531,7 +1712,8 @@ def _externalize_initializers_from_safetensors(
     # Must run AFTER the w8a8 plugin rewrite (so Q/K/V come from
     # ConvRotInt8Linear outputs) and AFTER SplitToSequence lowering, but
     # BEFORE constant folding (so the dead Q/K scaling nodes get cleaned up).
-    attention_rewrite_report = rewrite_attention_to_onnx_attention_fp16(model_proto)
+    attention_rewrite_report = rewrite_attention_to_onnx_attention_fp16(
+        model_proto, keep_output_fp32=(precision != "w8a8"))
     if attention_rewrite_report.get("rewritten", 0):
         rewrite_report["attention_rewrite"] = attention_rewrite_report
         if attention_rewrite_report.get("skipped"):
@@ -1541,6 +1723,26 @@ def _externalize_initializers_from_safetensors(
             print(f"[export_dit] Attention rewrite: {attention_rewrite_report['rewritten']} blocks fused")
     elif attention_rewrite_report.get("skipped"):
         print(f"[export_dit] Attention rewrite: 0 blocks fused, skipped={attention_rewrite_report['skipped']}")
+
+    if precision == "w8a8" and attention_rewrite_report.get("rewritten", 0):
+        projection_fusion_report = _fuse_w8a8_attention_projection_epilogues(model_proto)
+        rewrite_report["attention_projection_epilogues"] = projection_fusion_report
+        if projection_fusion_report["fused_attention_projections"] != attention_rewrite_report["rewritten"]:
+            raise SystemExit(
+                "failed to fuse every W8A8 Attention Q/K/V projection epilogue: "
+                f"attention={attention_rewrite_report['rewritten']}, "
+                f"projection_fusions={projection_fusion_report['fused_attention_projections']}"
+            )
+        residual_fusion_report = _fuse_w8a8_residual_epilogues(model_proto)
+        rewrite_report["residual_epilogues"] = residual_fusion_report
+        if (residual_fusion_report["fused_residual_epilogues"] == 0 or
+                residual_fusion_report["fused_residual_epilogues"] !=
+                residual_fusion_report["eligible_residual_epilogues"]):
+            raise SystemExit(
+                "failed to fuse every W8A8 O/down residual epilogue: "
+                f"eligible={residual_fusion_report['eligible_residual_epilogues']}, "
+                f"fused={residual_fusion_report['fused_residual_epilogues']}"
+            )
 
     constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(
         model_proto,
@@ -1552,6 +1754,52 @@ def _externalize_initializers_from_safetensors(
     removed_initializer_inputs = _remove_initializer_graph_inputs(model_proto)
     if removed_initializer_inputs:
         rewrite_report["initializer_graph_inputs_removed"] = removed_initializer_inputs
+
+    # Dead-node removal MUST run before topological sort.  The fusion passes
+    # above rewire ConvRotInt8Linear plugin inputs to consume upstream tensors
+    # (RoPE cos/sin, residual addends) and rename plugin outputs to match
+    # downstream Add outputs.  This leaves dead helper nodes (CastLike, Sqrt,
+    # the original Add/Mul) whose producers were removed by the fusion; their
+    # inputs now reference tensors that no node produces.  The topological
+    # sort would abort on the first such missing producer, so we sweep dead
+    # nodes first.  _remove_dead_graph_nodes uses mark-and-sweep liveness
+    # propagation (order-independent), so it is safe to run on the unsorted
+    # post-fusion graph.
+    dead_node_report = _remove_dead_graph_nodes(model_proto)
+    if dead_node_report["dead_nodes_removed"]:
+        rewrite_report["dead_node_elimination"] = dead_node_report
+
+    topo_sort_report = _topologically_sort_model_graph(model_proto)
+    if topo_sort_report["nodes_reordered"]:
+        rewrite_report["topological_sort"] = topo_sort_report
+
+    # Externalize any embedded initializers left by fusion passes.  The
+    # _fuse_w8a8_attention_projection_epilogues pass creates small [0, 0, H, 128]
+    # INT64 shape tensors and adds them directly as embedded initializers;
+    # _fold_constant_nodes_to_initializers_for_trt only externalizes Constant
+    # nodes, not existing embedded initializers.  Without this pass the
+    # low-memory validation (_validate_external_data_artifacts) rejects the
+    # model with "left embedded ONNX initializer(s)".
+    if data_path and data_location:
+        from onnx import TensorProto
+        externalized = []
+        new_initializers = []
+        for init in model_proto.graph.initializer:
+            if init.data_location == TensorProto.DEFAULT:
+                external = _write_tensor_proto_external(init, data_path, data_location)
+                if external is not None:
+                    new_initializers.append(external)
+                    externalized.append(init.name)
+                    continue
+            new_initializers.append(init)
+        if externalized:
+            del model_proto.graph.initializer[:]
+            model_proto.graph.initializer.extend(new_initializers)
+            rewrite_report["externalized_embedded_initializers"] = externalized
+            print(
+                f"[export_dit] Externalized {len(externalized)} embedded initializer(s) "
+                f"to {os.path.basename(data_path)}"
+            )
 
     onnx.save(model_proto, output_path)
     onnx.checker.check_model(output_path)
@@ -1847,6 +2095,63 @@ def _emit_convrot_h_initializer(model, group_size: int, name: str) -> str:
     return name
 
 
+def _hqq_symmetric_block(
+    w: "np.ndarray",
+    qmin: int = -127,
+    qmax: int = 127,
+    lp: float = 1.0,
+    beta: float = 10.0,
+    iters: int = 10,
+    kappa: float = 1.05,
+    eps: float = 1e-12,
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """Symmetric HQQ-style scale optimization for signed integer blocks.
+
+    Borrowed from the attached quantization simulator's symmetric HQQ helper:
+    dequant(q) = scale * q, q in a signed integer range.  Each row/block gets
+    one positive scale and no zero point, which is exactly the ConvRotInt8Linear
+    weight contract.
+    """
+    import numpy as np
+
+    w = np.ascontiguousarray(w, dtype=np.float32)
+    max_abs = np.max(np.abs(w), axis=1)
+    scale = np.where(max_abs > eps, max_abs / float(qmax), 1e-30).astype(np.float32)
+    q = np.clip(np.rint(w / scale[:, None]), qmin, qmax).astype(np.int8)
+    best_q = q.copy()
+    best_scale = scale.copy()
+    best_err = np.mean((w - best_scale[:, None] * best_q.astype(np.float32)) ** 2, axis=1)
+
+    beta_t = float(beta)
+    for _ in range(int(iters)):
+        q_f = q.astype(np.float32)
+        deq = scale[:, None] * q_f
+        residual = w - deq
+        abs_res = np.abs(residual)
+        threshold = (1.0 / beta_t) * np.power(np.maximum(abs_res, eps), float(lp) - 1.0)
+        w_e = np.sign(residual) * np.maximum(abs_res - threshold, 0.0)
+        target = w - w_e
+
+        denom = np.sum(q_f * q_f, axis=1)
+        numer = np.sum(q_f * target, axis=1)
+        new_scale = np.where(denom > eps, numer / np.maximum(denom, eps), scale)
+        new_scale = np.where(np.isfinite(new_scale) & (new_scale > eps), new_scale, scale).astype(np.float32)
+        new_q = np.clip(np.rint(w / new_scale[:, None]), qmin, qmax).astype(np.int8)
+        new_err = np.mean((w - new_scale[:, None] * new_q.astype(np.float32)) ** 2, axis=1)
+
+        improved = new_err < best_err
+        if np.any(improved):
+            best_err[improved] = new_err[improved]
+            best_scale[improved] = new_scale[improved]
+            best_q[improved, :] = new_q[improved, :]
+        if not np.any(new_q != q) and not np.any(np.abs(new_scale - scale) > eps * np.maximum(1.0, np.abs(scale))):
+            break
+        q, scale = new_q, new_scale
+        beta_t *= float(kappa)
+
+    return np.ascontiguousarray(best_q, dtype=np.int8), np.ascontiguousarray(best_scale, dtype=np.float32)
+
+
 def _hqq_symmetric_per_row_quantize_block(
     w: "np.ndarray",
     *,
@@ -1857,92 +2162,40 @@ def _hqq_symmetric_per_row_quantize_block(
     iters: int,
     eps: float,
 ) -> tuple["np.ndarray", "np.ndarray"]:
-    """Single-thread HQQ worker for a row block in canonical [out, in] layout."""
-    import numpy as np
-
-    qmax = float((1 << (int(nbits) - 1)) - 1)
-    w = np.ascontiguousarray(w, dtype=np.float32)
-
-    # Standard per-row max-abs quantization is the starting point and the
-    # fallback best candidate for all-zero or numerically degenerate rows.
-    max_abs = np.max(np.abs(w), axis=1)
-    scale = np.where(max_abs > 0.0, max_abs / qmax, 1.0).astype(np.float32)
-    q = np.clip(np.rint(w / scale.reshape(-1, 1)), -qmax, qmax).astype(np.int8)
-    best_q = q.copy()
-    best_scale = scale.copy()
-    best_err = np.mean((w - best_scale.reshape(-1, 1) * best_q.astype(np.float32)) ** 2, axis=1)
-
-    beta_t = float(beta)
-    abs_eps = np.float32(eps)
-    for _ in range(int(iters)):
-        q_f = q.astype(np.float32)
-        deq = scale.reshape(-1, 1) * q_f
-        residual = w - deq
-
-        # Generalized soft-thresholding prox for lp in [0, 1], matching HQQ:
-        # sign(x) * relu(|x| - (1/beta)*|x|^(p-1)).  Guard |x|^(p-1) near zero.
-        abs_residual = np.abs(residual)
-        threshold = (1.0 / beta_t) * np.power(np.maximum(abs_residual, abs_eps), lp - 1.0)
-        w_e = np.sign(residual) * np.maximum(abs_residual - threshold, 0.0)
-
-        target = w - w_e
-        numerator = np.sum(q_f * target, axis=1)
-        denominator = np.sum(q_f * q_f, axis=1)
-        new_scale = np.where(denominator > 0.0, numerator / np.maximum(denominator, eps), scale)
-        new_scale = np.where(np.isfinite(new_scale) & (new_scale > eps), new_scale, scale).astype(np.float32)
-
-        new_q = np.clip(np.rint(w / new_scale.reshape(-1, 1)), -qmax, qmax).astype(np.int8)
-        new_err = np.mean((w - new_scale.reshape(-1, 1) * new_q.astype(np.float32)) ** 2, axis=1)
-        improved = new_err < best_err
-        if np.any(improved):
-            best_err[improved] = new_err[improved]
-            best_scale[improved] = new_scale[improved]
-            best_q[improved, :] = new_q[improved, :]
-
-        if not np.any(new_q != q) and not np.any(np.abs(new_scale - scale) > eps * np.maximum(1.0, np.abs(scale))):
-            break
-        q = new_q
-        scale = new_scale
-        beta_t *= float(kappa)
-
-    return np.ascontiguousarray(best_q, dtype=np.int8), np.ascontiguousarray(best_scale, dtype=np.float32)
+    """Single-thread symmetric HQQ worker for a row block in [out, in] layout."""
+    qmax = (1 << (int(nbits) - 1)) - 1
+    qmin = -qmax
+    return _hqq_symmetric_block(
+        w,
+        qmin=qmin,
+        qmax=qmax,
+        lp=lp,
+        beta=beta,
+        iters=iters,
+        kappa=kappa,
+        eps=eps,
+    )
 
 
 def _hqq_symmetric_per_row_quantize(
     w: "np.ndarray",
     *,
     nbits: int = 8,
-    lp: float = 0.7,
-    beta: float = 1.0,
-    kappa: float = 1.01,
-    iters: int = 20,
+    lp: float = 1.0,
+    beta: float = 10.0,
+    kappa: float = 1.05,
+    iters: int = 10,
     eps: float = 1.0e-12,
     max_workers: int = 1,
     rows_per_chunk: int = 256,
 ) -> tuple["np.ndarray", "np.ndarray"]:
-    """Half-Quadratic Quantization for symmetric per-row weight scales.
+    """Parallel symmetric HQQ returning signed INT weights and per-row scales.
 
-    This is the HQQ alternating-optimization idea adapted to the current
-    ConvRotInt8Linear plugin contract, which accepts only an INT8 weight tensor
-    plus one FP32 scale per output row (no weight zero-point and no per-group
-    scales).  The original HQQ derivation fixes ``s`` and alternates between a
-    sparse residual ``W_e`` and zero-point ``z``.  Here ``z`` is fixed to zero
-    by the symmetric INT8 contract, so the second sub-problem is the closed-form
-    least-squares update for the row scale ``s`` with the integer codes fixed.
-
-    Per iteration, for each row independently:
-      1. q <- round(W / s) clipped to the symmetric INT range.
-      2. W_e <- shrink_lp(W - s*q, beta), modelling sparse/outlier residuals.
-      3. s <- argmin_s ||s*q - (W - W_e)||_2^2.
-
-    Rows are independent under per-row scaling, so large matrices are split into
-    row blocks and processed with a ThreadPoolExecutor. NumPy releases the GIL
-    for the heavy elementwise/reduction kernels, so this uses multiple CPU cores
-    without the extra memory/copy cost of multiprocessing.
-
-    We keep the best plain L2 dequantization error seen during the robust HQQ
-    iterations, so this default never intentionally returns a worse candidate
-    than its initialization.
+    This mirrors ``hqq_symmetric_quantize_parallel`` from the attached script,
+    specialized to the plugin's effective group_size=K (one HQQ block per
+    output row).  Large matrices are split into row chunks; for the DiT matrix
+    sizes the default single large vectorized chunk avoids per-64-row executor
+    overhead and is faster in practice.
     """
     import os
     import numpy as np
@@ -1961,33 +2214,29 @@ def _hqq_symmetric_per_row_quantize(
     workers = int(max_workers) if max_workers is not None else 1
     workers = max(1, min(workers, os.cpu_count() or 1, rows))
     chunk_rows = max(1, int(rows_per_chunk))
-
-    # Avoid thread overhead for small matrices or when the caller requests one
-    # worker.  This code path is also useful for deterministic micro-tests.
-    if workers == 1 or rows <= chunk_rows:
-        return _hqq_symmetric_per_row_quantize_block(
-            w, nbits=nbits, lp=lp, beta=beta, kappa=kappa, iters=iters, eps=eps
-        )
-
     ranges = [(start, min(start + chunk_rows, rows)) for start in range(0, rows, chunk_rows)]
+
     q_out = np.empty(w.shape, dtype=np.int8)
     scale_out = np.empty((rows,), dtype=np.float32)
 
-    def run_block(row_range: tuple[int, int]) -> tuple[int, int, "np.ndarray", "np.ndarray"]:
+    def run_chunk(row_range: tuple[int, int]) -> tuple[int, int, "np.ndarray", "np.ndarray"]:
         start, stop = row_range
         q_block, scale_block = _hqq_symmetric_per_row_quantize_block(
             w[start:stop], nbits=nbits, lp=lp, beta=beta, kappa=kappa, iters=iters, eps=eps
         )
         return start, stop, q_block, scale_block
 
-    # Map preserves input order, but we still return explicit ranges so each
-    # worker writes a disjoint slice.  Thread writes occur in the main thread.
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for start, stop, q_block, scale_block in pool.map(run_block, ranges):
-            q_out[start:stop, :] = q_block
-            scale_out[start:stop] = scale_block
+    if workers <= 1 or len(ranges) == 1:
+        results = [run_chunk(r) for r in ranges]
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(ranges))) as pool:
+            results = list(pool.map(run_chunk, ranges))
 
-    return np.ascontiguousarray(q_out), np.ascontiguousarray(scale_out)
+    for start, stop, q_block, scale_block in results:
+        q_out[start:stop] = q_block
+        scale_out[start:stop] = scale_block
+
+    return np.ascontiguousarray(q_out, dtype=np.int8), np.ascontiguousarray(scale_out, dtype=np.float32)
 
 
 def _quantize_w8a8_weight_array(
@@ -2027,12 +2276,10 @@ def _quantize_w8a8_weight_array(
     HQQ_KAPPA = 1.05
     HQQ_ITERS = 10
     HQQ_EPS = 1.0e-12
-    # Parallelize across independent output rows.  Threads are preferred over
-    # multiprocessing because they avoid copying large weight blocks; NumPy's
-    # heavy kernels release the GIL.  Tune down if export competes with other
-    # CPU work, or up if the machine has many idle cores and enough memory.
+    # ThreadPool parallelism across independent output-row blocks.  Threads are
+    # preferred over multiprocessing because they avoid copying large weight
+    # blocks; NumPy's heavy elementwise/reduction kernels release the GIL.
     HQQ_MAX_WORKERS = 14
-    HQQ_ROWS_PER_CHUNK = 64
 
     if arr.ndim != 2:
         raise SystemExit(
@@ -2056,6 +2303,20 @@ def _quantize_w8a8_weight_array(
 
         w_canonical = rotate_weight(w_canonical, H, group_size)
         rotated = True
+
+    # Chunk size 256 rows is the benchmark-proven sweet spot.  Each chunk is
+    # 2.5 MB for a 2560-wide FP32 matrix — large enough that NumPy's C-level
+    # work (GIL released) dominates the Python glue (GIL held), but small
+    # enough to fit in L3 cache.  The GIL-held fraction drops from ~28% (with
+    # the old 64-row chunks) to ~9%, giving ~10× effective parallelism instead
+    # of ~3×.  Larger chunks (512+) degrade due to L3 cache eviction and
+    # memory bandwidth contention between threads.
+    #
+    # Chunk counts for DiT matrices (14 workers):
+    #   gate_proj [9728 rows]: 38 chunks — plenty for 14 workers
+    #   q_proj   [4096 rows]: 16 chunks — good
+    #   k_proj   [1024 rows]:  4 chunks — undersubscribed but fast
+    HQQ_ROWS_PER_CHUNK = 256
 
     # Per-output-row symmetric INT8 quantization refined by HQQ alternating
     # optimization.  HQQ is applied after ConvRot, as requested, and remains
@@ -2317,7 +2578,7 @@ def _trace_untranspose_k(name: str, prod: dict):
     return r1.input[0]
 
 
-def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
+def rewrite_attention_to_onnx_attention_fp16(model, keep_output_fp32: bool = True) -> dict:
     """Rewrite decomposed SDPA islands to ONNX ``Attention`` op (opset 23, FP16).
 
     Pattern matched::
@@ -2435,15 +2696,17 @@ def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
             helper.make_node(
                 "Attention",
                 [q_fp16, k_fp16, v_fp16, mask_fp16],
-                [y_fp16],
+                [y_fp16 if keep_output_fp32 else out_name],
                 name=base + "/Attentionfp16",
                 scale=0.08838834764831845,  # 1/sqrt(128) for head_dim=128
                 is_causal=0,
             ),
-            helper.make_node("Cast", [y_fp16], [out_name],
-                             name=base + "/CastAttentionOutputToFP32",
-                             to=TensorProto.FLOAT),
         ]
+        if keep_output_fp32:
+            new_nodes.append(helper.make_node(
+                "Cast", [y_fp16], [out_name],
+                name=base + "/CastAttentionOutputToFP32",
+                to=TensorProto.FLOAT))
         replacements[av.name] = new_nodes
         remove_node_names.update({softmax.name, add.name, qk.name, av.name})
         # Q/K scaling nodes become dead after QK removal; remove when uniquely named.
@@ -2469,6 +2732,426 @@ def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
     model.graph.node.extend(new_graph_nodes)
     _attn_ensure_main_opset(model, 23)
     return {"rewritten": len(rewritten), "examples": rewritten[:8], "skipped": dict(skipped)}
+
+
+def _share_w8a8_convrot_quantization(model) -> dict:
+    """Run K1 once for projection groups that consume the same activation."""
+    import onnx
+    from onnx import helper
+    from trt_plugins import make_convrot_quantize_onnx_node
+
+    nodes = list(model.graph.node)
+
+    def int_attr(node, name, default=0):
+        for a in node.attribute:
+            if a.name == name and a.type == onnx.AttributeProto.INT:
+                return int(a.i)
+        return default
+
+    def set_attr(node, name, value):
+        kept = [a for a in node.attribute if a.name != name]
+        del node.attribute[:]
+        node.attribute.extend(kept)
+        node.attribute.append(helper.make_attribute(name, value))
+
+    groups: dict[str, list] = {}
+    for n in nodes:
+        if n.op_type == "ConvRotInt8Linear" and len(n.input) >= 3 and not int_attr(n, "quantize_only"):
+            groups.setdefault(n.input[0], []).append(n)
+
+    selected = []
+    for x_name, members in groups.items():
+        weights = [m.input[1] for m in members]
+        self_qkv = len(members) == 3 and all(
+            ".self_attn." in w and any(r in w for r in (".q_proj.weight", ".k_proj.weight", ".v_proj.weight"))
+            for w in weights)
+        gate_up = len(members) == 2 and all(
+            ".mlp." in w and any(r in w for r in (".gate_proj.weight", ".up_proj.weight"))
+            for w in weights)
+        cross_kv = len(members) >= 2 and all(
+            ".cross_attn." in w and any(r in w for r in (".k_proj.weight", ".v_proj.weight"))
+            for w in weights)
+        if self_qkv or gate_up or cross_kv:
+            selected.append((x_name, members,
+                             "self_qkv" if self_qkv else ("gate_up" if gate_up else "cross_kv")))
+
+    if not selected:
+        return {"shared_quantizers": 0, "linear_consumers": 0, "examples": []}
+
+    insert_before: dict[str, list] = {}
+    examples = []
+    for x_name, members, kind in selected:
+        first = min(members, key=lambda n: nodes.index(n))
+        in_features = int_attr(first, "in_features")
+        group_size = int_attr(first, "group_size")
+        input_dtype = _string_attr(first, "input_dtype", "FP32")
+        xq_name = x_name + f"_convrot_shared_{kind}_xq"
+        xs_name = x_name + f"_convrot_shared_{kind}_xs"
+        quant = make_convrot_quantize_onnx_node(
+            helper, onnx.TensorProto, x_name, xq_name, xs_name,
+            (first.name or x_name) + f"/SharedQuantize_{kind}",
+            group_size, in_features, input_dtype=input_dtype)
+        insert_before.setdefault(first.name, []).append(quant)
+        for plugin in members:
+            old_inputs = list(plugin.input)
+            # Existing layout: x, wq, ws, [bias], [future aux].
+            del plugin.input[:]
+            plugin.input.extend([xq_name, xs_name, *old_inputs[1:]])
+            set_attr(plugin, "prequantized", 1)
+        examples.append({"kind": kind, "input": x_name, "consumers": len(members)})
+
+    out = []
+    for n in nodes:
+        out.extend(insert_before.get(n.name, []))
+        out.append(n)
+    del model.graph.node[:]
+    model.graph.node.extend(out)
+    return {"shared_quantizers": len(selected),
+            "linear_consumers": sum(len(m) for _, m, _ in selected),
+            "examples": examples[:8]}
+
+
+def _fuse_w8a8_attention_projection_epilogues(model) -> dict:
+    """Fuse Q/K norm(+RoPE) and V casts into ConvRot K2 epilogues.
+
+    This pass runs after decomposed SDPA has been replaced by ONNX Attention,
+    which gives an unambiguous set of Q/K/V endpoint tensors.  Projection
+    outputs remain row-major [B,S,H*128]; a cheap Reshape+Transpose converts
+    them to the [B,H,S,128] Attention input without an FP32 tensor boundary.
+
+    Self attention is detected structurally: Q and K projections have the same
+    activation input.  This remains correct for the model's alternating
+    sliding/full attention pattern because only the mask changes; every self
+    attention layer still applies RoPE. Cross-attention Q/K have different
+    activation inputs and use the norm-only epilogue.
+    """
+    import onnx
+    import numpy as np
+    from onnx import TensorProto, helper, numpy_helper
+
+    nodes = list(model.graph.node)
+    prod = {o: n for n in nodes for o in n.output if o}
+    consumers: dict[str, list] = {}
+    for n in nodes:
+        for i in n.input:
+            if i:
+                consumers.setdefault(i, []).append(n)
+    init_names = {i.name for i in model.graph.initializer}
+    init_by_name = {i.name: i for i in model.graph.initializer}
+    used = {x for n in nodes for x in list(n.input) + list(n.output) if x} | init_names
+
+    def unique(base: str) -> str:
+        value = base
+        idx = 0
+        while value in used:
+            idx += 1
+            value = f"{base}_{idx}"
+        used.add(value)
+        return value
+
+    def attr_string(node, name: str, default: str = "") -> str:
+        for a in node.attribute:
+            if a.name == name and a.type == onnx.AttributeProto.STRING:
+                return a.s.decode("utf-8", errors="replace")
+        return default
+
+    def set_attr(node, name: str, value) -> None:
+        kept = [a for a in node.attribute if a.name != name]
+        del node.attribute[:]
+        node.attribute.extend(kept)
+        node.attribute.append(helper.make_attribute(name, value))
+
+    def plugin_weight(node) -> str:
+        if node.op_type != "ConvRotInt8Linear":
+            return ""
+        preq = 0
+        for a in node.attribute:
+            if a.name == "prequantized" and a.type == onnx.AttributeProto.INT:
+                preq = int(a.i)
+        index = 2 if preq else 1
+        return node.input[index] if len(node.input) > index else ""
+
+    def upstream_plugin(tensor: str, role: str):
+        seen = set()
+        stack = [tensor]
+        hits = []
+        while stack:
+            t = stack.pop()
+            if t in seen:
+                continue
+            seen.add(t)
+            p = prod.get(t)
+            if p is None:
+                continue
+            if p.op_type == "ConvRotInt8Linear" and role in plugin_weight(p):
+                hits.append(p)
+                continue
+            stack.extend(i for i in p.input if i)
+        return hits[0] if len(hits) == 1 else None
+
+    def path_nodes(start_tensor: str, target_tensor: str):
+        # Reverse ancestor set of target.
+        ancestors = set()
+        stack = [target_tensor]
+        while stack:
+            t = stack.pop()
+            p = prod.get(t)
+            if p is None or p.name in ancestors:
+                continue
+            ancestors.add(p.name)
+            stack.extend(i for i in p.input if i)
+        # Forward reachability from the projection output, restricted to those
+        # ancestors. This excludes cos/sin/gamma producer subgraphs.
+        reached = {start_tensor}
+        selected = []
+        changed = True
+        while changed:
+            changed = False
+            for n in nodes:
+                if n.name not in ancestors or n in selected:
+                    continue
+                if any(i in reached for i in n.input):
+                    selected.append(n)
+                    reached.update(o for o in n.output if o)
+                    changed = True
+        return selected if target_tensor in reached else []
+
+    def gamma_for(weight_name: str) -> str | None:
+        if ".q_proj.weight" in weight_name:
+            candidate = weight_name.replace(".q_proj.weight", ".q_norm.weight")
+        elif ".k_proj.weight" in weight_name:
+            candidate = weight_name.replace(".k_proj.weight", ".k_norm.weight")
+        else:
+            return None
+        return candidate if candidate in init_names else None
+
+    def rope_inputs(q_path, k_path, q_start: str, k_start: str):
+        def external(path, start):
+            names = {n.name for n in path}
+            produced = {o for n in path for o in n.output}
+            result = set()
+            for n in path:
+                for i in n.input:
+                    if i and i != start and i not in produced and i not in init_names:
+                        p = prod.get(i)
+                        if p is not None and p.op_type != "Constant":
+                            result.add(i)
+            return result
+
+        shared = external(q_path, q_start) & external(k_path, k_start)
+        if len(shared) != 2:
+            return None
+
+        cos_name = sin_name = None
+        for ext in shared:
+            p = prod.get(ext)
+            label = ((p.name if p is not None else "") + " " + ext).lower()
+            if "cos" in label:
+                cos_name = ext
+            elif "sin" in label:
+                sin_name = ext
+
+        # Export names are not always semantic. Distinguish the branch by the
+        # rotate_half Neg: the external multiplied with that branch is sin.
+        if cos_name is None or sin_name is None:
+            for ext in shared:
+                for n in q_path:
+                    if n.op_type != "Mul" or ext not in n.input:
+                        continue
+                    other = n.input[1] if n.input[0] == ext else n.input[0]
+                    branch_seen = set()
+                    branch_stack = [other]
+                    has_neg = False
+                    while branch_stack:
+                        t = branch_stack.pop()
+                        p = prod.get(t)
+                        if p is None or p.name in branch_seen or p not in q_path:
+                            continue
+                        branch_seen.add(p.name)
+                        has_neg |= p.op_type == "Neg"
+                        branch_stack.extend(i for i in p.input if i)
+                    if has_neg:
+                        sin_name = ext
+                    else:
+                        cos_name = ext
+        if cos_name is None or sin_name is None or cos_name == sin_name:
+            return None
+        return cos_name, sin_name
+
+    remove_names: set[str] = set()
+    insert_after: dict[str, list] = {}
+    fused = []
+    shape_initializers = []
+
+    for attn in [n for n in nodes if n.op_type == "Attention" and len(n.input) >= 3]:
+        endpoints = list(attn.input[:3])
+        plugins = [
+            upstream_plugin(endpoints[0], ".q_proj.weight"),
+            upstream_plugin(endpoints[1], ".k_proj.weight"),
+            upstream_plugin(endpoints[2], ".v_proj.weight"),
+        ]
+        if any(p is None for p in plugins):
+            continue
+        q_plugin, k_plugin, v_plugin = plugins
+        is_self = q_plugin.input[0] == k_plugin.input[0]
+        q_path = path_nodes(q_plugin.output[0], endpoints[0])
+        k_path = path_nodes(k_plugin.output[0], endpoints[1])
+        v_path = path_nodes(v_plugin.output[0], endpoints[2])
+        if not q_path or not k_path or not v_path:
+            continue
+        q_gamma = gamma_for(plugin_weight(q_plugin))
+        k_gamma = gamma_for(plugin_weight(k_plugin))
+        if q_gamma is None or k_gamma is None:
+            continue
+        rope = rope_inputs(q_path, k_path, q_plugin.output[0], k_plugin.output[0]) if is_self else None
+        if is_self and rope is None:
+            # Never silently swap or omit rotary inputs.
+            continue
+
+        for index, (plugin, path, endpoint, gamma) in enumerate((
+            (q_plugin, q_path, endpoints[0], q_gamma),
+            (k_plugin, k_path, endpoints[1], k_gamma),
+            (v_plugin, v_path, endpoints[2], None),
+        )):
+            weight_name = plugin_weight(plugin)
+            weight_init = init_by_name.get(weight_name)
+            if weight_init is None or len(weight_init.dims) != 2:
+                break
+            width = int(weight_init.dims[0])
+            if width % 128:
+                break
+            heads = width // 128
+            old_output = plugin.output[0]
+            row_output = unique(old_output + "_fused_rowmajor_fp16")
+            plugin.output[0] = row_output
+            set_attr(plugin, "output_dtype", "FP16")
+            set_attr(plugin, "output_dtype_id", int(TensorProto.FLOAT16))
+            if index < 2:
+                epilogue_kind = 2 if is_self else 1
+                plugin.input.append(gamma)
+                if is_self:
+                    plugin.input.extend([rope[0], rope[1]])
+                set_attr(plugin, "epilogue_kind", epilogue_kind)
+                set_attr(plugin, "epsilon", float(os.environ.get("HOTSTEP_RMS_NORM_EPS", "1e-6")))
+            else:
+                set_attr(plugin, "epilogue_kind", 0)
+
+            shape_name = unique(row_output + "_shape")
+            bsnh = unique(row_output + "_bsnh")
+            shape_initializers.append(numpy_helper.from_array(
+                np.asarray([0, 0, heads, 128], dtype=np.int64), name=shape_name))
+            reshape = helper.make_node(
+                "Reshape", [row_output, shape_name], [bsnh],
+                name=unique((plugin.name or row_output) + "/FusedViewBSNH"))
+            transpose = helper.make_node(
+                "Transpose", [bsnh], [endpoint],
+                name=unique((plugin.name or row_output) + "/FusedTransposeBHSD"),
+                perm=[0, 2, 1, 3])
+            insert_after.setdefault(plugin.name, []).extend([reshape, transpose])
+            remove_names.update(n.name for n in path)
+        else:
+            fused.append({"attention": attn.name, "self": is_self,
+                          "q": q_plugin.name, "k": k_plugin.name, "v": v_plugin.name})
+            continue
+        # Partial mutation is not expected because all dimensions are fixed by
+        # the model; fail loudly rather than emitting a half-mutated graph.
+        raise RuntimeError(f"failed to fuse all Q/K/V projections for {attn.name}")
+
+    if not fused:
+        return {"fused_attention_projections": 0, "examples": []}
+
+    new_nodes = []
+    for n in nodes:
+        if n.name in remove_names:
+            continue
+        new_nodes.append(n)
+        new_nodes.extend(insert_after.get(n.name, []))
+    del model.graph.node[:]
+    model.graph.node.extend(new_nodes)
+    model.graph.initializer.extend(shape_initializers)
+    return {"fused_attention_projections": len(fused), "examples": fused[:8]}
+
+
+def _fuse_w8a8_residual_epilogues(model) -> dict:
+    """Fuse self-O/down gated residuals and cross-O residuals into K2."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    nodes = list(model.graph.node)
+    consumers: dict[str, list] = {}
+    for n in nodes:
+        for i in n.input:
+            if i:
+                consumers.setdefault(i, []).append(n)
+
+    def set_attr(node, name, value):
+        kept = [a for a in node.attribute if a.name != name]
+        del node.attribute[:]
+        node.attribute.extend(kept)
+        node.attribute.append(helper.make_attribute(name, value))
+
+    def plugin_weight(node):
+        preq = 0
+        for a in node.attribute:
+            if a.name == "prequantized" and a.type == onnx.AttributeProto.INT:
+                preq = int(a.i)
+        idx = 2 if preq else 1
+        return node.input[idx] if len(node.input) > idx else ""
+
+    remove = set()
+    fused = []
+    eligible = 0
+    for plugin in [n for n in nodes if n.op_type == "ConvRotInt8Linear" and len(n.input) >= 3]:
+        weight = plugin_weight(plugin)
+        if ".o_proj.weight" not in weight and ".down_proj.weight" not in weight:
+            continue
+        eligible += 1
+        direct = consumers.get(plugin.output[0], [])
+        if len(direct) != 1:
+            continue
+        first = direct[0]
+        gate = None
+        add = None
+        projected_tensor = plugin.output[0]
+        if first.op_type == "Mul":
+            mul_consumers = consumers.get(first.output[0], [])
+            if len(mul_consumers) != 1 or mul_consumers[0].op_type != "Add":
+                continue
+            add = mul_consumers[0]
+            gate = first.input[1] if first.input[0] == projected_tensor else first.input[0]
+            projected_tensor = first.output[0]
+        elif first.op_type == "Add":
+            add = first
+        else:
+            continue
+        if add is None or projected_tensor not in add.input or len(add.output) != 1:
+            continue
+        residual = add.input[1] if add.input[0] == projected_tensor else add.input[0]
+        old_output = plugin.output[0]
+        plugin.output[0] = add.output[0]
+        plugin.input.append(residual)
+        if gate is not None:
+            plugin.input.append(gate)
+            epilogue_kind = 4
+            remove.add(first.name)
+        else:
+            epilogue_kind = 3
+        set_attr(plugin, "epilogue_kind", epilogue_kind)
+        set_attr(plugin, "output_dtype", "FP32")
+        set_attr(plugin, "output_dtype_id", int(TensorProto.FLOAT))
+        remove.add(add.name)
+        fused.append({"plugin": plugin.name, "weight": weight,
+                      "old_output": old_output, "output": plugin.output[0],
+                      "gated": gate is not None})
+
+    if not fused:
+        return {"eligible_residual_epilogues": eligible,
+                "fused_residual_epilogues": 0, "examples": []}
+    kept = [n for n in nodes if n.name not in remove]
+    del model.graph.node[:]
+    model.graph.node.extend(kept)
+    return {"eligible_residual_epilogues": eligible,
+            "fused_residual_epilogues": len(fused), "examples": fused[:8]}
 
 
 def _w8a8_rewrite_dispatch(model, quant_report: dict) -> dict:
@@ -2504,7 +3187,7 @@ def _string_attr(node, name: str, default: str = "") -> str:
 def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_name: str = "FP16") -> dict:
     """Make TensorRT strongly-typed elementwise islands agree on the plugin lowp dtype.
 
-    ConvRotInt8Linear v2 emits FP16 in this T4-compatible variant. In a
+    ConvRotInt8Linear v3 emits FP16 in this T4-compatible variant. In a
     strongly typed TRT network, elementwise nodes such as
     Add/Mul are not allowed to mix FP32 and lowp tensors. This pass propagates
     the target lowp dtype through dtype-preserving ONNX ops and inserts casts
@@ -2851,12 +3534,20 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
             )
         plugin_group_size = int(group_size)
 
-        # Using FP32 for accuracy. It's worse with BF16 and catastrophic with FP16 here
-        if any(t in weight_source for t in ["q_proj", "k_proj", "v_proj"]):
+        # Selective boundaries: keep normalized hidden activations FP32, but
+        # write V directly in the FP16 precision consumed by Attention. Q/K are
+        # changed to fused FP32-RMSNorm(+RoPE)->FP16 epilogues after the
+        # Attention rewrite, when their complete projection subgraphs are known.
+        if any(t in weight_source for t in ["q_proj", "k_proj"]):
             input_dtype = "FP32"
             output_dtype = "FP32"
-        elif "o_proj" in weight_source:
+        elif "v_proj" in weight_source:
             input_dtype = "FP32"
+            output_dtype = "FP16"
+        elif "o_proj" in weight_source:
+            # Attention already produces FP16. The old FP16->FP32 cast added no
+            # information before K1 and is removed by the attention rewrite.
+            input_dtype = "FP16"
             output_dtype = "FP32"
         elif any(t in weight_source for t in ["gate_proj", "up_proj"]):
             input_dtype = "FP32"
@@ -2920,11 +3611,14 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
 
     del model.graph.node[:]
     model.graph.node.extend(new_nodes)
-    fp16_island_report = (
-        _rewrite_w8a8_fp16_islands(model, lowp_plugin_outputs, boundary_dtype if boundary_dtype != "FP32" else "FP16")
-        if lowp_plugin_outputs
-        else {"lowp_boundary_casts_inserted": [], "lowp_tensor_count": 0}
-    )
+    # Do not propagate FP16 through arbitrary elementwise/reduction islands.
+    # The selective policy intentionally keeps RMSNorm/AdaLN in FP32 and only
+    # narrows tensors at custom epilogues or the explicit Attention boundary.
+    fp16_island_report = {
+        "lowp_boundary_casts_inserted": [],
+        "lowp_tensor_count": len(lowp_plugin_outputs),
+        "selective_boundaries": True,
+    }
     return {
         "rewritten_nodes": rewritten,
         "plugin_op": _OP_NAME,
@@ -3160,6 +3854,7 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
         keep_initializers_as_inputs=True,
         external_data=True,
     )
+    _dump_source_onnx_graph_without_weights(graph_shell_path)
     print(f"[export_dit] Streaming {precision} safetensors into ONNX external data...")
     try:
         stream_result = _externalize_initializers_from_safetensors(
@@ -3229,8 +3924,8 @@ def main():
     parser.add_argument("--stream-chunk-mb", type=int, default=16,
                         help="Chunk size in MB for low-memory tensor streaming (default: 16)")
     parser.add_argument("--convrot-group-size", type=int, default=None,
-                        help="ConvRot Hadamard group size for w8a8 (default: 64). "
-                             "Only 64 is compiled into the TensorRT plugin. "
+                        help="ConvRot Hadamard group size for w8a8 (default: 256). "
+                             "Only 256 is compiled into the TensorRT plugin. "
                              "Overrides the HOTSTEP_CONVROT_GROUP_SIZE env var.")
     parser.add_argument("--force", action="store_true",
                         help="Re-export even if the output ONNX already exists")
