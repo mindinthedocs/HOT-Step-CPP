@@ -570,7 +570,7 @@ def kernel1_convrot_quant(
             tl.store(xs_ptr_block, scale, mask=mask_m)
 
 
-@triton.autotune(configs=_K2_CONFIGS, key=["M", "N", "K", "OUTPUT_FP16"])
+@triton.autotune(configs=_K2_CONFIGS, key=["M", "N", "K", "HAS_BIAS", "OUTPUT_FP16"])
 @triton.jit
 def kernel2_gemm_dequant(
     X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
@@ -584,6 +584,7 @@ def kernel2_gemm_dequant(
     BLOCK_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     GROUP_M: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     OUTPUT_FP16: tl.constexpr,
 ):
     """K2 — plain INT8 GEMM + late per-group xs fold ("hybrid_direct" variant).
@@ -602,9 +603,8 @@ def kernel2_gemm_dequant(
     selected BLOCK_N; the plugin rejects unsupported N rather than shipping a
     masked fallback.
 
-    Bias handling: HAS_BIAS is compile-time-hardwired to True (the single
-    shipped K2 cubin).  No-bias plugin instances pass a workspace zero-bias
-    vector so the same cubin handles both cases.
+    Bias handling remains a compile-time specialization.  Separate BIAS and
+    NOBIAS cubins are generated so no-bias layers skip the bias load/add.
 
     sm86 optimization notes (Nsight Compute profiled):
 
@@ -669,13 +669,12 @@ def kernel2_gemm_dequant(
 
             acc += int32_acc.to(tl.float32) * xs[:, None]
 
-        # W_scale and bias are epilogue-only, outside the K loop.  HAS_BIAS is
-        # compile-time True (see BIAS_CONFIGS below); no-bias plugin instances
-        # pass a zero-filled FP32 bias vector from workspace.
+        # W_scale and optional bias are epilogue-only, outside the K loop.
         ws = tl.load(W_scale_ptr + rn, eviction_policy="evict_last")
         acc = acc * ws[None, :]
-        bias = tl.load(Bias_ptr + rn, eviction_policy="evict_last")
-        acc += bias[None, :]
+        if HAS_BIAS:
+            bias = tl.load(Bias_ptr + rn, eviction_policy="evict_last")
+            acc += bias[None, :]
 
         y_ptr_block = Y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn
         if OUTPUT_FP16:
@@ -697,13 +696,11 @@ TILE_NAME = "PersistentG256"
 #       "hybrid_direct" variant: canonical [N, K] W_q consumed via
 #       tl.dot(xq, tl.trans(wq)), late per-group xs load, W_scale/bias
 #       epilogue-only.  The plugin pads/splits runtime M on the host side
-#       instead of shipping masked K2 variants.  Only the bias-enabled K2
-#       cubin ships; no-bias plugin instances pass a workspace zero-bias
-#       vector.
-CONVROT_INT8_CUBIN_HEADER_VERSION = 7
-# K2 is always compiled with HAS_BIAS=True.  For no-bias ONNX layers, the C++
-# plugin passes a zero-filled FP32 bias vector from workspace.
-BIAS_CONFIGS = [("BIAS", True)]
+#       instead of shipping masked K2 variants.  Version 8 restores separate
+#       compile-time BIAS and NOBIAS K2 cubins.
+CONVROT_INT8_CUBIN_HEADER_VERSION = 8
+# K2 ships separate compile-time bias and no-bias specializations.
+BIAS_CONFIGS = [("NOBIAS", False), ("BIAS", True)]
 DTYPE_CONFIGS = [("FP32IO", False, False)]
 # Real DiT decoder K2 shapes, expressed as (M, K, N).  M=3000 is not
 # divisible by all candidate BLOCK_M values; extract_k2 pads the benchmark M
@@ -1420,6 +1417,7 @@ def _flush_compiled_kernel_cache(jit_fn):
 # don't overwrite each other's torch memory tensors.
 _K1_WORKER_STATE = threading.local()
 _K2_WORKER_STATE = threading.local()
+_K2_ACTIVE_HAS_BIAS = True
 
 
 def _init_k1_worker(input_fp16):
@@ -1514,7 +1512,7 @@ def _worker_precompile_k2(config_tuple):
             _K2_WORKER_STATE.ws, _K2_WORKER_STATE.bias, _K2_WORKER_STATE.y,
             1024, 2560, 2560,
             2560, 1, 1, 1024, 2560, 1, 2560, 1,
-            GROUP_SIZE=256, OUTPUT_FP16=output_fp16,
+            GROUP_SIZE=256, HAS_BIAS=_K2_ACTIVE_HAS_BIAS, OUTPUT_FP16=output_fp16,
             **cfg.all_kwargs(),
             grid=(1, 1, 1)
         )
@@ -1759,9 +1757,8 @@ def _spill_check_variants(stage):
             yield (dtype_suffix, signature,
                    {'GROUP_SIZE': 256, 'INPUT_FP16': input_fp16, 'CONTIG_XK': True})
     else:  # k2
-        # HAS_BIAS is compile-time-hardwired in the shipped K2 cubin
-        # (see BIAS_CONFIGS).  Iterating BIAS_CONFIGS keeps the label scheme
-        # in sync with the extraction summary and the C++ cubin lookup.
+        # Spill-check both shipped compile-time bias variants.  Register
+        # pressure can differ because BIAS retains an extra epilogue vector.
         for bias_suffix, _has_bias in BIAS_CONFIGS:
             for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
                 y_type = '*fp16' if output_fp16 else '*fp32'
@@ -1775,7 +1772,7 @@ def _spill_check_variants(stage):
                     'stride_ym': 'i32', 'stride_yn': 'i32',
                 }
                 yield (f"{bias_suffix}_{dtype_suffix}", signature,
-                       {'GROUP_SIZE': 256,
+                       {'GROUP_SIZE': 256, 'HAS_BIAS': _has_bias,
                         'OUTPUT_FP16': output_fp16})
 
 
@@ -1968,6 +1965,7 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
     grid_x = _autotune_grid_x(num_tiles, num_sms, ctas)
     kwargs = dict(cfg.kwargs)
     kwargs["GROUP_SIZE"] = GROUP_SIZE
+    kwargs["HAS_BIAS"] = _K2_ACTIVE_HAS_BIAS
     kwargs["OUTPUT_FP16"] = output_fp16
     kwargs["num_warps"] = cfg.num_warps
     kwargs["num_stages"] = cfg.num_stages
@@ -2178,10 +2176,10 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
     results = {}
     if num_sms == 0:
         num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    # HAS_BIAS is compile-time-hardwired True in the shipped K2 cubin (see
-    # BIAS_CONFIGS).  We still iterate BIAS_CONFIGS so the label scheme in the
-    # extraction summary and the generated cubin lookup stays uniform.
+    # Build and benchmark separate compile-time bias/no-bias K2 variants.
     for bias_suffix, _has_bias in BIAS_CONFIGS:
+        global _K2_ACTIVE_HAS_BIAS
+        _K2_ACTIVE_HAS_BIAS = _has_bias
         for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
             config_name = f"{bias_suffix}_{dtype_suffix}"
             print(f"\n  K2 G256 {config_name} (custom-bench selection)...", flush=True)
@@ -2205,9 +2203,8 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             # changes.
             wq = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
             ws = torch.rand((N,), device="cuda", dtype=torch.float32) * 0.02 + 0.001
-            # HAS_BIAS is hardwired True in the shipped cubin; always pass a
-            # real bias tensor to autotune so the fused epilogue is measured.
-            bias = torch.randn((N,), device="cuda", dtype=torch.float32)
+            bias = (torch.randn((N,), device="cuda", dtype=torch.float32)
+                    if _has_bias else torch.empty((1,), device="cuda", dtype=torch.float32))
             y = torch.empty((M, N), device="cuda", dtype=out_dtype)
             # Bypass Triton's @autotune measurement (its internal do_bench is
             # too noisy at the ~2% level, causing mis-ranking of adjacent K2
@@ -2238,6 +2235,7 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                 kernel2_gemm_dequant, best_cfg,
                 debug_dump=debug_dump,
                 GROUP_SIZE=GROUP_SIZE,
+                HAS_BIAS=_has_bias,
                 OUTPUT_FP16=output_fp16,
             )
 

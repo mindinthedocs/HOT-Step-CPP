@@ -225,8 +225,8 @@ class TestK1UnalignedM(unittest.TestCase):
 
 class TestK2GemmDequant(unittest.TestCase):
     """The hybrid_direct K2 kernel matches a NumPy reference for the canonical
-    [N, K] W_q layout.  HAS_BIAS is compile-time True in the shipped cubin, so
-    no-bias layers pass a zero bias vector (validated below).
+    [N, K] W_q layout.  BIAS and NOBIAS are separate compile-time variants;
+    their equivalent zero-bias math is validated below.
     """
 
     def setUp(self):

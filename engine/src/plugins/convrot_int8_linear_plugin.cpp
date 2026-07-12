@@ -68,12 +68,13 @@
 //            kernel with late per-group xs load, W_scale/bias epilogue-only, and
 //            the canonical [N, K] W_q layout consumed via tl.dot(xq, tl.trans(wq));
 //            the plugin pads/splits runtime M on the host side instead of
-//            shipping masked K2 variants.  Only the bias-enabled K2 cubin
-//            ships; no-bias plugin instances pass a workspace zero-bias vector.
+//            shipping masked K2 variants.
+// Version 8: restores separate compile-time BIAS and NOBIAS K2 cubins; NOBIAS
+//            removes the bias load/add and no longer needs a zero-bias workspace.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 7
-#  error "Cubin header version >= 7 required (hybrid_direct K2, host-side M padding, single bias-enabled K2 cubin, direct H4 K1 rotation, occupancy-scaled persistent grid). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 8
+#  error "Cubin header version >= 8 required (hybrid_direct K2 with separate BIAS/NOBIAS variants, host-side M padding, direct H4 K1 rotation, occupancy-scaled persistent grid). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -930,12 +931,7 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
         static_cast<size_t>(kMaxK2WorkspacePadBlockM) * static_cast<size_t>(m_out_features) *
             dtypeSizeBytesFromId(m_output_dtype_id),
         16);
-    // Version 7 ships only the bias-enabled K2 cubin.  No-bias layers pass this
-    // zero-filled FP32 vector as Bias_ptr so one K2 cubin handles both cases.
-    size_t zero_bias_size = m_has_bias ? 0 : alignUp(
-        static_cast<size_t>(m_out_features) * sizeof(float),
-        16);
-    return x_q_size + x_scale_size + y_tail_size + zero_bias_size;
+    return x_q_size + x_scale_size + y_tail_size;
 }
 
 // ── Custom Tactics (IPluginV3OneBuild) ──────────────────────────────────────
@@ -1155,17 +1151,8 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         void* xq_ptr = workspace;
         void* xs_ptr = static_cast<char*>(workspace) + x_q_size;
         void* y_tail_ptr = static_cast<char*>(xs_ptr) + x_scale_size;
-        void* zero_bias_ptr = static_cast<char*>(y_tail_ptr) + y_tail_size;
+        // NOBIAS cubins compile the bias pointer and epilogue branch away.
         void const* bias_ptr = input_bias_ptr;
-        if (!m_has_bias) {
-            cudaError_t zb = cudaMemsetAsync(
-                zero_bias_ptr,
-                0,
-                static_cast<size_t>(N) * sizeof(float),
-                stream);
-            if (zb != cudaSuccess) return -1;
-            bias_ptr = zero_bias_ptr;
-        }
 
         int32_t stride_xqm = K;
         int32_t stride_xqk = 1;
@@ -1396,15 +1383,10 @@ GeneratedCubinDesc const* selectCubinK2(int32_t group_size,
                                         bool has_bias,
                                         int32_t input_dtype_id,
                                         int32_t output_dtype_id) {
-    (void)has_bias;
-    // Version 7 ships only the bias-enabled K2 cubin.  No-bias plugin
-    // instances pass a zero-filled FP32 bias vector from workspace, which is
-    // cheaper than duplicating the K2 cubin inventory for a branch that has no
-    // measurable resource difference on sm86.
     return hotstep::convrot_int8_generated::findConvRotCubin(
         hotstep::convrot_int8_generated::ConvRotKernelStage::kGemm,
         group_size,
-        true,
+        has_bias,
         input_dtype_id,
         output_dtype_id);
 }
