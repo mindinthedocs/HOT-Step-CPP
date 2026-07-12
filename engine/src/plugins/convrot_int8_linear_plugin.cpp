@@ -44,7 +44,7 @@
 
 #if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
 // ── Cubin header version guard ─────────────────────────────────────────────
-// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 9.
+// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 10.
 // Version 3 added per-cubin tile dimensions; version 4 additionally reflects
 // the intentionally smaller cubin inventory: G256 only (plus optional G0 sentinel), and no specialized M1
 // cubins. Referencing removed G0/G256/M1 symbols here would make the plugin
@@ -73,10 +73,12 @@
 //            removes the bias load/add and no longer needs a zero-bias workspace.
 // Version 9: strict numerically-locked K1 tuning and redundant no-spill gates;
 //            the plugin rejects any loaded function with nonzero local memory.
+// Version 10: K2 supports descriptor-selected 1-D or 2-D persistent grids;
+//             arithmetic remains bitwise-checked against the v9 K2 baseline.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 9
-#  error "Cubin header version >= 9 required (strict exact K1 tuning and zero-local-memory gate). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 10
+#  error "Cubin header version >= 10 required (strict K1/K2 exactness and K2 scheduler metadata). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -120,6 +122,7 @@ struct ConvRotCubinDesc {
     int32_t block_n{1};
     int32_t block_k{1};
     int32_t group_m{1};
+    bool schedule_2d{false};
     uint32_t block_x{1};
     uint32_t block_y{1};
     uint32_t block_z{1};

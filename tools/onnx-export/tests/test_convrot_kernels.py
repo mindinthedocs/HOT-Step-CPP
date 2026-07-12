@@ -72,11 +72,11 @@ def _set_k1_config(BLOCK_M):
     ]
 
 
-def _set_k2_config(BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M):
+def _set_k2_config(BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, SCHEDULE_2D=False):
     m.kernel2_gemm_dequant.configs = [
         m.triton.Config(
             {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K,
-             "GROUP_M": GROUP_M},
+             "GROUP_M": GROUP_M, "SCHEDULE_2D": SCHEDULE_2D},
             num_warps=4, num_stages=1,
         )
     ]
@@ -250,11 +250,13 @@ class TestK2GemmDequant(unittest.TestCase):
             y += bias_np[None, :]
         return y
 
-    def _triton_k2(self, xq, xs, wq_N_K, ws, bias, has_bias):
+    def _triton_k2(self, xq, xs, wq_N_K, ws, bias, has_bias,
+                   schedule_2d=False):
         M, K = xq.shape
         N = wq_N_K.shape[0]
         y = torch.empty((M, N), dtype=torch.float32, device=xq.device)
-        _set_k2_config(BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4)
+        _set_k2_config(BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4,
+                       SCHEDULE_2D=schedule_2d)
 
         # HAS_BIAS is compile-time True in the shipped cubin.  For no-bias
         # layers the plugin passes a zero-filled bias vector.
@@ -296,6 +298,15 @@ class TestK2GemmDequant(unittest.TestCase):
         y_ref = self._reference(xq.numpy(), xs.numpy(), wq.numpy(), ws.numpy(), bias.numpy(), True)
         max_diff = float(np.max(np.abs(y.numpy() - y_ref)))
         self.assertLess(max_diff, 1e-3, f"with-bias: max_diff={max_diff:.4e}")
+
+    def test_2d_scheduler_is_bitwise_identical(self):
+        xq, xs, wq, ws, bias = self._build_inputs()
+        y_1d = self._triton_k2(xq, xs, wq, ws, bias, has_bias=True,
+                               schedule_2d=False)
+        y_2d = self._triton_k2(xq, xs, wq, ws, bias, has_bias=True,
+                               schedule_2d=True)
+        self.assertTrue(torch.equal(y_1d.view(torch.int32),
+                                    y_2d.view(torch.int32)))
 
 
 class TestK2HostPadding(unittest.TestCase):

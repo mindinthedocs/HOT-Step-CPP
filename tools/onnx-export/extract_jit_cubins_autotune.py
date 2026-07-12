@@ -288,6 +288,7 @@ def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, 
                     "BLOCK_N": bn,
                     "BLOCK_K": bk,
                     "GROUP_M": gm,
+                    "SCHEDULE_2D": False,
                 }
                 key = (bm, bn, bk, gm, nw, ns)
                 if key in seen:
@@ -313,6 +314,7 @@ def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
     def _cfg_key(c):
         return (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
                 c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
+                bool(c.kwargs.get("SCHEDULE_2D", False)),
                 c.num_warps, c.num_stages)
 
     seen = {_cfg_key(c) for c in base_configs}
@@ -335,7 +337,7 @@ def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
                         for gm in [4, 8]:
                             extra_warps_stages = [(4, 2), (8, 2)] if (bm == 32 and bn >= 256 and bk == 32) else [(4, 3), (8, 3)]
                             for nw, ns in extra_warps_stages:
-                                key = (bm, bn, bk, gm, nw, ns)
+                                key = (bm, bn, bk, gm, False, nw, ns)
                                 if key in seen:
                                     continue
                                 seen.add(key)
@@ -344,8 +346,54 @@ def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
                                     "BLOCK_N": bn,
                                     "BLOCK_K": bk,
                                     "GROUP_M": gm,
+                                    "SCHEDULE_2D": False,
                                 }
                                 extra.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
+    return base_configs + extra
+
+
+def _add_k2_2d_schedule_candidates(base_configs, arch):
+    """Add a small, numerically identical 2-D persistent-scheduler family.
+
+    The arithmetic tile body is shared verbatim with the 1-D reference.  Only
+    CTA-to-output-tile ownership changes.  Restrict the initial sm80-sm89 search
+    to resource shapes that are already competitive on the RTX 3050, avoiding
+    a Cartesian doubling of the full K2 space.
+    """
+    if not (80 <= int(arch) <= 89):
+        return base_configs
+
+    specs = [
+        # Current sm86 winner, with tile-index division removed.
+        (128, 64, 64, 1, 8, 3),
+        # Symmetric traffic alternative that is consistently second-tier.
+        (64, 128, 64, 1, 8, 3),
+        # Smaller tile: candidate for better production-tail efficiency.
+        (64, 64, 64, 1, 8, 3),
+        # Larger output tile with shallower BK/staging; spill gate decides.
+        (128, 128, 32, 1, 8, 2),
+    ]
+
+    seen = {
+        (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
+         c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
+         bool(c.kwargs.get("SCHEDULE_2D", False)),
+         c.num_warps, c.num_stages, getattr(c, "maxnreg", None))
+        for c in base_configs
+    }
+    extra = []
+    for bm, bn, bk, gm, nw, ns in specs:
+        key = (bm, bn, bk, gm, True, nw, ns, None)
+        if key in seen:
+            continue
+        seen.add(key)
+        extra.append(Config({
+            "BLOCK_M": bm,
+            "BLOCK_N": bn,
+            "BLOCK_K": bk,
+            "GROUP_M": gm,       # unused by the 2-D schedule; ABI identity only
+            "SCHEDULE_2D": True,
+        }, num_warps=nw, num_stages=ns))
     return base_configs + extra
 
 
@@ -595,6 +643,71 @@ def kernel1_convrot_quant(
             tl.store(xs_ptr_block, scale, mask=mask_m)
 
 
+@triton.jit
+def _kernel2_compute_tile(
+    X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
+    M, N, K,
+    stride_xqm, stride_xqk,
+    stride_xsm, stride_xsg,
+    stride_wn, stride_wk,
+    stride_ym, stride_yn,
+    pid_m, pid_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    OUTPUT_FP16: tl.constexpr,
+):
+    """Numerically locked K2 tile body shared by the 1-D and 2-D schedulers.
+
+    Moving the existing body into this always-inlined helper was verified to
+    produce the same sm86 SASS instruction multiset and resource usage for the
+    baseline BM128/BN64/BK64/W8/S3 cubin.  In particular, the required
+    arithmetic contract remains one INT32 fold per 256-wide activation-scale
+    group followed by FP32 group accumulation, a single W_scale multiply, and
+    the optional bias add.
+    """
+    GROUPS_PER_TILE: tl.constexpr = GROUP_SIZE // BLOCK_K
+    pid_m_off = pid_m * BLOCK_M
+    pid_n_off = pid_n * BLOCK_N
+    rm = pid_m_off + tl.arange(0, BLOCK_M)
+    rn = pid_n_off + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k_group_start in tl.range(0, K, GROUP_SIZE):
+        group_idx = k_group_start // GROUP_SIZE
+        xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + rm * stride_xsm
+        xs = tl.load(xs_ptr_block, eviction_policy="evict_last")
+
+        int32_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        for sub in tl.static_range(0, GROUPS_PER_TILE):
+            k_offset = k_group_start + sub * BLOCK_K
+            cols_k = k_offset + tl.arange(0, BLOCK_K)
+            xq = tl.load(
+                X_q_ptr + rm[:, None] * stride_xqm + cols_k[None, :] * stride_xqk)
+            # Canonical W_q layout remains [N,K].  Keeping this exact load and
+            # tl.trans path avoids the quality/regression observed in the Gluon
+            # experiment and requires no weight-format change.
+            wq = tl.load(
+                W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
+            int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
+
+        acc += int32_acc.to(tl.float32) * xs[:, None]
+
+    ws = tl.load(W_scale_ptr + rn, eviction_policy="evict_last")
+    acc = acc * ws[None, :]
+    if HAS_BIAS:
+        bias = tl.load(Bias_ptr + rn, eviction_policy="evict_last")
+        acc += bias[None, :]
+
+    y_ptr_block = Y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn
+    if OUTPUT_FP16:
+        tl.store(y_ptr_block, acc.to(tl.float16))
+    else:
+        tl.store(y_ptr_block, acc.to(tl.float32))
+
+
 @triton.autotune(configs=_K2_CONFIGS, key=["M", "N", "K", "HAS_BIAS", "OUTPUT_FP16"])
 @triton.jit
 def kernel2_gemm_dequant(
@@ -611,6 +724,7 @@ def kernel2_gemm_dequant(
     GROUP_M: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     OUTPUT_FP16: tl.constexpr,
+    SCHEDULE_2D: tl.constexpr = False,
 ):
     """K2 — plain INT8 GEMM + late per-group xs fold ("hybrid_direct" variant).
 
@@ -644,68 +758,60 @@ def kernel2_gemm_dequant(
          rate ~3% — the hints add LSU overhead for zero benefit on streaming
          INT8 operands that never fit L1).
 
-      4. Persistent grid stride uses ``tl.num_programs(0)`` so the kernel
-         matches the host's occupancy-scaled launch geometry
-         (``min(num_tiles, num_sms * max_active_ctas_per_sm)``) without
-         carrying a runtime NUM_SMS argument.
+      4. The original 1-D GROUP_M persistent scheduler remains the numerical
+         reference.  ``SCHEDULE_2D=True`` uses a bounded 2-D persistent grid
+         and removes repeated dynamic tile division/modulo while calling the
+         identical tile body.  The generated descriptor makes the plugin use
+         the matching launch geometry.
     """
     tl.static_assert(GROUP_SIZE == 256, "Only GROUP_SIZE=256 is supported")
-    tl.static_assert(GROUP_SIZE % BLOCK_K == 0, "GROUP_SIZE must be a multiple of BLOCK_K")
-    GROUPS_PER_TILE: tl.constexpr = GROUP_SIZE // BLOCK_K
+    tl.static_assert(GROUP_SIZE % BLOCK_K == 0,
+                     "GROUP_SIZE must be a multiple of BLOCK_K")
 
     num_pid_m = tl.cdiv(M, BLOCK_M)
     num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_tiles = num_pid_m * num_pid_n
-    num_pid_in_group = GROUP_M * num_pid_n
 
-    start_pid = tl.program_id(0)
-    grid_x = tl.num_programs(0)
-    for tile_id in tl.range(start_pid, num_tiles, grid_x):
-        group_id = tile_id // num_pid_in_group
-        first_pid_m = group_id * GROUP_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-        pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-        pid_n = (tile_id % num_pid_in_group) // group_size_m
-
-        pid_m_off = pid_m * BLOCK_M
-        pid_n_off = pid_n * BLOCK_N
-
-        rm = pid_m_off + tl.arange(0, BLOCK_M)
-        rn = pid_n_off + tl.arange(0, BLOCK_N)
-
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-        for k_group_start in tl.range(0, K, GROUP_SIZE):
-            group_idx = k_group_start // GROUP_SIZE
-            # Load xs ONCE per group (outside the sub-MMA loop).
-            xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + rm * stride_xsm
-            xs = tl.load(xs_ptr_block, eviction_policy="evict_last")
-
-            int32_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-            for sub in tl.static_range(0, GROUPS_PER_TILE):
-                k_offset = k_group_start + sub * BLOCK_K
-                cols_k = k_offset + tl.arange(0, BLOCK_K)
-                # Unmasked loads; no eviction_policy hint on streaming INT8.
-                xq = tl.load(X_q_ptr + rm[:, None] * stride_xqm + cols_k[None, :] * stride_xqk)
-                # W_q is [N, K] row-major (canonical Linear layout); consume
-                # it with tl.trans(wq) so the IMMA is fed [BM,BK] x [BK,BN].
-                wq = tl.load(W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
-                int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
-
-            acc += int32_acc.to(tl.float32) * xs[:, None]
-
-        # W_scale and optional bias are epilogue-only, outside the K loop.
-        ws = tl.load(W_scale_ptr + rn, eviction_policy="evict_last")
-        acc = acc * ws[None, :]
-        if HAS_BIAS:
-            bias = tl.load(Bias_ptr + rn, eviction_policy="evict_last")
-            acc += bias[None, :]
-
-        y_ptr_block = Y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn
-        if OUTPUT_FP16:
-            tl.store(y_ptr_block, acc.to(tl.float16))
-        else:
-            tl.store(y_ptr_block, acc.to(tl.float32))
+    if SCHEDULE_2D:
+        # Division-free persistent scheduler.  The host launches a bounded 2-D
+        # grid.  Each CTA owns a deterministic strided set of M/N tiles, so the
+        # per-output arithmetic is exactly the same as the baseline scheduler.
+        start_pid_m = tl.program_id(0)
+        start_pid_n = tl.program_id(1)
+        grid_m = tl.num_programs(0)
+        grid_n = tl.num_programs(1)
+        for pid_m in tl.range(start_pid_m, num_pid_m, grid_m):
+            for pid_n in tl.range(start_pid_n, num_pid_n, grid_n):
+                _kernel2_compute_tile(
+                    X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
+                    M, N, K,
+                    stride_xqm, stride_xqk, stride_xsm, stride_xsg,
+                    stride_wn, stride_wk, stride_ym, stride_yn,
+                    pid_m, pid_n,
+                    BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE,
+                    HAS_BIAS, OUTPUT_FP16,
+                )
+    else:
+        # Existing 1-D GROUP_M super-group scheduler retained as the reference
+        # and as an autotuned candidate.
+        num_tiles = num_pid_m * num_pid_n
+        num_pid_in_group = GROUP_M * num_pid_n
+        start_pid = tl.program_id(0)
+        grid_x = tl.num_programs(0)
+        for tile_id in tl.range(start_pid, num_tiles, grid_x):
+            group_id = tile_id // num_pid_in_group
+            first_pid_m = group_id * GROUP_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+            pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
+            pid_n = (tile_id % num_pid_in_group) // group_size_m
+            _kernel2_compute_tile(
+                X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
+                M, N, K,
+                stride_xqm, stride_xqk, stride_xsm, stride_xsg,
+                stride_wn, stride_wk, stride_ym, stride_yn,
+                pid_m, pid_n,
+                BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE,
+                HAS_BIAS, OUTPUT_FP16,
+            )
 
 
 GROUP_SIZE = 256
@@ -727,7 +833,11 @@ TILE_NAME = "PersistentG256"
 #       exact-specialization zero-spill gate (STACK + PTX + final SASS +
 #       scratch), per-config K1 occupancy, generic runtime-M extraction,
 #       bitwise BM16/W4 equivalence/canary gate, and redundant modulo removal.
-CONVROT_INT8_CUBIN_HEADER_VERSION = 9
+#  10 — numerically locked K2 tile helper plus an optional division-free 2-D
+#       persistent scheduler.  Selection uses a weighted multi-shape benchmark
+#       of the exact plugin prefix/tail/copy sequence and rejects any candidate
+#       that differs bitwise from the v9 BM128/BN64/BK64 reference.
+CONVROT_INT8_CUBIN_HEADER_VERSION = 10
 # K2 ships separate compile-time bias and no-bias specializations.
 BIAS_CONFIGS = [("NOBIAS", False), ("BIAS", True)]
 DTYPE_CONFIGS = [("FP32IO", False, False)]
@@ -742,12 +852,15 @@ DTYPE_CONFIGS = [("FP32IO", False, False)]
 # SM-wave-aware candidate injection, so down_proj / attention projections are
 # represented in the candidate set.
 AUTOTUNE_SHAPES_K2 = [
-    (3000, 2560, 9728),  # dit.mlp.gate_proj  — dominant, wide N
-    (3000, 9728, 2560),  # dit.mlp.down_proj  — dominant, large K
-    (3000, 2560, 4096),  # dit.self_attn.q_proj
-    (3000, 2560, 1024),  # dit.self_attn.k_proj
-    (3000, 4096, 2560),  # dit.self_attn.o_proj
+    (3000, 2560, 9728),  # dit.mlp.gate/up projections
+    (3000, 9728, 2560),  # dit.mlp.down projection
+    (3000, 2560, 4096),  # dit.self_attn.q projection
+    (3000, 2560, 1024),  # dit.self_attn.k/v projections
+    (3000, 4096, 2560),  # dit.self_attn.o projection
 ]
+# Approximate per-layer call multiplicity.  Override with a comma-separated
+# HOTSTEP_K2_SHAPE_WEIGHTS list when the exported graph differs.
+K2_DEFAULT_SHAPE_WEIGHTS = (2.0, 1.0, 1.0, 2.0, 1.0)
 K2_AUTOTUNE_M_ALIGNMENT = 128  # max generated K2 BLOCK_M; avoids OOB in plain K2
 # K1 uses the same workspace pitch contract as K2 but the real, unpadded M so
 # the shipped cubin makes no false divisibility assumption about runtime M.
@@ -787,12 +900,25 @@ AUTOTUNE_OCCUPANCY_ASSUMPTION = 2
 # both stages now benchmark with the same occupancy-scaled grid as production.
 _K1_CFG_OCCUPANCY: dict = {}
 _K2_CFG_OCCUPANCY: dict = {}
+# K2 additionally keeps bias-specific occupancy so NOBIAS benchmarking is not
+# under-launched merely because the BIAS epilogue needs more registers.
+_K2_CFG_OCCUPANCY_BY_BIAS: dict = {}
 
 
 def _cfg_occupancy_key(cfg):
     """Identity tuple matching ``_filter_spilling_configs``'s reject map."""
     return (tuple(sorted(cfg.kwargs.items())), cfg.num_warps, cfg.num_stages,
             getattr(cfg, "maxnreg", None))
+
+
+def _max_shared_bytes_per_block(arch: int) -> int:
+    if arch == 75:
+        return 48 * 1024
+    if arch == 80 or arch == 87:
+        return 163 * 1024
+    if 86 <= arch <= 89:
+        return 99 * 1024
+    return 48 * 1024
 
 
 def _compute_ctas_per_sm(shared_bytes: int, num_regs: int, num_warps: int,
@@ -1392,10 +1518,9 @@ def _get_compiled_kernel_for_cfg(autotuned_fn, best_cfg, device=0,
                                  debug_dump=False, **runtime_kwargs):
     """Same as ``_get_compiled_kernel`` but for a caller-selected ``best_cfg``.
 
-    The custom K2 benchmarker (``_bench_k2_configs_custom``) bypasses
-    ``@triton.autotune``'s built-in measurement, so ``autotuned_fn.best_config``
-    is not populated for the shape we care about.  Instead we hand the picked
-    config in explicitly and reuse the same cache-walking helpers.
+    The weighted K2 workload benchmark bypasses ``@triton.autotune``'s built-in
+    measurement, so ``autotuned_fn.best_config`` is not populated.  Instead we
+    hand the picked config in explicitly and reuse the cache-walking helpers.
     """
     base_fn = _find_jit_holder(autotuned_fn)
     if base_fn is None:
@@ -1866,9 +1991,23 @@ def _spill_check_variants(stage):
                     'stride_wn': 'i32', 'stride_wk': 'i32',
                     'stride_ym': 'i32', 'stride_yn': 'i32',
                 }
+                constexprs = {
+                    'GROUP_SIZE': 256,
+                    'HAS_BIAS': _has_bias,
+                    'OUTPUT_FP16': output_fp16,
+                    'stride_xqk': 1,
+                    'stride_xsm': 1,
+                    'stride_wk': 1,
+                    'stride_yn': 1,
+                }
+                # Match every production K2 specialization: pointers, M/N/K,
+                # row pitches and the padded scale pitch are 16-byte divisible.
+                attrs = {
+                    (i,): [["tt.divisibility", 16]]
+                    for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15)
+                }
                 yield (f"{bias_suffix}_{dtype_suffix}", signature,
-                       {'GROUP_SIZE': 256, 'HAS_BIAS': _has_bias,
-                        'OUTPUT_FP16': output_fp16}, {})
+                       constexprs, attrs)
 
 
 def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
@@ -1965,7 +2104,13 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
                 f"sass_local_ops={spill_info.get('sass_local_ops', -1)}, "
                 f"global_scratch={spill_info.get('global_scratch', -1)}, "
                 f"regs={spill_info['registers']}")
-        elif stage == "k2" and K2_MAX_SHARED_BYTES > 0 and spill_info.get("shared_bytes", 0) > K2_MAX_SHARED_BYTES:
+        elif (stage == "k2" and spill_info.get("shared_bytes", 0) >
+              _max_shared_bytes_per_block(target_arch)):
+            reject_reasons.setdefault(cid, []).append(
+                f"[{variant_label}] shared_bytes={spill_info.get('shared_bytes', 0)} "
+                f"> architectural block limit={_max_shared_bytes_per_block(target_arch)}")
+        elif (stage == "k2" and K2_MAX_SHARED_BYTES > 0 and
+              spill_info.get("shared_bytes", 0) > K2_MAX_SHARED_BYTES):
             reject_reasons.setdefault(cid, []).append(
                 f"[{variant_label}] shared_bytes={spill_info.get('shared_bytes', 0)} "
                 f"> K2_MAX_SHARED_BYTES={K2_MAX_SHARED_BYTES}")
@@ -1977,6 +2122,7 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
     # the tightest variant supports.  Both K1 and K2 publish exact-config
     # occupancy; the old fixed K1=2 assumption under-launched the sm86 winner.
     occ_map: dict = {}
+    variant_occ_map: dict = {}
     for cfg, variant_label, spill_info, error in results:
         if error is not None or spill_info is None:
             continue
@@ -1989,6 +2135,11 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
         cid = _cfg_id(cfg)
         prev = occ_map.get(cid)
         occ_map[cid] = cur if prev is None else min(prev, cur)
+        if stage == "k2":
+            has_bias_variant = variant_label.startswith("BIAS_")
+            vkey = (cid, has_bias_variant)
+            vprev = variant_occ_map.get(vkey)
+            variant_occ_map[vkey] = cur if vprev is None else min(vprev, cur)
 
     for cfg in configs:
         reasons = reject_reasons.get(_cfg_id(cfg))
@@ -2002,6 +2153,15 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
     for cfg in filtered:
         occ = occ_map.get(_cfg_id(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
         occupancy_dst[_cfg_occupancy_key(cfg)] = int(occ)
+    if stage == "k2":
+        _K2_CFG_OCCUPANCY_BY_BIAS.clear()
+        for cfg in filtered:
+            cid = _cfg_id(cfg)
+            for has_bias in (False, True):
+                occ = variant_occ_map.get(
+                    (cid, has_bias),
+                    occ_map.get(cid, AUTOTUNE_OCCUPANCY_ASSUMPTION))
+                _K2_CFG_OCCUPANCY_BY_BIAS[(_cfg_occupancy_key(cfg), has_bias)] = int(occ)
 
     if rejected:
         print(f"    [spill-check] {stage}: REJECTED {len(rejected)} configs "
@@ -2027,22 +2187,36 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
 # ``benchmark_k2_tuning_space_hybrid.py`` uses a fixed ``warmup=20``,
 # ``iters=50`` CUDA-event loop and consistently ranks the same config
 # combinations — with ~0.5% run-to-run noise vs. the ~2% swings we saw
-# from Triton's built-in.  So for K2 we replace the built-in measurement
-# with the exact benchmark methodology the standalone benchmark uses,
-# then plug the picked config back into ``_get_compiled_kernel_for_cfg``
-# for header emission.
+# from Triton's built-in.  K2 v10 retains that fixed event methodology but
+# benchmarks the exact plugin sequence (prefix launch + padded tail launch +
+# copy-back) over every production shape, rather than one artificial M=3072
+# gate-projection launch.
 #
 # Environment variables (all optional):
 #   HOTSTEP_K2_BENCH_WARMUP   — warmup iterations per config (default 20)
 #   HOTSTEP_K2_BENCH_ITERS    — timed iterations per config (default 50)
 #   HOTSTEP_K2_BENCH_TOPN     — how many top configs to print (default 5)
+#   HOTSTEP_K2_SHAPE_WEIGHTS  — five comma-separated production call weights
 
 K2_BENCH_WARMUP = int(os.environ.get("HOTSTEP_K2_BENCH_WARMUP", "20"))
 K2_BENCH_ITERS = int(os.environ.get("HOTSTEP_K2_BENCH_ITERS", "50"))
 K2_BENCH_TOPN = int(os.environ.get("HOTSTEP_K2_BENCH_TOPN", "5"))
 
 
-def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
+def _k2_shape_weights():
+    raw = os.environ.get("HOTSTEP_K2_SHAPE_WEIGHTS", "").strip()
+    if not raw:
+        return K2_DEFAULT_SHAPE_WEIGHTS
+    vals = tuple(float(x.strip()) for x in raw.split(",") if x.strip())
+    if len(vals) != len(AUTOTUNE_SHAPES_K2) or any(x <= 0 for x in vals):
+        raise ValueError(
+            f"HOTSTEP_K2_SHAPE_WEIGHTS must contain "
+            f"{len(AUTOTUNE_SHAPES_K2)} positive comma-separated values")
+    return vals
+
+
+def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
+                         stride_xsg=None):
     """Launch one K2 config with the occupancy-scaled production grid.
 
     Uses ``kernel2_gemm_dequant.fn[grid](...)`` (the raw JITFunction, no
@@ -2050,12 +2224,26 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
     each call is a straight launch — no measurement is done here.
     """
     xq, xs, wq, ws, bias, y = tensors
-    num_tiles = triton.cdiv(M, cfg.kwargs["BLOCK_M"]) * triton.cdiv(N, cfg.kwargs["BLOCK_N"])
-    # Per-config occupancy (populated by the spill/compile filter) mirrors the
-    # production launch geometry; fall back to AUTOTUNE_OCCUPANCY_ASSUMPTION
-    # if the map was skipped (e.g. tests injecting a manual config list).
-    ctas = _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
-    grid_x = _autotune_grid_x(num_tiles, num_sms, ctas)
+    if stride_xsg is None:
+        stride_xsg = M
+    num_pid_m = triton.cdiv(M, cfg.kwargs["BLOCK_M"])
+    num_pid_n = triton.cdiv(N, cfg.kwargs["BLOCK_N"])
+    num_tiles = num_pid_m * num_pid_n
+    # Per-config occupancy mirrors the production launch geometry.
+    cfg_occ_key = _cfg_occupancy_key(cfg)
+    ctas = _K2_CFG_OCCUPANCY_BY_BIAS.get(
+        (cfg_occ_key, bool(_K2_ACTIVE_HAS_BIAS)),
+        _K2_CFG_OCCUPANCY.get(cfg_occ_key, AUTOTUNE_OCCUPANCY_ASSUMPTION))
+    grid_cap = max(int(num_sms) * max(int(ctas), 1), 1)
+    if cfg.kwargs.get("SCHEDULE_2D", False):
+        grid_m = min(num_pid_m, grid_cap)
+        grid_n = min(num_pid_n, max(grid_cap // max(grid_m, 1), 1))
+        grid = (grid_m, grid_n)
+        launched_ctas = grid_m * grid_n
+    else:
+        grid_x = _autotune_grid_x(num_tiles, num_sms, ctas)
+        grid = (grid_x,)
+        launched_ctas = grid_x
     kwargs = dict(cfg.kwargs)
     kwargs["GROUP_SIZE"] = GROUP_SIZE
     kwargs["HAS_BIAS"] = _K2_ACTIVE_HAS_BIAS
@@ -2065,87 +2253,243 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16):
     mr = getattr(cfg, "maxnreg", None)
     if mr is not None:
         kwargs["maxnreg"] = mr
-    kernel2_gemm_dequant.fn[(grid_x,)](
+    kernel2_gemm_dequant.fn[grid](
         xq, xs, wq, ws, bias, y,
         M, N, K,
         K, 1,
-        1, M,
+        1, stride_xsg,
         K, 1,        # W_q [N, K] row-major
         N, 1,
         **kwargs,
     )
-    return grid_x
+    return launched_ctas
 
 
-def _bench_k2_config(cfg, tensors, M, N, K, num_sms, output_fp16,
-                     warmup=None, iters=None):
-    """Time a single K2 config with warmup + CUDA events, returning (ms, grid).
-
-    Mirrors ``benchmark_k2_tuning_space_hybrid.py``'s per-config loop: one
-    compile launch, ``warmup`` warm launches, then ``iters`` timed launches
-    bracketed by ``torch.cuda.Event`` records, returning the mean time per
-    launch in ms.
-
-    Raises whatever the launch raises (typically ``OutOfResources`` /
-    ``triton.compiler.errors.CompilationError`` for configs that can't fit).
-    """
+def _make_k2_production_bench_pack(configs, M, N, K, has_bias, output_fp16,
+                                   seed):
+    """Allocate deterministic tensors for exact plugin-sequence benchmarking."""
     import torch
-    if warmup is None:
-        warmup = K2_BENCH_WARMUP
-    if iters is None:
-        iters = K2_BENCH_ITERS
 
-    # 1 compile-and-launch call to force JIT + cache population.
-    grid_x = _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+    max_bm = max(c.kwargs["BLOCK_M"] for c in configs)
+    if max_bm > K2_AUTOTUNE_M_ALIGNMENT:
+        raise RuntimeError(
+            f"K2 candidate BLOCK_M={max_bm} exceeds plugin workspace contract "
+            f"{K2_AUTOTUNE_M_ALIGNMENT}")
+    max_m_padded = _math.ceil(M / max_bm) * max_bm
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(int(seed))
+
+    xq = torch.randint(-127, 128, (max_m_padded, K), generator=gen,
+                       device="cuda", dtype=torch.int8)
+    if max_m_padded > M:
+        xq[M:].zero_()
+    n_groups = K // GROUP_SIZE
+    xs_valid = torch.rand((n_groups, M), generator=gen, device="cuda",
+                          dtype=torch.float32) * 0.02 + 0.001
+    pitches = sorted({_math.ceil(M / c.kwargs["BLOCK_M"]) * c.kwargs["BLOCK_M"]
+                      for c in configs})
+    xs_by_pitch = {}
+    for pitch in pitches:
+        xs = torch.zeros((n_groups, pitch), device="cuda", dtype=torch.float32)
+        xs[:, :M].copy_(xs_valid)
+        xs_by_pitch[pitch] = xs
+
+    wq = torch.randint(-127, 128, (N, K), generator=gen,
+                       device="cuda", dtype=torch.int8)
+    ws = torch.rand((N,), generator=gen, device="cuda",
+                    dtype=torch.float32) * 0.02 + 0.001
+    bias = (torch.randn((N,), generator=gen, device="cuda", dtype=torch.float32)
+            if has_bias else torch.empty((1,), device="cuda", dtype=torch.float32))
+    out_dtype = torch.float16 if output_fp16 else torch.float32
+    y = torch.empty((M, N), device="cuda", dtype=out_dtype)
+    y_tail = torch.empty((max_bm, N), device="cuda", dtype=out_dtype)
+    return {
+        "xq": xq, "xs_by_pitch": xs_by_pitch, "wq": wq, "ws": ws,
+        "bias": bias, "y": y, "y_tail": y_tail,
+    }
+
+
+def _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms,
+                                   output_fp16):
+    """Mirror plugin enqueue: aligned prefix, padded tail, then copy-back."""
+    bm = cfg.kwargs["BLOCK_M"]
+    m_aligned = M - (M % bm)
+    m_padded = _math.ceil(M / bm) * bm
+    xs = pack["xs_by_pitch"][m_padded]
+    total_ctas = 0
+
+    # enqueue() zero-fills padded K1 workspace on every call.  Include those
+    # operations because BLOCK_M controls the amount of padding and can change
+    # the real end-to-end ranking.
+    if m_padded > M:
+        pack["xq"][M:m_padded].zero_()
+        xs[:, M:m_padded].zero_()
+
+    if m_aligned > 0:
+        total_ctas += _launch_k2_for_bench(
+            cfg,
+            (pack["xq"], xs, pack["wq"], pack["ws"], pack["bias"], pack["y"]),
+            m_aligned, N, K, num_sms, output_fp16, stride_xsg=m_padded)
+    if m_aligned < M:
+        tail_rows = M - m_aligned
+        xq_tail = pack["xq"][m_aligned:]
+        xs_tail = xs[:, m_aligned:]
+        y_tail = pack["y_tail"][:bm]
+        total_ctas += _launch_k2_for_bench(
+            cfg,
+            (xq_tail, xs_tail, pack["wq"], pack["ws"], pack["bias"], y_tail),
+            bm, N, K, num_sms, output_fp16, stride_xsg=m_padded)
+        # Contiguous copy_ lowers to the same D2D copy class used by enqueue.
+        pack["y"][m_aligned:M].copy_(y_tail[:tail_rows])
+    return total_ctas
+
+
+def _bench_k2_config_production(cfg, pack, M, N, K, num_sms, output_fp16,
+                                warmup=None, iters=None):
+    """Time the exact two-launch/copy production sequence for one config."""
+    import torch
+    warmup = K2_BENCH_WARMUP if warmup is None else warmup
+    iters = K2_BENCH_ITERS if iters is None else iters
+
+    grid_ctas = _launch_k2_production_sequence(
+        cfg, pack, M, N, K, num_sms, output_fp16)
     torch.cuda.synchronize()
     for _ in range(warmup):
-        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+        _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms, output_fp16)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     for _ in range(iters):
-        _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16)
+        _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms, output_fp16)
     end.record()
     torch.cuda.synchronize()
-    ms = start.elapsed_time(end) / iters
-    return ms, grid_x
+    return start.elapsed_time(end) / iters, grid_ctas
 
 
-def _bench_k2_configs_custom(configs, tensors, M, N, K, num_sms, output_fp16):
-    """Custom-benchmark every config and return (best_cfg, results_sorted).
+def _k2_reference_config():
+    """The exact K2 baseline that shipped before this optimization patch."""
+    return Config({
+        "BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64,
+        "GROUP_M": 2, "SCHEDULE_2D": False,
+    }, num_warps=8, num_stages=3)
 
-    ``results_sorted`` is a list of ``(cfg, ms, grid_x, error)`` tuples ordered
-    by ascending ms (successful configs first, failures appended last with
-    ``ms=inf``).  ``best_cfg`` is ``results_sorted[0][0]`` if any config
-    succeeded, else ``None``.
 
-    Progress is logged every ~10% of the config space.
+def _tensor_bitwise_equal(a, b):
+    import torch
+    if a.dtype == torch.float32:
+        return torch.equal(a.view(torch.int32), b.view(torch.int32))
+    if a.dtype == torch.float16:
+        return torch.equal(a.view(torch.int16), b.view(torch.int16))
+    return torch.equal(a, b)
+
+
+def _bench_k2_workload(configs, num_sms, has_bias, output_fp16):
+    """Select one K2 cubin on the weighted, exact plugin workload.
+
+    Each candidate must first match the previously shipped K2 output bitwise on
+    every production shape.  Timing includes the real M-aligned prefix launch,
+    padded tail launch and copy-back instead of the old single M=3072 launch.
     """
+    import torch
+
     if not configs:
         return None, []
+    reference = _k2_reference_config()
+    weights = _k2_shape_weights()
+    state = {
+        id(cfg): {"cfg": cfg, "weighted_ms": 0.0, "weight": 0.0,
+                  "shape_ms": [], "error": None}
+        for cfg in configs
+    }
 
-    total = len(configs)
-    step = max(total // 10, 1)
-    results: list = []
-    print(f"    [custom-bench] Benchmarking {total} K2 configs "
-          f"(warmup={K2_BENCH_WARMUP}, iters={K2_BENCH_ITERS})...", flush=True)
+    for shape_idx, ((M, K, N), weight) in enumerate(
+            zip(AUTOTUNE_SHAPES_K2, weights)):
+        legal = [c for c in configs if N % c.kwargs["BLOCK_N"] == 0]
+        if not legal:
+            continue
+        pack = _make_k2_production_bench_pack(
+            legal + [reference], M, N, K, has_bias, output_fp16,
+            seed=0x4B320000 + shape_idx)
 
-    for i, cfg in enumerate(configs, start=1):
-        try:
-            ms, grid_x = _bench_k2_config(cfg, tensors, M, N, K, num_sms, output_fp16)
-            results.append((cfg, ms, grid_x, None))
-        except Exception as e:
-            results.append((cfg, float("inf"), 0, f"{type(e).__name__}: {e}"))
-        if i % step == 0 or i == total:
-            ok = sum(1 for _, ms, _, _ in results if ms != float("inf"))
-            print(f"    [custom-bench] {i}/{total} benchmarked ({ok} succeeded)",
-                  flush=True)
+        # Current shipped arithmetic/scheduler is the immutable numerical
+        # reference, but it is timed only if present as a normal candidate.
+        _launch_k2_production_sequence(
+            reference, pack, M, N, K, num_sms, output_fp16)
+        torch.cuda.synchronize()
+        if not torch.isfinite(pack["y"]).all().item():
+            raise SystemExit(
+                f"[K2 exactness] v9 reference produced NaN/Inf for {M}x{K}x{N}")
+        y_reference = pack["y"].clone()
 
-    results.sort(key=lambda r: r[1])
+        shape_rows = []
+        for cfg in legal:
+            entry = state[id(cfg)]
+            if entry["error"] is not None:
+                continue
+            try:
+                _launch_k2_production_sequence(
+                    cfg, pack, M, N, K, num_sms, output_fp16)
+                torch.cuda.synchronize()
+                if not torch.isfinite(pack["y"]).all().item():
+                    raise RuntimeError("candidate produced NaN/Inf")
+                if not _tensor_bitwise_equal(pack["y"], y_reference):
+                    if pack["y"].dtype == torch.float32:
+                        mismatch = int((pack["y"].view(torch.int32) !=
+                                        y_reference.view(torch.int32)).sum().item())
+                    else:
+                        mismatch = int((pack["y"].view(torch.int16) !=
+                                        y_reference.view(torch.int16)).sum().item())
+                    raise RuntimeError(f"bitwise output mismatch ({mismatch} values)")
+
+                ms, grid_ctas = _bench_k2_config_production(
+                    cfg, pack, M, N, K, num_sms, output_fp16)
+                entry["weighted_ms"] += float(weight) * ms
+                entry["weight"] += float(weight)
+                entry["shape_ms"].append((shape_idx, ms, grid_ctas))
+                shape_rows.append((cfg, ms, grid_ctas, None))
+            except Exception as exc:
+                entry["error"] = f"shape {M}x{K}x{N}: {type(exc).__name__}: {exc}"
+                shape_rows.append((cfg, float("inf"), 0, entry["error"]))
+
+        shape_rows.sort(key=lambda row: row[1])
+        print(f"    [K2 workload] shape {shape_idx + 1}/{len(AUTOTUNE_SHAPES_K2)} "
+              f"weight={weight:g}; exact plugin sequence", flush=True)
+        _print_k2_bench_topn(shape_rows, M, K, N)
+        del y_reference, pack
+
+    results = []
+    expected_weight = float(sum(weights))
+    for entry in state.values():
+        cfg = entry["cfg"]
+        err = entry["error"]
+        if err is not None or entry["weight"] != expected_weight:
+            results.append((cfg, float("inf"), 0,
+                            err or "not legal/benchmarked for every shape"))
+        else:
+            weighted_mean = entry["weighted_ms"] / expected_weight
+            results.append((cfg, weighted_mean, -1, None))
+    results.sort(key=lambda row: row[1])
     best = results[0][0] if results and results[0][1] != float("inf") else None
     return best, results
+
+
+def _print_k2_workload_topn(results, topn=None):
+    if topn is None:
+        topn = K2_BENCH_TOPN
+    print(f"    [K2 workload] weighted top-{topn} (mean production-sequence ms):",
+          flush=True)
+    for cfg, ms, _, err in results[:topn]:
+        if ms == float("inf"):
+            print(f"      FAIL  {cfg}: {err}", flush=True)
+            continue
+        print(f"      {ms:8.4f} ms  BM={cfg.kwargs['BLOCK_M']} "
+              f"BN={cfg.kwargs['BLOCK_N']} BK={cfg.kwargs['BLOCK_K']} "
+              f"GM={cfg.kwargs['GROUP_M']} "
+              f"SCH={'2D' if cfg.kwargs.get('SCHEDULE_2D', False) else '1D'} "
+              f"W={cfg.num_warps} S={cfg.num_stages} "
+              f"MR={getattr(cfg, 'maxnreg', None)}", flush=True)
 
 
 def _print_k2_bench_topn(results, M, K, N, topn=None):
@@ -2164,6 +2508,7 @@ def _print_k2_bench_topn(results, M, K, N, topn=None):
         print(f"      {ms:7.4f} ms  {tops:6.2f} TOPS  grid={grid_x:4d}  "
               f"BM={cfg.kwargs.get('BLOCK_M')} BN={cfg.kwargs.get('BLOCK_N')} "
               f"BK={cfg.kwargs.get('BLOCK_K')} GM={cfg.kwargs.get('GROUP_M')} "
+              f"SCH={'2D' if cfg.kwargs.get('SCHEDULE_2D', False) else '1D'} "
               f"W={cfg.num_warps} S={cfg.num_stages} MR={mr}",
               flush=True)
 
@@ -2380,51 +2725,26 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             config_name = f"{bias_suffix}_{dtype_suffix}"
             print(f"\n  K2 G256 {config_name} (custom-bench selection)...", flush=True)
             _parallel_precompile_k2(_K2_CONFIGS, output_fp16)
-            out_dtype = torch.float16 if output_fp16 else torch.float32
-            M_real, K, N = AUTOTUNE_SHAPES_K2[0]
-            # Plain K2 has no M masks.  Autotune the same production-like work
-            # with M padded to the largest generated BLOCK_M so every candidate
-            # can run safely; this mirrors the plugin's host-side padding while
-            # keeping the benchmark within 2.4% of M=3000.
-            M = ((M_real + K2_AUTOTUNE_M_ALIGNMENT - 1) // K2_AUTOTUNE_M_ALIGNMENT) * K2_AUTOTUNE_M_ALIGNMENT
-            if M != M_real:
-                print(f"    [K2 autotune] primary shape M={M_real}, K={K}, N={N}; "
-                      f"using padded M={M} for plain/unmasked K2 safety", flush=True)
-            xq = torch.randint(-127, 128, (M, K), device="cuda", dtype=torch.int8)
-            n_groups = K // GROUP_SIZE
-            xs = torch.rand((n_groups, M), device="cuda", dtype=torch.float32) * 0.02 + 0.001
-            # W_q is [N, K] row-major (canonical Linear layout).  The
-            # hybrid_direct K2 kernel handles the transpose in-kernel with
-            # tl.trans(wq), so nothing about the exported weight layout
-            # changes.
-            wq = torch.randint(-127, 128, (N, K), device="cuda", dtype=torch.int8)
-            ws = torch.rand((N,), device="cuda", dtype=torch.float32) * 0.02 + 0.001
-            bias = (torch.randn((N,), device="cuda", dtype=torch.float32)
-                    if _has_bias else torch.empty((1,), device="cuda", dtype=torch.float32))
-            y = torch.empty((M, N), device="cuda", dtype=out_dtype)
-            # Bypass Triton's @autotune measurement (its internal do_bench is
-            # too noisy at the ~2% level, causing mis-ranking of adjacent K2
-            # configs) and use the fixed-budget CUDA-event benchmark loop
-            # from ``benchmark_k2_tuning_space_hybrid.py`` instead.  Every
-            # config is launched at its per-config occupancy-scaled grid
-            # (see ``_autotune_grid_x_for_k2`` for the geometry rationale).
-            tensors = (xq, xs, wq, ws, bias, y)
-            best_cfg, bench_results = _bench_k2_configs_custom(
-                _K2_CONFIGS, tensors, M, N, K, num_sms, output_fp16)
+            # Select on all production shape families, using the exact enqueue
+            # sequence (aligned prefix + padded tail + copy-back).  Every
+            # candidate must first match the previously shipped K2 output
+            # bit-for-bit on every shape.
+            best_cfg, bench_results = _bench_k2_workload(
+                _K2_CONFIGS, num_sms, _has_bias, output_fp16)
             if best_cfg is None:
+                failures = [err for _, _, _, err in bench_results if err]
                 raise SystemExit(
-                    f"[custom-bench] K2 {config_name}: no config successfully "
-                    f"benchmarked. Config space was likely rejected wholesale "
-                    f"by the spill filter — check the [spill-check] log above."
-                )
-            _print_k2_bench_topn(bench_results, M, K, N)
+                    f"[K2 workload] {config_name}: no spill-free, bitwise-exact "
+                    f"config passed all shapes. First failures: {failures[:3]}")
+            _print_k2_workload_topn(bench_results)
 
-            # Force Triton to compile and cache the picked winner so
-            # _get_compiled_kernel_for_cfg can retrieve its CompiledKernel.
-            # (The custom bench already ran the winner — the cache entry is
-            # present — but we re-launch to be defensive against a possible
-            # cache-flush from the spill filter running between passes.)
-            _launch_k2_for_bench(best_cfg, tensors, M, N, K, num_sms, output_fp16)
+            # Recreate the primary shape and launch the winner so the exact JIT
+            # cache entry is present for artifact extraction.
+            M, K, N = AUTOTUNE_SHAPES_K2[0]
+            primary_pack = _make_k2_production_bench_pack(
+                [best_cfg], M, N, K, _has_bias, output_fp16, seed=0x4B32FFFF)
+            _launch_k2_production_sequence(
+                best_cfg, primary_pack, M, N, K, num_sms, output_fp16)
             torch.cuda.synchronize()
 
             kernel, best_cfg, cache_dir = _get_compiled_kernel_for_cfg(
@@ -2439,6 +2759,7 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             block_n = best_cfg.kwargs["BLOCK_N"]
             block_k_winning = best_cfg.kwargs["BLOCK_K"]
             group_m = best_cfg.kwargs["GROUP_M"]
+            schedule_2d = bool(best_cfg.kwargs.get("SCHEDULE_2D", False))
             nw = best_cfg.num_warps
             ns = best_cfg.num_stages
             mr = getattr(best_cfg, "maxnreg", None)
@@ -2468,21 +2789,20 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                 )
             spill_status = f"no spills ({spill_info['method']}, regs={spill_info['registers']})"
 
-            occ_ctas = _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(best_cfg))
+            occ_ctas = _K2_CFG_OCCUPANCY_BY_BIAS.get(
+                (_cfg_occupancy_key(best_cfg), bool(_has_bias)),
+                _K2_CFG_OCCUPANCY.get(_cfg_occupancy_key(best_cfg)))
             occ_note = f", occupancy={occ_ctas} CTA/SM" if occ_ctas else ""
-            # Winning ms/TOPS from the custom bench are recorded so the
-            # summary log shows the exact per-launch time that drove the
-            # selection.
-            win_row = next(((c, ms, g) for c, ms, g, e in bench_results
+            win_row = next(((c, ms) for c, ms, _, e in bench_results
                             if c is best_cfg and e is None), None)
             win_note = ""
             if win_row is not None:
-                real_ops = 2.0 * M * K * N
-                _, win_ms, win_grid = win_row
-                win_tops = real_ops / (win_ms * 1e-3) / 1e12
-                win_note = f", {win_ms:.4f} ms, {win_tops:.2f} TOPS, grid={win_grid}"
+                _, win_ms = win_row
+                win_note = f", weighted production mean={win_ms:.4f} ms"
+            schedule_name = "2D" if schedule_2d else "1D-GROUP_M"
             print(f"  -> Custom-bench winner: BM={block_m} BN={block_n} BK={block_k_winning} GM={group_m} "
-                  f"W={nw} S={ns} MR={mr}{occ_note}{win_note}", flush=True)
+                  f"schedule={schedule_name} W={nw} S={ns} MR={mr}"
+                  f"{occ_note}{win_note}", flush=True)
             print(
                 f"     shared={shared/1024:.0f}KB, cubin={len(cubin)}B, "
                 f"runtime_args={len(abi['runtime_signature'])}, scratch_ptrs={abi['scratch_ptr_count']}, "
@@ -2505,6 +2825,7 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                 "block_n": int(block_n),
                 "block_k": int(block_k_winning),
                 "group_m": int(group_m),
+                "schedule_2d": schedule_2d,
                 "num_warps": nw,
                 "num_stages": ns,
                 "maxnreg": mr,
@@ -2618,6 +2939,7 @@ def write_header(k1_results, k2_results, output_path):
             "block_n": 1,
             "block_k": int(r['block_k']),
             "group_m": 1,
+            "schedule_2d": "false",
             "block_x": block_x,
             "block_y": block_y,
             "block_z": block_z,
@@ -2662,6 +2984,7 @@ def write_header(k1_results, k2_results, output_path):
                 "block_n": int(r['block_n']),
                 "block_k": int(r.get('block_k', DEFAULT_BLOCK_K)),
                 "group_m": int(r.get('group_m', -1)),
+                "schedule_2d": "true" if r.get('schedule_2d', False) else "false",
                 "block_x": block_x,
                 "block_y": block_y,
                 "block_z": block_z,
@@ -2707,6 +3030,7 @@ def write_header(k1_results, k2_results, output_path):
         "    int32_t block_n;",
         "    int32_t block_k;",
         "    int32_t group_m;",
+        "    bool schedule_2d;",
         "    uint32_t block_x;",
         "    uint32_t block_y;",
         "    uint32_t block_z;",
@@ -2732,7 +3056,7 @@ def write_header(k1_results, k2_results, output_path):
             f'{d["stage"]}, {d["group_size"]}, {d["has_bias"]}, ' +
             f'{d["input_dtype"]}, {d["output_dtype"]}, ' +
             f'{d["block_m"]}, {d["block_n"]}, {d["block_k"]}, {d["group_m"]}, ' +
-            f'{d["block_x"]}u, {d["block_y"]}u, {d["block_z"]}u, ' +
+            f'{d["schedule_2d"]}, {d["block_x"]}u, {d["block_y"]}u, {d["block_z"]}u, ' +
             f'{d["shared"]}, {d["num_warps"]}, {d["num_stages"]}, {d["maxnreg"]}, ' +
             f'{d["runtime_args"]}, {d["runtime_arg_count"]}u, {d["scratch_ptr_count"]}u' +
             "},"
@@ -2951,9 +3275,21 @@ def write_header(k1_results, k2_results, output_path):
         "    uint32_t const occupancy = (max_active_ctas_per_sm != 0)",
         "        ? max_active_ctas_per_sm",
         "        : queryMaxActiveCtasPerSm(func, block_threads, static_cast<uint32_t>(d.shared_bytes));",
-        "    uint32_t const grid_x = persistentGridU32(total_tiles,",
-        "                                              static_cast<uint32_t>(num_sms),",
-        "                                              occupancy);",
+        "    uint32_t const raw_grid_cap = static_cast<uint32_t>(num_sms) * (occupancy == 0 ? 1u : occupancy);",
+        "    uint32_t const grid_cap = raw_grid_cap == 0 ? 1u : raw_grid_cap;",
+        "    uint32_t launch_grid_x = 1u;",
+        "    uint32_t launch_grid_y = 1u;",
+        "    if (d.schedule_2d) {",
+        "        launch_grid_x = (grid_m < grid_cap) ? grid_m : grid_cap;",
+        "        uint32_t const denom = launch_grid_x == 0 ? 1u : launch_grid_x;",
+        "        uint32_t const remaining = grid_cap / denom;",
+        "        uint32_t const y_cap = remaining == 0 ? 1u : remaining;",
+        "        launch_grid_y = (grid_n < y_cap) ? grid_n : y_cap;",
+        "    } else {",
+        "        launch_grid_x = persistentGridU32(total_tiles,",
+        "                                          static_cast<uint32_t>(num_sms),",
+        "                                          occupancy);",
+        "    }",
         "    void* params[kConvRotMaxLaunchParams] = {};",
         "    uint32_t n = 0;",
         "    for (uint32_t i = 0; i < d.runtime_arg_count; ++i) {",
@@ -2969,7 +3305,7 @@ def write_header(k1_results, k2_results, output_path):
         "    void* scratch_slots[] = { &triton_scratch1, &triton_scratch2 };",
         "    for (uint32_t i = 0; i < d.trailing_scratch_ptr_count; ++i) params[n++] = scratch_slots[i];",
         "    return cuLaunchKernel(",
-        "        func, grid_x, 1, 1, d.block_x, d.block_y, d.block_z,",
+        "        func, launch_grid_x, launch_grid_y, 1, d.block_x, d.block_y, d.block_z,",
         "        static_cast<unsigned int>(d.shared_bytes), stream, params, nullptr);",
         "}",
         "",
@@ -3052,7 +3388,15 @@ def main():
     # tailored to the target GPU's smem budget, L2 size, and CTA cap.
     _K2_CONFIGS[:] = _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm,
                                           AUTOTUNE_SHAPES_K2, arch=arch)
-    _K2_CONFIGS[:] = _add_sm_aware_tile_candidates(_K2_CONFIGS, num_sms, AUTOTUNE_SHAPES_K2)
+    _K2_CONFIGS[:] = _add_sm_aware_tile_candidates(
+        _K2_CONFIGS, num_sms, AUTOTUNE_SHAPES_K2)
+    _K2_CONFIGS[:] = _add_k2_2d_schedule_candidates(_K2_CONFIGS, arch)
+    # The plugin's workspace/tail contract is strict; never benchmark a tile
+    # that could win extraction but be rejected by enqueue.
+    _K2_CONFIGS[:] = [
+        c for c in _K2_CONFIGS
+        if c.kwargs.get("BLOCK_M", 0) <= K2_AUTOTUNE_M_ALIGNMENT
+    ]
 
     # ── Register spill filtering (patch review §8) ───────────────────────
     # Triton will SILENTLY spill registers to local memory (DRAM) when a
