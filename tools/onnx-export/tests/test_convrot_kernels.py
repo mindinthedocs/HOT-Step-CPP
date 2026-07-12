@@ -266,7 +266,7 @@ class TestK2GemmDequant(unittest.TestCase):
             K, 1, 1, M,
             K, 1,
             N, 1,
-            GROUP_SIZE=256, OUTPUT_FP16=False,
+            GROUP_SIZE=256, HAS_BIAS=has_bias, OUTPUT_FP16=False,
         )
         return y
 
@@ -336,7 +336,7 @@ class TestK2HostPadding(unittest.TestCase):
             K, 1, 1, M_PAD,
             K, 1,
             N, 1,
-            GROUP_SIZE=group_size, OUTPUT_FP16=False,
+            GROUP_SIZE=group_size, HAS_BIAS=True, OUTPUT_FP16=False,
         )
 
         # Reference only for the real rows.  Padded rows should be finite but
@@ -394,6 +394,58 @@ class TestOccupancyCompute(unittest.TestCase):
         occ = m._compute_ctas_per_sm(shared_bytes=32 * 1024, num_regs=0,
                                      num_warps=8, arch=86)
         self.assertGreaterEqual(occ, 1)
+
+
+class TestK1TargetDispatchAndGrid(unittest.TestCase):
+    """K1 has one enabled sm80-sm89 family and strict placeholders."""
+
+    def setUp(self):
+        m._K1_CFG_OCCUPANCY.clear()
+
+    def tearDown(self):
+        m._K1_CFG_OCCUPANCY.clear()
+
+    def test_sm86_candidate_family_is_numerically_locked(self):
+        cfgs = m._estimate_k1_configs(
+            20, 2 * 1024 * 1024, 100 * 1024, m.AUTOTUNE_SHAPES_K2,
+            target_backend="cuda", target_arch=86)
+        self.assertEqual(len(cfgs), 5)
+        self.assertEqual({c.kwargs["BLOCK_M"] for c in cfgs}, {16, 32, 64})
+        self.assertTrue(all(c.num_warps == 4 for c in cfgs))
+        self.assertTrue(all(c.num_stages == 1 for c in cfgs))
+        self.assertEqual(
+            sum(c.kwargs["BLOCK_M"] == 16 for c in cfgs), 1,
+            "BM16 capped/uncapped forms are resource duplicates",
+        )
+
+    def test_strict_placeholders_have_no_fallback(self):
+        with self.assertRaises(SystemExit):
+            m._estimate_k1_configs(20, 0, 0, [], "cuda", 75)
+        with self.assertRaises(SystemExit):
+            m._estimate_k1_configs(96, 0, 0, [], "hip", "gfx1100")
+        with self.assertRaises(SystemExit):
+            m._estimate_k1_configs(1, 0, 0, [], "cuda", 90)
+
+    def test_spill_signature_matches_shipping_specialization(self):
+        label, signature, constexprs, attrs = next(m._spill_check_variants("k1"))
+        self.assertEqual(label, "FP32IO")
+        self.assertEqual(constexprs["stride_xk"], 1)
+        self.assertEqual(constexprs["stride_xqk"], 1)
+        self.assertEqual(constexprs["stride_xsm"], 1)
+        # Runtime M (argument index 3) must remain generic for M=300/3000.
+        self.assertNotIn((3,), attrs)
+        for index in (0, 1, 2, 4, 5, 7, 10):
+            self.assertIn((index,), attrs)
+        self.assertEqual(signature["M"], "i32")
+
+    def test_k1_grid_uses_per_config_occupancy(self):
+        cfg = m.triton.Config({"BLOCK_M": 32}, num_warps=4,
+                              num_stages=1, maxnreg=128)
+        m._K1_CFG_OCCUPANCY[m._cfg_occupancy_key(cfg)] = 4
+        meta = {"BLOCK_M": 32, "num_warps": 4, "num_stages": 1,
+                "maxnreg": 128}
+        self.assertEqual(m._autotune_grid_x_for_k1(1000, 20, meta), 80)
+        self.assertEqual(m._autotune_grid_x_for_k1(10, 20, meta), 10)
 
 
 class TestAutotuneGridForK2(unittest.TestCase):
@@ -494,7 +546,7 @@ class TestEndToEndPipeline(unittest.TestCase):
             K, 1, 1, M,
             K, 1,   # W_q [N, K] row-major: wn=K, wk=1
             N, 1,
-            GROUP_SIZE=group_size, OUTPUT_FP16=False,
+            GROUP_SIZE=group_size, HAS_BIAS=True, OUTPUT_FP16=False,
         )
 
         y_np = y.numpy()

@@ -44,7 +44,7 @@
 
 #if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
 // ── Cubin header version guard ─────────────────────────────────────────────
-// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 7.
+// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 9.
 // Version 3 added per-cubin tile dimensions; version 4 additionally reflects
 // the intentionally smaller cubin inventory: G256 only (plus optional G0 sentinel), and no specialized M1
 // cubins. Referencing removed G0/G256/M1 symbols here would make the plugin
@@ -71,10 +71,12 @@
 //            shipping masked K2 variants.
 // Version 8: restores separate compile-time BIAS and NOBIAS K2 cubins; NOBIAS
 //            removes the bias load/add and no longer needs a zero-bias workspace.
+// Version 9: strict numerically-locked K1 tuning and redundant no-spill gates;
+//            the plugin rejects any loaded function with nonzero local memory.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 8
-#  error "Cubin header version >= 8 required (hybrid_direct K2 with separate BIAS/NOBIAS variants, host-side M padding, direct H4 K1 rotation, occupancy-scaled persistent grid). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 9
+#  error "Cubin header version >= 9 required (strict exact K1 tuning and zero-local-memory gate). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -1469,34 +1471,34 @@ bool loadOrReuseKernel(GeneratedCubinDesc const* cubin,
             // produce correct output but at a fraction of the performance
             // because spilled registers go through DRAM.
             //
-            // This is a safety net: the extraction pipeline's spill gate
-            // (extract_jit_cubins_autotune.py) should have already rejected
-            // spilling cubins at build time.  This check catches the case
-            // where someone loads a stale cubin header that predates the
-            // spill gate.  Zero runtime cost in release builds (gated behind
-            // HOTSTEP_PLUGIN_DEBUG, same as the rest of the diag subsystem).
-#ifdef HOTSTEP_PLUGIN_DEBUG
+            // This is a mandatory runtime safety gate, not a debug warning.
+            // The universal plugin may load externally regenerated kernels;
+            // refusing local memory here protects against a stale/bad artifact
+            // even when its Python-side extraction log is unavailable.
             int local_bytes_per_thread = 0;
             CUresult const spill_rc = cuFuncGetAttribute(
                 &local_bytes_per_thread,
                 CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
                 new_func);
-            if (spill_rc == CUDA_SUCCESS && local_bytes_per_thread > 0) {
+            if (spill_rc != CUDA_SUCCESS || local_bytes_per_thread != 0) {
+                char const* err_str = "unknown";
+                if (spill_rc != CUDA_SUCCESS) cuGetErrorString(spill_rc, &err_str);
                 hotstep::diag::log(
-                    "[ConvRotInt8Linear] WARNING: cubin %s spills %d bytes/thread to local "
-                    "memory (CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES). This cubin should not have "
-                    "shipped — the extraction pipeline's spill gate should have rejected it.\n",
-                    cubin->logical_name, local_bytes_per_thread);
+                    "[ConvRotInt8Linear] REJECT cubin %s: strict no-local-memory "
+                    "gate failed (rc=%d, %s, local=%d bytes/thread).\n",
+                    cubin->logical_name, static_cast<int>(spill_rc), err_str,
+                    local_bytes_per_thread);
+                cuModuleUnload(new_module);
+                return false;
             }
-            // Also log the register count for diagnostic visibility.
+#ifdef HOTSTEP_PLUGIN_DEBUG
             int num_regs = 0;
             CUresult const reg_rc = cuFuncGetAttribute(
                 &num_regs, CU_FUNC_ATTRIBUTE_NUM_REGS, new_func);
             if (reg_rc == CUDA_SUCCESS) {
                 hotstep::diag::log(
-                    "[ConvRotInt8Linear] cubin %s: regs=%d, shared=%zuB, local=%dB\n",
-                    cubin->logical_name, num_regs,
-                    cubin->shared_bytes, local_bytes_per_thread);
+                    "[ConvRotInt8Linear] cubin %s: regs=%d, shared=%zuB, local=0B\n",
+                    cubin->logical_name, num_regs, cubin->shared_bytes);
             }
 #endif
 
