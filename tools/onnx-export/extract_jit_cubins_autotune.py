@@ -289,6 +289,7 @@ def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, 
                     "BLOCK_K": bk,
                     "GROUP_M": gm,
                     "SCHEDULE_2D": False,
+                    "DYNAMIC_INNER": False,
                 }
                 key = (bm, bn, bk, gm, nw, ns)
                 if key in seen:
@@ -315,6 +316,7 @@ def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
         return (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
                 c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
                 bool(c.kwargs.get("SCHEDULE_2D", False)),
+                bool(c.kwargs.get("DYNAMIC_INNER", False)),
                 c.num_warps, c.num_stages)
 
     seen = {_cfg_key(c) for c in base_configs}
@@ -337,7 +339,7 @@ def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
                         for gm in [4, 8]:
                             extra_warps_stages = [(4, 2), (8, 2)] if (bm == 32 and bn >= 256 and bk == 32) else [(4, 3), (8, 3)]
                             for nw, ns in extra_warps_stages:
-                                key = (bm, bn, bk, gm, False, nw, ns)
+                                key = (bm, bn, bk, gm, False, False, nw, ns)
                                 if key in seen:
                                     continue
                                 seen.add(key)
@@ -347,8 +349,37 @@ def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
                                     "BLOCK_K": bk,
                                     "GROUP_M": gm,
                                     "SCHEDULE_2D": False,
+                                    "DYNAMIC_INNER": False,
                                 }
                                 extra.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
+    return base_configs + extra
+
+
+def _add_k2_small_m_candidates(base_configs, arch):
+    """Add BM16 candidates needed by the real BIAS M=1 workload."""
+    if not (80 <= int(arch) <= 89):
+        return base_configs
+    seen = {
+        (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
+         c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
+         bool(c.kwargs.get("SCHEDULE_2D", False)),
+         bool(c.kwargs.get("DYNAMIC_INNER", False)),
+         c.num_warps, c.num_stages)
+        for c in base_configs
+    }
+    extra = []
+    for bn in (64, 128):
+        for nw in (4, 8):
+            for ns in (2, 3):
+                key = (16, bn, 64, 4, False, False, nw, ns)
+                if key in seen:
+                    continue
+                seen.add(key)
+                extra.append(Config({
+                    "BLOCK_M": 16, "BLOCK_N": bn, "BLOCK_K": 64,
+                    "GROUP_M": 4, "SCHEDULE_2D": False,
+                    "DYNAMIC_INNER": False,
+                }, num_warps=nw, num_stages=ns))
     return base_configs + extra
 
 
@@ -364,6 +395,11 @@ def _add_k2_2d_schedule_candidates(base_configs, arch):
         return base_configs
 
     specs = [
+        # Small-M BIAS projections (M=1) need a real tensor-core-sized M tile.
+        (16, 64, 64, 1, 4, 2),
+        (16, 64, 64, 1, 8, 2),
+        (16, 128, 64, 1, 4, 2),
+        (16, 128, 64, 1, 8, 2),
         # Current sm86 winner, with tile-index division removed.
         (128, 64, 64, 1, 8, 3),
         # Symmetric traffic alternative that is consistently second-tier.
@@ -378,12 +414,13 @@ def _add_k2_2d_schedule_candidates(base_configs, arch):
         (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
          c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
          bool(c.kwargs.get("SCHEDULE_2D", False)),
+         bool(c.kwargs.get("DYNAMIC_INNER", False)),
          c.num_warps, c.num_stages, getattr(c, "maxnreg", None))
         for c in base_configs
     }
     extra = []
     for bm, bn, bk, gm, nw, ns in specs:
-        key = (bm, bn, bk, gm, True, nw, ns, None)
+        key = (bm, bn, bk, gm, True, False, nw, ns, None)
         if key in seen:
             continue
         seen.add(key)
@@ -393,6 +430,60 @@ def _add_k2_2d_schedule_candidates(base_configs, arch):
             "BLOCK_K": bk,
             "GROUP_M": gm,       # unused by the 2-D schedule; ABI identity only
             "SCHEDULE_2D": True,
+            "DYNAMIC_INNER": False,
+        }, num_warps=nw, num_stages=ns))
+    return base_configs + extra
+
+
+def _add_k2_dynamic_inner_candidates(base_configs, arch):
+    """Reuse one pipelined smem buffer across the four BK steps per G256.
+
+    The static inner loop in the v10 winner is unrolled into four independent
+    double-buffered X/W allocations (96 KB total in the attached TTGIR).  A
+    dynamic four-iteration loop keeps the same INT32 accumulation order and
+    FP32 fold boundary while allowing Triton to allocate one reusable pipeline
+    (12/24/36 KB for W4 S2/S3/S4 on the 64x128 tile).
+    """
+    if not (80 <= int(arch) <= 89):
+        return base_configs
+
+    specs = []
+    for bm, bn, gms in ((64, 128, (4, 8)),
+                        (128, 64, (2, 4)),
+                        (64, 64, (4, 8))):
+        for gm in gms:
+            for nw in (4, 8):
+                for ns in ((2, 3, 4) if nw == 4 else (2, 3)):
+                    specs.append((bm, bn, 64, gm, False, nw, ns))
+    for bm, bn in ((16, 64), (16, 128)):
+        for nw in (4, 8):
+            for ns in (2, 3):
+                specs.append((bm, bn, 64, 4, False, nw, ns))
+    # One larger-tile experiment and division-free variants of the two leaders.
+    specs += [
+        (128, 128, 64, 2, False, 8, 2),
+        (64, 128, 64, 1, True, 4, 3),
+        (128, 64, 64, 1, True, 4, 3),
+    ]
+
+    seen = {
+        (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
+         c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
+         bool(c.kwargs.get("SCHEDULE_2D", False)),
+         bool(c.kwargs.get("DYNAMIC_INNER", False)),
+         c.num_warps, c.num_stages, getattr(c, "maxnreg", None))
+        for c in base_configs
+    }
+    extra = []
+    for bm, bn, bk, gm, schedule_2d, nw, ns in specs:
+        key = (bm, bn, bk, gm, schedule_2d, True, nw, ns, None)
+        if key in seen:
+            continue
+        seen.add(key)
+        extra.append(Config({
+            "BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
+            "GROUP_M": gm, "SCHEDULE_2D": schedule_2d,
+            "DYNAMIC_INNER": True,
         }, num_warps=nw, num_stages=ns))
     return base_configs + extra
 
@@ -658,6 +749,7 @@ def _kernel2_compute_tile(
     GROUP_SIZE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     OUTPUT_FP16: tl.constexpr,
+    DYNAMIC_INNER: tl.constexpr,
 ):
     """Numerically locked K2 tile body shared by the 1-D and 2-D schedulers.
 
@@ -681,17 +773,28 @@ def _kernel2_compute_tile(
         xs = tl.load(xs_ptr_block, eviction_policy="evict_last")
 
         int32_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-        for sub in tl.static_range(0, GROUPS_PER_TILE):
-            k_offset = k_group_start + sub * BLOCK_K
-            cols_k = k_offset + tl.arange(0, BLOCK_K)
-            xq = tl.load(
-                X_q_ptr + rm[:, None] * stride_xqm + cols_k[None, :] * stride_xqk)
-            # Canonical W_q layout remains [N,K].  Keeping this exact load and
-            # tl.trans path avoids the quality/regression observed in the Gluon
-            # experiment and requires no weight-format change.
-            wq = tl.load(
-                W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
-            int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
+        if DYNAMIC_INNER:
+            # Same ordered offsets {0,64,128,192}, but one reusable software-
+            # pipelined smem allocation instead of four unrolled allocations.
+            for k_offset in tl.range(
+                    k_group_start, k_group_start + GROUP_SIZE, BLOCK_K):
+                cols_k = k_offset + tl.arange(0, BLOCK_K)
+                xq = tl.load(
+                    X_q_ptr + rm[:, None] * stride_xqm + cols_k[None, :] * stride_xqk)
+                wq = tl.load(
+                    W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
+                int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
+        else:
+            for sub in tl.static_range(0, GROUPS_PER_TILE):
+                k_offset = k_group_start + sub * BLOCK_K
+                cols_k = k_offset + tl.arange(0, BLOCK_K)
+                xq = tl.load(
+                    X_q_ptr + rm[:, None] * stride_xqm + cols_k[None, :] * stride_xqk)
+                # Canonical W_q layout remains [N,K].  Keeping this exact load
+                # and transpose path preserves the v10 numerical reference.
+                wq = tl.load(
+                    W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
+                int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
 
         acc += int32_acc.to(tl.float32) * xs[:, None]
 
@@ -725,6 +828,7 @@ def kernel2_gemm_dequant(
     HAS_BIAS: tl.constexpr,
     OUTPUT_FP16: tl.constexpr,
     SCHEDULE_2D: tl.constexpr = False,
+    DYNAMIC_INNER: tl.constexpr = False,
 ):
     """K2 — plain INT8 GEMM + late per-group xs fold ("hybrid_direct" variant).
 
@@ -758,7 +862,12 @@ def kernel2_gemm_dequant(
          rate ~3% — the hints add LSU overhead for zero benefit on streaming
          INT8 operands that never fit L1).
 
-      4. The original 1-D GROUP_M persistent scheduler remains the numerical
+      4. ``DYNAMIC_INNER=True`` preserves the ordered four-BK INT32 sum and
+         G256 FP32 fold but reuses one software-pipelined shared-memory buffer.
+         The v10 static winner allocates four independent double buffers in
+         TTGIR (96 KB); the dynamic W4 S3 64x128 candidate uses 24 KB.
+
+      5. The original 1-D GROUP_M persistent scheduler remains the numerical
          reference.  ``SCHEDULE_2D=True`` uses a bounded 2-D persistent grid
          and removes repeated dynamic tile division/modulo while calling the
          identical tile body.  The generated descriptor makes the plugin use
@@ -788,7 +897,7 @@ def kernel2_gemm_dequant(
                     stride_wn, stride_wk, stride_ym, stride_yn,
                     pid_m, pid_n,
                     BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE,
-                    HAS_BIAS, OUTPUT_FP16,
+                    HAS_BIAS, OUTPUT_FP16, DYNAMIC_INNER,
                 )
     else:
         # Existing 1-D GROUP_M super-group scheduler retained as the reference
@@ -810,7 +919,7 @@ def kernel2_gemm_dequant(
                 stride_wn, stride_wk, stride_ym, stride_yn,
                 pid_m, pid_n,
                 BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE,
-                HAS_BIAS, OUTPUT_FP16,
+                HAS_BIAS, OUTPUT_FP16, DYNAMIC_INNER,
             )
 
 
@@ -858,9 +967,27 @@ AUTOTUNE_SHAPES_K2 = [
     (3000, 2560, 1024),  # dit.self_attn.k/v projections
     (3000, 4096, 2560),  # dit.self_attn.o projection
 ]
-# Approximate per-layer call multiplicity.  Override with a comma-separated
-# HOTSTEP_K2_SHAPE_WEIGHTS list when the exported graph differs.
-K2_DEFAULT_SHAPE_WEIGHTS = (2.0, 1.0, 1.0, 2.0, 1.0)
+# Actual ConvRot inventory from the TensorRT inspector JSON has 32 DiT layers:
+#   NOBIAS: gate/up=64, down=32, self+cross Q=64, self+cross O=64,
+#           self K/V=64, cross K/V=64.
+#   BIAS:   six M=1 time-embedding projections plus one condition embedder.
+# The benchmark models total runtime as sum(call_count * measured_latency).
+# Measured latency already contains M*K*N, so multiplying call counts by FLOPs
+# again would incorrectly square the compute weighting.
+K2_DEFAULT_NOBIAS_WORKLOAD = (
+    (3000, 2560, 9728, 64.0, "mlp.gate/up"),
+    (3000, 9728, 2560, 32.0, "mlp.down"),
+    (3000, 2560, 4096, 64.0, "self/cross q"),
+    (3000, 2560, 1024, 64.0, "self k/v"),
+    (2048, 2560, 1024, 64.0, "cross k/v"),
+    (3000, 4096, 2560, 64.0, "self/cross o"),
+)
+K2_DEFAULT_BIAS_WORKLOAD = (
+    (1, 256, 2560, 2.0, "time_embed.linear_1"),
+    (1, 2560, 2560, 2.0, "time_embed.linear_2"),
+    (1, 2560, 15360, 2.0, "time_embed.time_proj"),
+    (2048, 2048, 2560, 1.0, "condition_embedder"),
+)
 K2_AUTOTUNE_M_ALIGNMENT = 128  # max generated K2 BLOCK_M; avoids OOB in plain K2
 # K1 uses the same workspace pitch contract as K2 but the real, unpadded M so
 # the shipped cubin makes no false divisibility assumption about runtime M.
@@ -2196,23 +2323,90 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
 #   HOTSTEP_K2_BENCH_WARMUP   — warmup iterations per config (default 20)
 #   HOTSTEP_K2_BENCH_ITERS    — timed iterations per config (default 50)
 #   HOTSTEP_K2_BENCH_TOPN     — how many top configs to print (default 5)
-#   HOTSTEP_K2_SHAPE_WEIGHTS  — five comma-separated production call weights
+#   HOTSTEP_K2_LAYER_JSON     — optional TensorRT inspector JSON for exact counts
+#   HOTSTEP_K2_PROFILE        — min/opt/max profile rows from that JSON (default max)
 
 K2_BENCH_WARMUP = int(os.environ.get("HOTSTEP_K2_BENCH_WARMUP", "20"))
 K2_BENCH_ITERS = int(os.environ.get("HOTSTEP_K2_BENCH_ITERS", "50"))
 K2_BENCH_TOPN = int(os.environ.get("HOTSTEP_K2_BENCH_TOPN", "5"))
 
 
-def _k2_shape_weights():
-    raw = os.environ.get("HOTSTEP_K2_SHAPE_WEIGHTS", "").strip()
-    if not raw:
-        return K2_DEFAULT_SHAPE_WEIGHTS
-    vals = tuple(float(x.strip()) for x in raw.split(",") if x.strip())
-    if len(vals) != len(AUTOTUNE_SHAPES_K2) or any(x <= 0 for x in vals):
-        raise ValueError(
-            f"HOTSTEP_K2_SHAPE_WEIGHTS must contain "
-            f"{len(AUTOTUNE_SHAPES_K2)} positive comma-separated values")
-    return vals
+def _inspector_profile_rows(doc, tensor_name, profile_kind):
+    shape_key = {"min": "MinShape", "opt": "OptShape", "max": "MaxShape"}[profile_kind]
+    layers = doc.get("layers", {})
+    for tensor in layers.get("I/O Tensors", []):
+        if tensor.get("Name") != tensor_name:
+            continue
+        infos = tensor.get("ProfileInfo", [])
+        if not infos:
+            break
+        shape = infos[0].get(shape_key, [])
+        if len(shape) < 2:
+            break
+        rows = 1
+        for dim in shape[:-1]:
+            rows *= int(dim)
+        return rows
+    raise ValueError(f"could not read {shape_key} rows for {tensor_name!r}")
+
+
+def _k2_workload_from_inspector(path, has_bias):
+    """Derive exact K2 call counts and M classes from a TRT inspector JSON."""
+    doc = json.loads(Path(path).read_text())
+    profile_kind = os.environ.get("HOTSTEP_K2_PROFILE", "max").strip().lower()
+    if profile_kind not in ("min", "opt", "max"):
+        raise ValueError("HOTSTEP_K2_PROFILE must be min, opt, or max")
+    latent_m = _inspector_profile_rows(doc, "input_latents", profile_kind)
+    encoder_m = _inspector_profile_rows(doc, "enc_hidden", profile_kind)
+
+    layer_list = doc.get("layers", {}).get("Layers", [])
+    producer = {
+        out.get("Name"): layer
+        for layer in layer_list for out in layer.get("Outputs", [])
+        if out.get("Name")
+    }
+    metadata_re = re.compile(r"gs=\d+,K=(\d+),N=(\d+),bias=(\d+)")
+    counts = {}
+    labels = {}
+    for layer in layer_list:
+        if layer.get("PluginType") != "ConvRotInt8Linear":
+            continue
+        match = metadata_re.search(layer.get("PluginMetadata", ""))
+        if match is None:
+            continue
+        K, N, bias_flag = map(int, match.groups())
+        if bool(bias_flag) != bool(has_bias):
+            continue
+        inputs = layer.get("Inputs", [])
+        weight_name = ""
+        if len(inputs) >= 2:
+            weight_name = producer.get(inputs[1].get("Name"), {}).get("Name", "")
+        if "time_embed" in weight_name:
+            M = 1
+        elif ("cross_attn.k_proj" in weight_name or
+              "cross_attn.v_proj" in weight_name or
+              "condition_embedder" in weight_name):
+            M = encoder_m
+        else:
+            M = latent_m
+        key = (M, K, N)
+        counts[key] = counts.get(key, 0.0) + 1.0
+        labels.setdefault(key, weight_name or layer.get("Name", "unnamed"))
+    if not counts:
+        raise ValueError(f"no ConvRot bias={int(bool(has_bias))} layers found in {path}")
+    return tuple((M, K, N, count, labels[(M, K, N)])
+                 for (M, K, N), count in sorted(counts.items()))
+
+
+def _k2_workload(has_bias):
+    inspector_path = os.environ.get("HOTSTEP_K2_LAYER_JSON", "").strip()
+    if inspector_path:
+        workload = _k2_workload_from_inspector(inspector_path, has_bias)
+        print(f"    [K2 workload] loaded {len(workload)} shape classes from "
+              f"{inspector_path} (profile={os.environ.get('HOTSTEP_K2_PROFILE', 'max')})",
+              flush=True)
+        return workload
+    return K2_DEFAULT_BIAS_WORKLOAD if has_bias else K2_DEFAULT_NOBIAS_WORKLOAD
 
 
 def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
@@ -2372,7 +2566,7 @@ def _k2_reference_config():
     """The exact K2 baseline that shipped before this optimization patch."""
     return Config({
         "BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64,
-        "GROUP_M": 2, "SCHEDULE_2D": False,
+        "GROUP_M": 2, "SCHEDULE_2D": False, "DYNAMIC_INNER": False,
     }, num_warps=8, num_stages=3)
 
 
@@ -2397,16 +2591,16 @@ def _bench_k2_workload(configs, num_sms, has_bias, output_fp16):
     if not configs:
         return None, []
     reference = _k2_reference_config()
-    weights = _k2_shape_weights()
+    workload = _k2_workload(has_bias)
     state = {
         id(cfg): {"cfg": cfg, "weighted_ms": 0.0, "weight": 0.0,
                   "shape_ms": [], "error": None}
         for cfg in configs
     }
 
-    for shape_idx, ((M, K, N), weight) in enumerate(
-            zip(AUTOTUNE_SHAPES_K2, weights)):
-        legal = [c for c in configs if N % c.kwargs["BLOCK_N"] == 0]
+    for shape_idx, (M, K, N, weight, shape_label) in enumerate(workload):
+        legal = [c for c in configs
+                 if N % c.kwargs["BLOCK_N"] == 0 and K % GROUP_SIZE == 0]
         if not legal:
             continue
         pack = _make_k2_production_bench_pack(
@@ -2454,13 +2648,14 @@ def _bench_k2_workload(configs, num_sms, has_bias, output_fp16):
                 shape_rows.append((cfg, float("inf"), 0, entry["error"]))
 
         shape_rows.sort(key=lambda row: row[1])
-        print(f"    [K2 workload] shape {shape_idx + 1}/{len(AUTOTUNE_SHAPES_K2)} "
-              f"weight={weight:g}; exact plugin sequence", flush=True)
+        print(f"    [K2 workload] shape {shape_idx + 1}/{len(workload)} "
+              f"calls={weight:g} label={shape_label}; exact plugin sequence",
+              flush=True)
         _print_k2_bench_topn(shape_rows, M, K, N)
         del y_reference, pack
 
     results = []
-    expected_weight = float(sum(weights))
+    expected_weight = float(sum(row[3] for row in workload))
     for entry in state.values():
         cfg = entry["cfg"]
         err = entry["error"]
@@ -2468,8 +2663,9 @@ def _bench_k2_workload(configs, num_sms, has_bias, output_fp16):
             results.append((cfg, float("inf"), 0,
                             err or "not legal/benchmarked for every shape"))
         else:
-            weighted_mean = entry["weighted_ms"] / expected_weight
-            results.append((cfg, weighted_mean, -1, None))
+            # Keep the modeled total, not an average.  This is directly
+            # interpretable as aggregate K2 milliseconds per engine invocation.
+            results.append((cfg, entry["weighted_ms"], -1, None))
     results.sort(key=lambda row: row[1])
     best = results[0][0] if results and results[0][1] != float("inf") else None
     return best, results
@@ -2478,16 +2674,17 @@ def _bench_k2_workload(configs, num_sms, has_bias, output_fp16):
 def _print_k2_workload_topn(results, topn=None):
     if topn is None:
         topn = K2_BENCH_TOPN
-    print(f"    [K2 workload] weighted top-{topn} (mean production-sequence ms):",
+    print(f"    [K2 workload] top-{topn} by modeled total K2 ms per engine invocation:",
           flush=True)
     for cfg, ms, _, err in results[:topn]:
         if ms == float("inf"):
             print(f"      FAIL  {cfg}: {err}", flush=True)
             continue
-        print(f"      {ms:8.4f} ms  BM={cfg.kwargs['BLOCK_M']} "
+        print(f"      total={ms:9.4f} ms  BM={cfg.kwargs['BLOCK_M']} "
               f"BN={cfg.kwargs['BLOCK_N']} BK={cfg.kwargs['BLOCK_K']} "
               f"GM={cfg.kwargs['GROUP_M']} "
               f"SCH={'2D' if cfg.kwargs.get('SCHEDULE_2D', False) else '1D'} "
+              f"INNER={'DYN' if cfg.kwargs.get('DYNAMIC_INNER', False) else 'STATIC'} "
               f"W={cfg.num_warps} S={cfg.num_stages} "
               f"MR={getattr(cfg, 'maxnreg', None)}", flush=True)
 
@@ -2509,6 +2706,7 @@ def _print_k2_bench_topn(results, M, K, N, topn=None):
               f"BM={cfg.kwargs.get('BLOCK_M')} BN={cfg.kwargs.get('BLOCK_N')} "
               f"BK={cfg.kwargs.get('BLOCK_K')} GM={cfg.kwargs.get('GROUP_M')} "
               f"SCH={'2D' if cfg.kwargs.get('SCHEDULE_2D', False) else '1D'} "
+              f"INNER={'DYN' if cfg.kwargs.get('DYNAMIC_INNER', False) else 'STATIC'} "
               f"W={cfg.num_warps} S={cfg.num_stages} MR={mr}",
               flush=True)
 
@@ -2760,6 +2958,7 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             block_k_winning = best_cfg.kwargs["BLOCK_K"]
             group_m = best_cfg.kwargs["GROUP_M"]
             schedule_2d = bool(best_cfg.kwargs.get("SCHEDULE_2D", False))
+            dynamic_inner = bool(best_cfg.kwargs.get("DYNAMIC_INNER", False))
             nw = best_cfg.num_warps
             ns = best_cfg.num_stages
             mr = getattr(best_cfg, "maxnreg", None)
@@ -2798,10 +2997,11 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             win_note = ""
             if win_row is not None:
                 _, win_ms = win_row
-                win_note = f", weighted production mean={win_ms:.4f} ms"
+                win_note = f", modeled total K2={win_ms:.4f} ms/engine-call"
             schedule_name = "2D" if schedule_2d else "1D-GROUP_M"
+            inner_name = "DYNAMIC-REUSE" if dynamic_inner else "STATIC-UNROLLED"
             print(f"  -> Custom-bench winner: BM={block_m} BN={block_n} BK={block_k_winning} GM={group_m} "
-                  f"schedule={schedule_name} W={nw} S={ns} MR={mr}"
+                  f"schedule={schedule_name} inner={inner_name} W={nw} S={ns} MR={mr}"
                   f"{occ_note}{win_note}", flush=True)
             print(
                 f"     shared={shared/1024:.0f}KB, cubin={len(cubin)}B, "
@@ -2826,6 +3026,7 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                 "block_k": int(block_k_winning),
                 "group_m": int(group_m),
                 "schedule_2d": schedule_2d,
+                "dynamic_inner": dynamic_inner,
                 "num_warps": nw,
                 "num_stages": ns,
                 "maxnreg": mr,
@@ -3390,7 +3591,9 @@ def main():
                                           AUTOTUNE_SHAPES_K2, arch=arch)
     _K2_CONFIGS[:] = _add_sm_aware_tile_candidates(
         _K2_CONFIGS, num_sms, AUTOTUNE_SHAPES_K2)
+    _K2_CONFIGS[:] = _add_k2_small_m_candidates(_K2_CONFIGS, arch)
     _K2_CONFIGS[:] = _add_k2_2d_schedule_candidates(_K2_CONFIGS, arch)
+    _K2_CONFIGS[:] = _add_k2_dynamic_inner_candidates(_K2_CONFIGS, arch)
     # The plugin's workspace/tail contract is strict; never benchmark a tile
     # that could win extraction but be rejected by enqueue.
     _K2_CONFIGS[:] = [
