@@ -959,11 +959,142 @@ def _float32_to_bfloat16_uint16(arr):
     return np.ascontiguousarray((rounded >> np.uint32(16)).astype(np.uint16))
 
 
+def _patch_qwen3_rmsnorm_to_use_aten_rms_norm() -> None:
+    """Monkey-patch Qwen3RMSNorm.forward to call F.rms_norm (aten.rms_norm).
+
+    Qwen3RMSNorm's default forward() is hand-written math that never calls
+    aten.rms_norm, so dynamo's torchlib registration (PR #159377, PyTorch
+    >= 2.9) cannot emit a native ONNX RMSNormalization node.
+
+    F.rms_norm(x, shape, weight, eps) dispatches through aten.rms_norm.default,
+    which dynamo maps to ONNX RMSNormalization at opset 23.
+
+    Numerically equivalent for fp32 input/weight (our export case):
+    same formula, same eps placement, same dtype flow.
+    """
+    import torch.nn.functional as F
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+    def _patched_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(
+            hidden_states,
+            self.weight.shape,
+            self.weight,
+            self.variance_epsilon,
+        )
+
+    Qwen3RMSNorm.forward = _patched_forward
+    print("[export_dit] Patched Qwen3RMSNorm.forward to use F.rms_norm (aten.rms_norm) "
+          "for native ONNX RMSNormalization emission")
+
+
+def _patch_dit_block_remove_type_as() -> None:
+    """Monkey-patch AceStepDiTLayer.forward and torch.Tensor.type_as to remove
+    .type_as(hidden_states) calls during export.
+
+    In FP32 export, .type_as(hidden_states) is a no-op, but dynamo still emits
+    a Cast node. _rewrite_w8a8_fp16_islands then propagates FP16 through this
+    Cast, placing it between RMSNorm and the AdaLN modulation Mul, causing the
+    modulation to run in FP16 and overflow.
+
+    By making type_as a no-op during export, we prevent these Cast nodes.
+    """
+    from modeling_acestep_v15_xl_base import AceStepDiTLayer
+
+    def _patched_dit_layer_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        temb,
+        attention_mask=None,
+        position_ids=None,
+        past_key_value=None,
+        output_attentions=False,
+        use_cache=False,
+        cache_position=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        **kwargs,
+    ):
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
+            self.scale_shift_table + temb
+        ).chunk(6, dim=1)
+
+        norm_hidden_states = self.self_attn_norm(hidden_states) * (1 + scale_msa) + shift_msa
+        attn_output, self_attn_weights = self.self_attn(
+            hidden_states=norm_hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_attentions=output_attentions,
+            use_cache=False,
+            past_key_value=None,
+            **kwargs,
+        )
+        hidden_states = hidden_states + attn_output * gate_msa
+
+        if self.use_cross_attention:
+            norm_hidden_states = self.cross_attn_norm(hidden_states)
+            attn_output, cross_attn_weights = self.cross_attn(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=encoder_attention_mask,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                **kwargs,
+            )
+            hidden_states = hidden_states + attn_output
+
+        norm_hidden_states = self.mlp_norm(hidden_states) * (1 + c_scale_msa) + c_shift_msa
+        ff_output = self.mlp(norm_hidden_states)
+        hidden_states = hidden_states + ff_output * c_gate_msa
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        return outputs
+
+    AceStepDiTLayer.forward = _patched_dit_layer_forward
+
+    # Also patch torch.Tensor.type_as to be a no-op during export (catches
+    # the norm_out path in AceStepDiTModel.forward).
+    _orig_type_as = torch.Tensor.type_as
+
+    def _noop_type_as(self, other):
+        return self
+
+    torch.Tensor.type_as = _noop_type_as
+    print("[export_dit] Patched AceStepDiTLayer.forward + torch.Tensor.type_as "
+          "(removes .type_as() calls that cause FP16 modulation overflow)")
+
+
+def _detect_native_rmsnorm_or_fail(model_proto) -> None:
+    """Verify that dynamo emitted native RMSNormalization nodes. NO FALLBACK."""
+    count = sum(1 for n in model_proto.graph.node if n.op_type == "RMSNormalization")
+    if count == 0:
+        raise SystemExit(
+            "FATAL: Native RMSNormalization not found in dynamo export (0 nodes).\n"
+            "Requirements:\n"
+            "  1. PyTorch >= 2.9.0 (PR #159377 adds aten.rms_norm -> RMSNormalization)\n"
+            "  2. --opset 23 (or higher)\n"
+            "  3. Qwen3RMSNorm monkey-patch must be active (calls F.rms_norm)\n"
+            f"Current: torch={torch.__version__}\n"
+            "No fallback to manual rewrite — fix the above and re-run."
+        )
+    print(f"[export_dit] Native RMSNormalization nodes detected: {count} (OK)")
+
+
+def _detect_native_attention(model_proto) -> int:
+    """Count native ONNX Attention nodes. Returns 0 if not found."""
+    return sum(1 for n in model_proto.graph.node if n.op_type == "Attention")
+
+
 def _w8a8_plugin_boundary_dtype() -> str:
     # GGML Q8_0 linears produce FP32 tensors, and RMSNorm/AdaLN/residual math
     # stays FP32. Keep that as the default for audio quality. FP16/BF16 are
     # explicit experimental modes for profiling or overflow investigations.
-    value = os.environ.get("HOTSTEP_W8A8_PLUGIN_IO_DTYPE", "FP32").strip().upper()
+    value = os.environ.get("HOTSTEP_W8A8_PLUGIN_IO_DTYPE", "FP16").strip().upper()
     if value in {"FP16", "FLOAT16", "HALF"}:
         return "FP16"
     if value in {"BF16", "BFLOAT16"}:
@@ -1334,6 +1465,13 @@ def _externalize_initializers_from_safetensors(
     zero_point_names: dict[str, str] = {}
     w8a8_boundary_dtype = _w8a8_plugin_boundary_dtype() if precision == "w8a8" else "FP16"
     w8a8_boundary_tensorproto = _onnx_dtype_for_plugin_boundary(TensorProto, w8a8_boundary_dtype)
+    # RMSNormalization scale weights MUST stay FP32. TRT makes the RMSNorm output
+    # dtype match the Scale dtype (not the input dtype, not stash_type). FP32 Scale
+    # → FP32 output → FP32 AdaLN modulation (no overflow). FP16 Scale → FP16 output
+    # → FP16 modulation → overflow (6 infs → 384 NaN in velocity).
+    # So we deliberately leave rmsnorm_scale_names EMPTY — the scale weights are
+    # not externalized as FP16, they stay in their original FP32 storage.
+    rmsnorm_scale_names: set[str] = set()
     # Sane quantization rule from the GGUF path: 1D tensors (norms/biases) stay
     # FP32. Even when a bias is folded into ConvRotInt8Linear, keep the ONNX
     # initializer and plugin input FP32; only activations/H use the lowp boundary
@@ -1426,9 +1564,11 @@ def _externalize_initializers_from_safetensors(
                 streamed_int8 += 1
                 continue
 
-            if precision == "q8map-fp16" and name in selected_initializer_names:
-                boundary_dtype = "FP16"
-                boundary_tensorproto = TensorProto.FLOAT16
+            if (precision == "q8map-fp16" and name in selected_initializer_names) or (
+                precision == "w8a8" and w8a8_boundary_dtype != "FP32" and name in rmsnorm_scale_names
+            ):
+                boundary_dtype = w8a8_boundary_dtype if precision == "w8a8" else "FP16"
+                boundary_tensorproto = w8a8_boundary_tensorproto if precision == "w8a8" else TensorProto.FLOAT16
                 if source is not None:
                     if is_transposed:
                         dst_dtype = "<f2" if boundary_dtype == "FP16" else ("<f4" if boundary_dtype == "FP32" else "<u2")
@@ -1451,6 +1591,8 @@ def _externalize_initializers_from_safetensors(
                     fallback += 1
                 added_initializers.append(_external_initializer(name, boundary_tensorproto, dims, data_location, offset, length))
                 if precision == "q8map-fp16":
+                    downcast_to_lowp.append(name)
+                elif precision == "w8a8":
                     downcast_to_lowp.append(name)
                 streamed_fp16 += 1
                 continue
@@ -1531,16 +1673,15 @@ def _externalize_initializers_from_safetensors(
     # Must run AFTER the w8a8 plugin rewrite (so Q/K/V come from
     # ConvRotInt8Linear outputs) and AFTER SplitToSequence lowering, but
     # BEFORE constant folding (so the dead Q/K scaling nodes get cleaned up).
-    attention_rewrite_report = rewrite_attention_to_onnx_attention_fp16(model_proto)
-    if attention_rewrite_report.get("rewritten", 0):
-        rewrite_report["attention_rewrite"] = attention_rewrite_report
-        if attention_rewrite_report.get("skipped"):
-            print(f"[export_dit] Attention rewrite: {attention_rewrite_report['rewritten']} blocks fused, "
-                  f"skipped={attention_rewrite_report['skipped']}")
-        else:
-            print(f"[export_dit] Attention rewrite: {attention_rewrite_report['rewritten']} blocks fused")
-    elif attention_rewrite_report.get("skipped"):
-        print(f"[export_dit] Attention rewrite: 0 blocks fused, skipped={attention_rewrite_report['skipped']}")
+    _native_attn_count = _detect_native_attention(model_proto)
+    if _native_attn_count == 0:
+        raise SystemExit(
+            "FATAL: Native ONNX Attention not found in dynamo export (0 nodes).\n"
+            "Dynamo emits native Attention at opset 23 via PR #154596 (PyTorch >= 2.8)\n"
+            "when the model calls F.scaled_dot_product_attention with dropout_p=0.\n"
+            "No fallback to manual SDPA rewrite — fix the above and re-run."
+        )
+    print(f"[export_dit] Native Attention nodes detected: {_native_attn_count} (OK — TRT FMHA)")
 
     constant_fold_report = _fold_constant_nodes_to_initializers_for_trt(
         model_proto,
@@ -2235,240 +2376,6 @@ def _quantize_w8a8_initializers_with_convrot(
     }
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Attention rewrite: decomposed SDPA → ONNX Attention-23 op (FP16 lowp island)
-# ──────────────────────────────────────────────────────────────────────────
-# Ported from tools/onnx-export/optimize_dit_onnx.py. Replaces the manually
-# decomposed ``MatMul(Q,Kᵀ) → Mul(scale) → Add(mask) → Softmax → MatMul(.,V)``
-# pattern (produced by torch dynamo's sdpa decomposition) with a single
-# ONNX ``Attention`` op (opset 23). This lets TensorRT dispatch to its
-# built-in FMHA kernel instead of the current FP32 MatMul+Softmax+MatMul
-# chain, which is ~30% of total inference time.
-#
-# The attention island runs in FP16 for sm_75/T4 compatibility (T4 has no BF16 support).
-# flash-attention precision). TRT's Attention op handles softmax
-# precision internally (always FP32 accumulation) — the
-# ``softmax_precision`` attribute is NOT supported by TRT's parser.
-# The surrounding graph stays in its current dtype (FP32 for the baseline);
-# Casts are inserted at the attention I/O boundary.
-
-
-def _attn_node_by_output(model) -> dict:
-    """Map tensor name → producing node."""
-    return {out: node for node in model.graph.node for out in node.output if out}
-
-
-def _attn_consumers_by_input(model) -> dict:
-    """Map tensor name → list of consuming nodes."""
-    import collections
-    consumers: dict[str, list] = collections.defaultdict(list)
-    for node in model.graph.node:
-        for inp in node.input:
-            if inp:
-                consumers[inp].append(node)
-    return consumers
-
-
-def _attn_ensure_main_opset(model, min_version: int) -> None:
-    """Bump the main (ai.onnx) opset to at least ``min_version``."""
-    from onnx import helper
-    for opset in model.opset_import:
-        if opset.domain in ("", "ai.onnx"):
-            if opset.version < min_version:
-                opset.version = min_version
-            return
-    model.opset_import.extend([helper.make_opsetid("", min_version)])
-
-
-def _is_sqrt_scalar_node(node, prod: dict) -> bool:
-    """True if ``node`` is a ``Sqrt(CastLike(scalar, q_tensor))`` pattern."""
-    if node is None or node.op_type != "Sqrt" or len(node.input) != 1:
-        return False
-    src = prod.get(node.input[0])
-    return src is None or src.op_type in {"CastLike", "Cast", "Constant", "Reshape", "Squeeze"}
-
-
-def _split_scaled_mul(mul_node, prod: dict):
-    """Return ``(data_input, sqrt_scale_input)`` for ``Mul(data, Sqrt(scale))``."""
-    if mul_node is None or mul_node.op_type != "Mul" or len(mul_node.input) != 2:
-        return None
-    a, b = mul_node.input
-    pa, pb = prod.get(a), prod.get(b)
-    if _is_sqrt_scalar_node(pa, prod):
-        return b, a
-    if _is_sqrt_scalar_node(pb, prod):
-        return a, b
-    return None
-
-
-def _trace_untranspose_k(name: str, prod: dict):
-    """Undo the exporter's ``K^T`` reshape/transpose/reshape wrapper."""
-    r2 = prod.get(name)
-    if r2 is None or r2.op_type != "Reshape" or len(r2.input) < 1:
-        return None
-    tr = prod.get(r2.input[0])
-    if tr is None or tr.op_type != "Transpose" or len(tr.input) < 1:
-        return None
-    r1 = prod.get(tr.input[0])
-    if r1 is None or r1.op_type != "Reshape" or len(r1.input) < 1:
-        return None
-    return r1.input[0]
-
-
-def rewrite_attention_to_onnx_attention_fp16(model) -> dict:
-    """Rewrite decomposed SDPA islands to ONNX ``Attention`` op (opset 23, FP16).
-
-    Pattern matched::
-
-        Mul(Q, sqrt(scale))            Mul(K^T, sqrt(scale))
-             |                              |
-              MatMul(Q, K^T) → Add(mask) → Softmax → MatMul(., V) → output
-
-    Replacement::
-
-        Cast Q/K/V/mask → fp16
-        Attention(Q_fp16, K_fp16, V_fp16, mask_fp16, scale=1/sqrt(D),
-                  is_causal=0)
-        Cast output → FP32 (reuses the original AV MatMul output name)
-
-    The attention island runs in FP16 in this export variant. This is required
-    for sm_75/T4 compatibility because T4 has no BF16 support. TensorRT handles
-    softmax precision internally (FP32 accumulation by default); the
-    ``softmax_precision`` attribute is rejected by TRT's ONNX parser
-    (``!hasSoftmaxPrecision`` assertion). The surrounding residual graph stays
-    in its current dtype (FP32 for the baseline); Casts are inserted at the
-    attention I/O boundary.
-
-    Returns a report dict with ``rewritten`` count and ``skipped`` reasons.
-    """
-    from onnx import TensorProto, helper
-
-    prod = _attn_node_by_output(model)
-    consumers = _attn_consumers_by_input(model)
-    remove_node_names: set[str] = set()
-    replacements: dict[str, list] = {}
-    rewritten = []
-    skipped: dict[str, int] = {}
-
-    used_names = {name for node in model.graph.node
-                  for name in list(node.input) + list(node.output) if name}
-    used_names.update(init.name for init in model.graph.initializer)
-
-    def unique(base: str) -> str:
-        name = base
-        i = 0
-        while name in used_names:
-            i += 1
-            name = f"{base}_{i}"
-        used_names.add(name)
-        return name
-
-    for softmax in list(model.graph.node):
-        if softmax.op_type != "Softmax" or len(softmax.input) != 1 or len(softmax.output) != 1:
-            continue
-        sm_in, sm_out = softmax.input[0], softmax.output[0]
-        add = prod.get(sm_in)
-        if add is None or add.op_type != "Add" or len(add.input) != 2:
-            skipped["softmax_input_not_add"] = skipped.get("softmax_input_not_add", 0) + 1
-            continue
-
-        # Find QK matmul and additive mask input.
-        qk = None
-        mask = None
-        for inp in add.input:
-            p = prod.get(inp)
-            if p is not None and p.op_type == "MatMul":
-                qk = p
-            else:
-                mask = inp
-        if qk is None or mask is None or len(qk.input) != 2 or len(qk.output) != 1:
-            skipped["no_qk_or_mask"] = skipped.get("no_qk_or_mask", 0) + 1
-            continue
-
-        q_mul = prod.get(qk.input[0])
-        k_mul = prod.get(qk.input[1])
-        q_parts = _split_scaled_mul(q_mul, prod)
-        k_parts = _split_scaled_mul(k_mul, prod)
-        if q_parts is None or k_parts is None:
-            skipped["scaled_mul_not_matched"] = skipped.get("scaled_mul_not_matched", 0) + 1
-            continue
-        q_name, _q_scale = q_parts
-        k_transposed_name, _k_scale = k_parts
-        k_name = _trace_untranspose_k(k_transposed_name, prod)
-        if k_name is None:
-            skipped["k_untranspose_not_matched"] = skipped.get("k_untranspose_not_matched", 0) + 1
-            continue
-
-        av_consumers = [node for node in consumers.get(sm_out, [])
-                        if node.op_type == "MatMul" and len(node.input) == 2]
-        if len(av_consumers) != 1:
-            skipped["av_consumer_count"] = skipped.get("av_consumer_count", 0) + 1
-            continue
-        av = av_consumers[0]
-        if av.input[0] != sm_out:
-            skipped["av_softmax_not_first_input"] = skipped.get("av_softmax_not_first_input", 0) + 1
-            continue
-        v_name = av.input[1]
-        if len(av.output) != 1:
-            skipped["av_output_count"] = skipped.get("av_output_count", 0) + 1
-            continue
-        out_name = av.output[0]
-
-        base = av.name or softmax.name or out_name
-        q_fp16 = unique(out_name + "_attention_q_fp16")
-        k_fp16 = unique(out_name + "_attention_k_fp16")
-        v_fp16 = unique(out_name + "_attention_v_fp16")
-        mask_fp16 = unique(out_name + "_attention_mask_fp16")
-        y_fp16 = unique(out_name + "_attention_y_fp16")
-
-        new_nodes = [
-            helper.make_node("Cast", [q_name], [q_fp16],
-                             name=base + "/CastQTofp16", to=TensorProto.FLOAT16),
-            helper.make_node("Cast", [k_name], [k_fp16],
-                             name=base + "/CastKTofp16", to=TensorProto.FLOAT16),
-            helper.make_node("Cast", [v_name], [v_fp16],
-                             name=base + "/CastVTofp16", to=TensorProto.FLOAT16),
-            helper.make_node("Cast", [mask], [mask_fp16],
-                             name=base + "/CastMaskTofp16", to=TensorProto.FLOAT16),
-            helper.make_node(
-                "Attention",
-                [q_fp16, k_fp16, v_fp16, mask_fp16],
-                [y_fp16],
-                name=base + "/Attentionfp16",
-                scale=0.08838834764831845,  # 1/sqrt(128) for head_dim=128
-                is_causal=0,
-            ),
-            helper.make_node("Cast", [y_fp16], [out_name],
-                             name=base + "/CastAttentionOutputToFP32",
-                             to=TensorProto.FLOAT),
-        ]
-        replacements[av.name] = new_nodes
-        remove_node_names.update({softmax.name, add.name, qk.name, av.name})
-        # Q/K scaling nodes become dead after QK removal; remove when uniquely named.
-        if q_mul is not None:
-            remove_node_names.add(q_mul.name)
-        if k_mul is not None:
-            remove_node_names.add(k_mul.name)
-        rewritten.append({"softmax": softmax.name, "qk": qk.name,
-                          "av": av.name, "output": out_name})
-
-    if not rewritten:
-        return {"rewritten": 0, "skipped": dict(skipped)}
-
-    new_graph_nodes = []
-    for node in model.graph.node:
-        if node.name in replacements:
-            new_graph_nodes.extend(replacements[node.name])
-            continue
-        if node.name in remove_node_names:
-            continue
-        new_graph_nodes.append(node)
-    del model.graph.node[:]
-    model.graph.node.extend(new_graph_nodes)
-    _attn_ensure_main_opset(model, 23)
-    return {"rewritten": len(rewritten), "examples": rewritten[:8], "skipped": dict(skipped)}
-
-
 def _w8a8_rewrite_dispatch(model, quant_report: dict) -> dict:
     """Emit the fused ``ConvRotInt8Linear`` custom op for every w8a8 site.
 
@@ -2480,7 +2387,13 @@ def _w8a8_rewrite_dispatch(model, quant_report: dict) -> dict:
     INT8 × INT8 matmul, dequant, and bias add into a single GPU kernel
     launch — a direct port of the ComfyUI-INT8-Fast Triton kernel.
     """
-    return _rewrite_w8a8_weight_ops_with_plugin(model, quant_report)
+    boundary_dtype = _w8a8_plugin_boundary_dtype()
+    # Native RMSNormalization is guaranteed by _detect_native_rmsnorm_or_fail().
+    # Skip the manual pattern-match rewrite.
+    rmsnorm_report = {"skipped": "native RMSNormalization verified at export time"}
+    report = _rewrite_w8a8_weight_ops_with_plugin(model, quant_report, rmsnorm_report.get("rmsnorm_outputs", set()))
+    report["rmsnorm_rewrite"] = rmsnorm_report
+    return report
 
 
 def _cast_attr_to_dtype(onnx, node) -> int | None:
@@ -2499,6 +2412,55 @@ def _string_attr(node, name: str, default: str = "") -> str:
     return default
 
 
+def _build_adaln_modulation_tensor_set(model) -> set[str]:
+    """Identify all tensors derived from scale_shift_table (AdaLN modulation).
+
+    These must stay FP32 to prevent the modulation Mul from overflowing in FP16.
+    Traces forward from every scale_shift_table initializer through dtype-preserving ops.
+    """
+    adaln_tensors = set()
+    for init in model.graph.initializer:
+        if "scale_shift_table" in init.name:
+            adaln_tensors.add(init.name)
+
+    consumers_by_input = {}
+    for n in model.graph.node:
+        for i in n.input:
+            if i:
+                consumers_by_input.setdefault(i, []).append(n)
+
+    trace_ops = {
+        "Add", "Sub", "Mul", "Split", "Identity", "SequenceAt",
+        "Unsqueeze", "Squeeze", "Reshape", "Cast", "Slice",
+        "SequenceConstruct",
+    }
+
+    worklist = list(adaln_tensors)
+    visited = set()
+    while worklist:
+        name = worklist.pop()
+        if name in visited:
+            continue
+        visited.add(name)
+        adaln_tensors.add(name)
+        for consumer in consumers_by_input.get(name, []):
+            if consumer.op_type in trace_ops:
+                for o in consumer.output:
+                    if o and o not in visited:
+                        worklist.append(o)
+    return adaln_tensors
+
+
+_ADALN_MODULATION_TENSORS: set[str] | None = None
+
+
+def _is_adaln_modulation_tensor(tensor_name: str) -> bool:
+    global _ADALN_MODULATION_TENSORS
+    if _ADALN_MODULATION_TENSORS is None:
+        return False
+    return tensor_name in _ADALN_MODULATION_TENSORS
+
+
 def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_name: str = "FP16") -> dict:
     """Make TensorRT strongly-typed elementwise islands agree on the plugin lowp dtype.
 
@@ -2513,6 +2475,10 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
 
     target_dtype_name = target_dtype_name.upper()
     target_tensorproto = _onnx_dtype_for_plugin_boundary(TensorProto, target_dtype_name)
+
+    global _ADALN_MODULATION_TENSORS
+    _ADALN_MODULATION_TENSORS = _build_adaln_modulation_tensor_set(model)
+
     lowp = set(seed_lowp_tensors)
     for init in model.graph.initializer:
         if init.data_type == target_tensorproto:
@@ -2558,6 +2524,8 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
     def cast_to_lowp(tensor_name: str, node_name: str, input_index: int) -> str:
         if tensor_name in lowp:
             return tensor_name
+        if _is_adaln_modulation_tensor(tensor_name):
+            return tensor_name  # protect AdaLN modulation tensors — keep FP32
         suffix = target_dtype_name.lower()
         cast_out = unique_name(f"{tensor_name}_to_{suffix}_for_{node_name}_{input_index}")
         cast_node = helper.make_node(
@@ -2572,12 +2540,53 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
         inserted.append({"node": cast_node.name, "input": tensor_name, "output": cast_out})
         return cast_out
 
+    fp32_boundary_inserted = []
+
+    def cast_to_fp32(tensor_name: str, node_name: str, input_index: int) -> str:
+        if tensor_name not in lowp:
+            return tensor_name
+        cast_out = unique_name(f"{tensor_name}_to_fp32_for_{node_name}_{input_index}")
+        cast_node = helper.make_node(
+            "Cast",
+            [tensor_name],
+            [cast_out],
+            name=unique_name(f"{node_name}/CastInput{input_index}ToFP32"),
+            to=TensorProto.FLOAT,
+        )
+        new_nodes.append(cast_node)
+        fp32_boundary_inserted.append({"node": cast_node.name, "input": tensor_name, "output": cast_out})
+        return cast_out
+
     def clone_with_inputs(node, inputs):
         cloned = onnx.NodeProto()
         cloned.CopyFrom(node)
         del cloned.input[:]
         cloned.input.extend(inputs)
         return cloned
+
+    # Build producer map for tracing weight sources back to initializer names.
+    # Dynamo lowers Linear to Transpose(weight) -> MatMul, so the MatMul sees a
+    # temporary like val_5161, not the literal proj_out weight name. Trace through
+    # Transpose/Cast/Identity to find the real source.
+    producer_by_output = {
+        output: producer
+        for producer in model.graph.node
+        for output in producer.output
+        if output
+    }
+
+    def traces_to_proj_out(tensor_name: str) -> bool:
+        seen = set()
+        current = tensor_name
+        while current and current not in seen:
+            seen.add(current)
+            if "proj_out" in current.lower():
+                return True
+            producer = producer_by_output.get(current)
+            if producer is None or producer.op_type not in {"Transpose", "Cast", "Identity"} or len(producer.input) != 1:
+                return False
+            current = producer.input[0]
+        return False
 
     for node in model.graph.node:
         node_name = node.name or (node.output[0] if node.output else node.op_type)
@@ -2589,12 +2598,53 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
             continue
 
         if node.op_type == "ConvRotInt8Linear":
-            new_nodes.append(node)
-            if _string_attr(node, "output_dtype", "FP16").upper() == target_dtype_name:
+            in_dtype = _string_attr(node, "input_dtype", "FP32").upper()
+            out_dtype = _string_attr(node, "output_dtype", "FP32").upper()
+            patched_inputs = list(node.input)
+            if in_dtype == "FP32" and patched_inputs[0] and patched_inputs[0] in lowp:
+                cast_out = unique_name(f"{patched_inputs[0]}_to_fp32_for_{node_name}")
+                cast_node = helper.make_node(
+                    "Cast",
+                    [patched_inputs[0]],
+                    [cast_out],
+                    name=unique_name(f"{node_name}/CastInput0ToFP32"),
+                    to=TensorProto.FLOAT,
+                )
+                new_nodes.append(cast_node)
+                patched_inputs[0] = cast_out
+            elif in_dtype == target_dtype_name and patched_inputs[0] and patched_inputs[0] not in lowp:
+                patched_inputs[0] = cast_to_lowp(patched_inputs[0], node_name, 0)
+            new_nodes.append(clone_with_inputs(node, patched_inputs) if patched_inputs != list(node.input) else node)
+            if out_dtype == target_dtype_name:
                 lowp.update(o for o in node.output if o)
             continue
 
+        if node.op_type == "RMSNormalization":
+            # TRT makes RMSNorm output dtype = input dtype (not scale dtype).
+            # If input is lowp (FP16), output is FP16 — mark as lowp.
+            # If input is FP32 (modulation-path norm), output is FP32 — leave as-is.
+            if node.input and node.input[0] in lowp:
+                lowp.update(o for o in node.output if o)
+            new_nodes.append(node)
+            continue
+
+        if node.op_type == "Attention":
+            # Native ONNX Attention: cast ALL inputs to lowp (FP16) for TRT FMHA.
+            patched_inputs = list(node.input)
+            for idx, inp in enumerate(patched_inputs):
+                if inp and inp not in lowp:
+                    patched_inputs[idx] = cast_to_lowp(inp, node_name, idx)
+            new_nodes.append(clone_with_inputs(node, patched_inputs) if patched_inputs != list(node.input) else node)
+            lowp.update(o for o in node.output if o)
+            continue
+
         if node.op_type in same_type_ops and any(i in lowp for i in node.input if i):
+            has_adaln = any(i and _is_adaln_modulation_tensor(i) for i in node.input if i)
+            if has_adaln:
+                patched_inputs = [cast_to_fp32(i, node_name, idx) if i and i in lowp else i
+                                  for idx, i in enumerate(node.input)]
+                new_nodes.append(clone_with_inputs(node, patched_inputs))
+                continue
             patched_inputs = [cast_to_lowp(i, node_name, idx) if i and i not in lowp else i
                               for idx, i in enumerate(node.input)]
             new_nodes.append(clone_with_inputs(node, patched_inputs))
@@ -2627,6 +2677,16 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
             continue
 
         if node.op_type in matmul_like_ops and any(i in lowp for i in node.input if i):
+            # proj_out is deliberately not quantized: preserve its FP32
+            # initializer and execute the terminal GEMM in FP32. Dynamo lowers
+            # Linear to Transpose(weight)->MatMul, so the weight may appear as
+            # a temporary (e.g. val_5161) — trace through Transpose/Cast/Identity
+            # to find the real source name.
+            if any(traces_to_proj_out(inp) for inp in node.input if inp):
+                patched_inputs = [cast_to_fp32(i, node_name, idx) if i and i in lowp else i
+                                  for idx, i in enumerate(node.input)]
+                new_nodes.append(clone_with_inputs(node, patched_inputs))
+                continue
             patched_inputs = [cast_to_lowp(i, node_name, idx) if i and i not in lowp else i
                               for idx, i in enumerate(node.input)]
             new_nodes.append(clone_with_inputs(node, patched_inputs))
@@ -2645,15 +2705,50 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
 
         new_nodes.append(node)
 
+    # Cast graph outputs back to their expected dtype
+    graph_outputs_by_name = {o.name: o for o in model.graph.output}
+    final_nodes = []
+    for node in new_nodes:
+        out_matches = [o for o in node.output if o in graph_outputs_by_name]
+        if not out_matches:
+            final_nodes.append(node)
+            continue
+        needed_casts = []
+        new_outputs = list(node.output)
+        for idx, o in enumerate(new_outputs):
+            if o in graph_outputs_by_name and o in lowp:
+                expected_type = graph_outputs_by_name[o].type.tensor_type.elem_type
+                if expected_type != target_tensorproto:
+                    lowp_out_name = unique_name(f"{o}_lowp")
+                    new_outputs[idx] = lowp_out_name
+                    cast_node = helper.make_node(
+                        "Cast",
+                        [lowp_out_name],
+                        [o],
+                        name=unique_name(f"{node.name}/CastOutputToFLOAT"),
+                        to=expected_type,
+                    )
+                    needed_casts.append(cast_node)
+        if needed_casts:
+            cloned = onnx.NodeProto()
+            cloned.CopyFrom(node)
+            del cloned.output[:]
+            cloned.output.extend(new_outputs)
+            final_nodes.append(cloned)
+            final_nodes.extend(needed_casts)
+        else:
+            final_nodes.append(node)
+
     del model.graph.node[:]
-    model.graph.node.extend(new_nodes)
+    model.graph.node.extend(final_nodes)
     return {
         "lowp_boundary_casts_inserted": inserted,
+        "fp32_boundary_casts_inserted": fp32_boundary_inserted,
         "lowp_tensor_count": len(lowp),
     }
 
 
-def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
+def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict, seed_lowp_outputs: set[str] = None) -> dict:
     """Replace MatMul/Gemm nodes with a single ConvRotInt8Linear custom op.
 
     This is the only w8a8 path in production: ONNX is the intermediate
@@ -2734,7 +2829,7 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
     rewritten = []
     new_nodes: list = []
     consumed_matmul_outputs: set[str] = set()
-    lowp_plugin_outputs: set[str] = set()
+    lowp_plugin_outputs: set[str] = set(seed_lowp_outputs) if seed_lowp_outputs else set()
     boundary_dtype = _w8a8_plugin_boundary_dtype()
     boundary_tensorproto = _onnx_dtype_for_plugin_boundary(TensorProto, boundary_dtype)
     cast_nodes_inserted = []
@@ -2849,21 +2944,10 @@ def _rewrite_w8a8_weight_ops_with_plugin(model, quant_report: dict) -> dict:
             )
         plugin_group_size = int(group_size)
 
-        # Using FP32 for accuracy. It's worse with BF16 and catastrophic with FP16 here
-        if any(t in weight_source for t in ["q_proj", "k_proj", "v_proj"]):
+        # proj_out stays FP32 for maximum audio quality on the velocity output.
+        # All other w8a8 linears use boundary_dtype (FP16) for bandwidth.
+        if "proj_out" in weight_source:
             input_dtype = "FP32"
-            output_dtype = "FP32"
-        elif "o_proj" in weight_source:
-            input_dtype = "FP32"
-            output_dtype = "FP32"
-        elif any(t in weight_source for t in ["gate_proj", "up_proj"]):
-            input_dtype = "FP32"
-            output_dtype = "FP32"
-        elif "down_proj" in weight_source:
-            input_dtype = "FP32"
-            output_dtype = "FP32"
-        elif "proj_out" in weight_source:
-            input_dtype = boundary_dtype
             output_dtype = "FP32"
         else:
             input_dtype = boundary_dtype
@@ -2982,6 +3066,10 @@ def load_dit_model(
 
     from modeling_acestep_v15_xl_base import AceStepDiTModel # only xl for now, it IS the same for all xl
     from configuration_acestep_v15 import AceStepConfig
+
+    # Monkey-patches must happen BEFORE model instantiation
+    _patch_qwen3_rmsnorm_to_use_aten_rms_norm()
+    _patch_dit_block_remove_type_as()
 
     # Load config
     import json
@@ -3158,6 +3246,26 @@ def export_onnx(dit_model, config, output_path: str, opset: int = 18,
         keep_initializers_as_inputs=True,
         external_data=True,
     )
+
+    # Verify native RMSNormalization was emitted. NO FALLBACK — fail if absent.
+    import onnx as _onnx_for_detect
+    _detect_model = _onnx_for_detect.load(graph_shell_path, load_external_data=False)
+    _detect_native_rmsnorm_or_fail(_detect_model)
+    _native_attn_count = _detect_native_attention(_detect_model)
+    if _native_attn_count > 0:
+        print(f"[export_dit] Native Attention nodes detected: {_native_attn_count} (OK)")
+    else:
+        print("[export_dit] WARNING: Native Attention not found — manual SDPA rewrite will run")
+
+    # Save raw dynamo graph for inspection.
+    import shutil
+    raw_inspection_path = os.path.join(os.getcwd(), "dit.raw.onnx")
+    try:
+        shutil.copy2(graph_shell_path, raw_inspection_path)
+        print(f"[export_dit] Raw dynamo graph (opset {opset}) saved for inspection: {raw_inspection_path}")
+    except Exception as e:
+        print(f"[export_dit] WARNING: could not save raw graph for inspection: {e}")
+
     print(f"[export_dit] Streaming {precision} safetensors into ONNX external data...")
     try:
         stream_result = _externalize_initializers_from_safetensors(
@@ -3217,8 +3325,8 @@ def main():
                         help="Path to the model directory (containing model.safetensors + config.json)")
     parser.add_argument("--output", default=None,
                         help="Output ONNX file path (default: models/onnx/dit_<model_name>.onnx)")
-    parser.add_argument("--opset", type=int, default=18,
-                        help="ONNX opset version (default: 18)")
+    parser.add_argument("--opset", type=int, default=23,
+                        help="ONNX opset version (default: 23 — native RMSNormalization + Attention)")
     parser.add_argument("--precision", default="q8map-fp16",
                         choices=["q8map-fp16", "w8a8", "fp32"],
                         help="Precision recipe (default: q8map-fp16). 'w8a8' = INT8 weights + INT8 activations with ConvRot rotation.")

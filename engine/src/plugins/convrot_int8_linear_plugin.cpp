@@ -690,11 +690,10 @@ char const* dtypeNameFromId(int32_t dtypeId) {
 }
 
 bool isSupportedPluginBoundaryDtypePair(int32_t input_dtype_id, int32_t output_dtype_id) {
-    // Only FP32IO (ONNX dtype id 1) is compiled by default. The 16-bit
-    // boundary cubin variants (FP16IO/BF16IO) were removed to simplify the
-    // build and because the default HOTSTEP_W8A8_PLUGIN_IO_DTYPE=FP32 uses
-    // FP32 everywhere anyway.
-    return (input_dtype_id == 1 && output_dtype_id == 1);  // FP32IO
+    // Both FP32IO (ONNX dtype id 1) and FP16IO (ONNX dtype id 10) are supported
+    // when generated cubins are present for both (via extract_jit_cubins_autotune.py).
+    return (input_dtype_id == 1 && output_dtype_id == 1) ||
+           (input_dtype_id == 10 && output_dtype_id == 10);
 }
 
 bool readPluginString(nvinfer1::PluginField const& f, char* dst, size_t dstSize) {
@@ -1521,7 +1520,7 @@ bool ConvRotInt8LinearPlugin::initTriton() {
     if (!isSupportedPluginBoundaryDtypePair(m_input_dtype_id, m_output_dtype_id)) {
         hotstep::diag::log(
             "[ConvRotInt8Linear] No compiled Triton cubin for input_dtype=%s, output_dtype=%s. "
-            "Only FP32->FP32 plugin boundary dtype is supported.\n",
+            "Only exact FP16->FP16 and FP32->FP32 plugin boundary dtypes are supported.\n",
             dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id));
         return false;
     }
@@ -1745,16 +1744,20 @@ HOTSTEP_PLUGIN_EXPORT int hotstep_register_plugins() {
         // nullptr for every plugin invocation.
         hotstep::diag::log("=== HotStep plugin DLL loaded ===\n");
         hotstep::diag::log("Cubin header state:\n");
+#if defined(CONVROT_INT8_HAS_DTYPE_FP16IO)
+        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP16IO = 1 (FP16-in/FP16-out cubins present)\n");
+#else
+        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP16IO = UNDEFINED (no FP16-in/FP16-out cubins)\n");
+#  error "Cubin header is missing CONVROT_INT8_HAS_DTYPE_FP16IO. Re-run tools/onnx-export/extract_jit_cubins_autotune.py."
+#endif
 #if defined(CONVROT_INT8_HAS_DTYPE_FP32IO)
         hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = 1 (FP32-in/FP32-out cubins present)\n");
 #else
         hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = UNDEFINED (no FP32-in/FP32-out cubins)\n");
-#  error "Cubin header is missing CONVROT_INT8_HAS_DTYPE_FP32IO. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#  error "Cubin header is missing CONVROT_INT8_HAS_DTYPE_FP32IO. Re-run tools/onnx-export/extract_jit_cubins_autotune.py."
 #endif
-        hotstep::diag::log("If FP32IO is UNDEFINED, you forgot to re-run "
-                         "tools/onnx-export/extract_jit_cubins_autotune.py to regenerate "
-                         "engine/src/plugins/assets/convrot_int8_kernel_cubin.h after "
-                         "updating the C++ plugin source.\n");
+        hotstep::diag::log("If FP16IO or FP32IO is UNDEFINED, you forgot to re-run "
+                         "tools/onnx-export/extract_jit_cubins_autotune.py after updating DTYPE_CONFIGS.\n");
         hotstep::diag::log("Log file path: %s (override with HOTSTEP_PLUGIN_LOG env var)\n",
                          hotstep::diag::logPath().c_str());
 

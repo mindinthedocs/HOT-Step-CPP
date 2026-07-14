@@ -949,7 +949,7 @@ TILE_NAME = "PersistentG256"
 CONVROT_INT8_CUBIN_HEADER_VERSION = 10
 # K2 ships separate compile-time bias and no-bias specializations.
 BIAS_CONFIGS = [("NOBIAS", False), ("BIAS", True)]
-DTYPE_CONFIGS = [("FP32IO", False, False)]
+DTYPE_CONFIGS = [("FP32IO", False, False), ("FP16IO", True, True)]
 # Real DiT decoder K2 shapes, expressed as (M, K, N).  M=3000 is not
 # divisible by all candidate BLOCK_M values; extract_k2 pads the benchmark M
 # to 3072 so the plain/unmasked K2 can be autotuned safely while staying within

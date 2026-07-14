@@ -361,6 +361,11 @@ def build_engine(args) -> tuple[Path, Path, Path]:
     network = builder.create_network(network_flags(trt))
     parser = trt.OnnxParser(network, logger)
     parse_onnx(parser, onnx_path)
+    # Immediately release ~3.6 GB of host memory held by the ONNX protobuf parser tree
+    # before builder.build_serialized_network() starts.
+    parser = None
+    import gc
+    gc.collect()
 
     config = builder.create_builder_config()
     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
@@ -478,6 +483,20 @@ def build_engine(args) -> tuple[Path, Path, Path]:
         "precision_manifest": precision_manifest_summary_for_base(precision_manifest_summary, onnx_path, layers_path.parent),
         "layers": None,
     }
+    # Reclaim VRAM held by builder/network before deserializing engine
+    parser = None
+    network = None
+    config = None
+    builder = None
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(bytes(serialized))
     if engine is not None:
