@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the Python-side ConvRotInt8Linear v2 contract.
+"""Unit tests for the Python-side ConvRotInt8Linear v3 contract.
 
 These tests deliberately avoid importing TensorRT or ONNX. They validate the
 stable ONNX-emission surface and the NumPy reference boundary dtype, which are
@@ -22,6 +22,7 @@ from convrot_int8_plugin import (
     _find_plugin_library,
     conv_rot_int8_linear_reference,
     make_convrot_int8_linear_onnx_node,
+    make_convrot_quantize_onnx_node,
 )
 
 
@@ -44,7 +45,7 @@ class _FakeHelper:
         }
 
 
-class ConvRotInt8PluginV2Tests(unittest.TestCase):
+class ConvRotInt8PluginV3Tests(unittest.TestCase):
     def test_reference_defaults_to_fp16_boundary_output(self) -> None:
         x = np.array([[0.25, -0.5, 1.0, -2.0]], dtype=np.float32)
         weight_q = np.array([[1, -2, 3, -4], [-4, 3, -2, 1]], dtype=np.int8)
@@ -84,7 +85,7 @@ class ConvRotInt8PluginV2Tests(unittest.TestCase):
         )
         self.assertEqual(y.dtype, np.float32)
 
-    def test_make_node_emits_v2_dtype_and_format_attributes(self) -> None:
+    def test_make_node_emits_v3_dtype_and_format_attributes(self) -> None:
         node = make_convrot_int8_linear_onnx_node(
             helper_module=_FakeHelper,
             tensor_proto_module=_FakeTensorProto,
@@ -131,6 +132,50 @@ class ConvRotInt8PluginV2Tests(unittest.TestCase):
         self.assertEqual(node["inputs"], ["x_fp16", "proj_out.weight", "proj_out.weight.w8a8_scale"])
         self.assertEqual(node["attrs"]["output_dtype"], "FP32")
         self.assertEqual(node["attrs"]["output_dtype_id"], _FakeTensorProto.FLOAT)
+
+    def test_prequantized_k2_contract(self) -> None:
+        node = make_convrot_int8_linear_onnx_node(
+            helper_module=_FakeHelper,
+            tensor_proto_module=_FakeTensorProto,
+            x_name="xq",
+            activation_scale_name="xs",
+            weight_q_name="wq",
+            weight_scale_name="ws",
+            bias_name="",
+            output_name="y",
+            node_name="linear/Prequantized",
+            group_size=256,
+            in_features=2560,
+            out_features=1024,
+            has_bias=False,
+            prequantized=True,
+        )
+        self.assertEqual(node["inputs"], ["xq", "xs", "wq", "ws"])
+        self.assertEqual(node["attrs"]["prequantized"], 1)
+        self.assertEqual(node["attrs"]["quantize_only"], 0)
+
+    def test_quantize_only_contract(self) -> None:
+        node = make_convrot_quantize_onnx_node(
+            _FakeHelper, _FakeTensorProto,
+            "x", "xq", "xs", "quant", 256, 2560,
+            input_dtype="FP16",
+        )
+        self.assertEqual(node["inputs"], ["x"])
+        self.assertEqual(node["outputs"], ["xq", "xs"])
+        self.assertEqual(node["attrs"]["quantize_only"], 1)
+        self.assertEqual(node["attrs"]["prequantized"], 0)
+        # Homogeneous serialized boundary selects the existing FP16IO K1.
+        self.assertEqual(node["attrs"]["input_dtype_id"], _FakeTensorProto.FLOAT16)
+        self.assertEqual(node["attrs"]["output_dtype_id"], _FakeTensorProto.FLOAT16)
+
+    def test_prequantized_requires_activation_scale(self) -> None:
+        with self.assertRaises(ValueError):
+            make_convrot_int8_linear_onnx_node(
+                _FakeHelper, _FakeTensorProto,
+                "xq", "wq", "ws", "", "y", "bad",
+                256, 2560, 1024, False,
+                prequantized=True,
+            )
 
     def test_find_plugin_library_honors_explicit_env_file(self) -> None:
         if sys.platform == "win32":

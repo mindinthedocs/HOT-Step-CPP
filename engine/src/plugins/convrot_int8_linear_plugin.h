@@ -30,7 +30,7 @@
 namespace hotstep {
 
 constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_NAME = "ConvRotInt8Linear";
-constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_VERSION = "2";
+constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_VERSION = "3";
 constexpr char const* const kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE = "hotstep";
 
 constexpr char const* const kFIELD_GROUP_SIZE = "group_size";
@@ -42,6 +42,8 @@ constexpr char const* const kFIELD_OUTPUT_DTYPE = "output_dtype";
 constexpr char const* const kFIELD_INPUT_DTYPE_ID = "input_dtype_id";
 constexpr char const* const kFIELD_OUTPUT_DTYPE_ID = "output_dtype_id";
 constexpr char const* const kFIELD_PREFERRED_FORMAT = "preferred_format";
+constexpr char const* const kFIELD_PREQUANTIZED = "prequantized";
+constexpr char const* const kFIELD_QUANTIZE_ONLY = "quantize_only";
 
 /*
  * ConvRotInt8LinearPlugin — IPluginV3 wrapper around AOT-compiled Triton
@@ -68,7 +70,9 @@ public:
                             int32_t out_features, int32_t has_bias,
                             int32_t input_dtype_id = 10,
                             int32_t output_dtype_id = 10,
-                            std::string preferred_format = "HWC8");
+                            std::string preferred_format = "HWC8",
+                            int32_t prequantized = 0,
+                            int32_t quantize_only = 0);
     ConvRotInt8LinearPlugin(void const* data, size_t length);
     ~ConvRotInt8LinearPlugin() override;
 
@@ -139,6 +143,10 @@ private:
     int32_t m_input_dtype_id{10};
     int32_t m_output_dtype_id{10};
     std::string m_preferred_format{"HWC8"};
+    // quantize_only: run K1 and expose X_q / X_scale as graph outputs.
+    // prequantized: consume those tensors and run K2 without repeating K1.
+    int32_t m_prequantized{0};
+    int32_t m_quantize_only{0};
     std::string m_namespace{kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE};
 
     // Runtime shape and tactic state

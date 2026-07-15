@@ -735,14 +735,17 @@ int32_t activationScaleGroups(int32_t K, int32_t groupSize) {
 
 ConvRotInt8LinearPlugin::ConvRotInt8LinearPlugin(
     int32_t group_size, int32_t in_features, int32_t out_features, int32_t has_bias,
-    int32_t input_dtype_id, int32_t output_dtype_id, std::string preferred_format)
+    int32_t input_dtype_id, int32_t output_dtype_id, std::string preferred_format,
+    int32_t prequantized, int32_t quantize_only)
     : m_group_size(group_size),
       m_in_features(in_features),
       m_out_features(out_features),
       m_has_bias(has_bias),
       m_input_dtype_id(normalizeDtypeId(input_dtype_id)),
       m_output_dtype_id(normalizeDtypeId(output_dtype_id)),
-      m_preferred_format(std::move(preferred_format)) {}
+      m_preferred_format(std::move(preferred_format)),
+      m_prequantized(prequantized),
+      m_quantize_only(quantize_only) {}
 
 ConvRotInt8LinearPlugin::ConvRotInt8LinearPlugin(void const* data, size_t length) {
     if (length != getSerializationSize()) return;
@@ -754,6 +757,8 @@ ConvRotInt8LinearPlugin::ConvRotInt8LinearPlugin(void const* data, size_t length
     std::memcpy(&m_has_bias,     d, sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(&input_dtype_id,  d, sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(&output_dtype_id, d, sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(&m_prequantized, d, sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(&m_quantize_only, d, sizeof(int32_t)); d += sizeof(int32_t);
     m_input_dtype_id = normalizeDtypeId(input_dtype_id);
     m_output_dtype_id = normalizeDtypeId(output_dtype_id);
 }
@@ -788,11 +793,19 @@ char const* ConvRotInt8LinearPlugin::getPluginNamespace() const noexcept {
 
 // ── IPluginV3OneBuild ──────────────────────────────────────────────────────
 
-int32_t ConvRotInt8LinearPlugin::getNbOutputs() const noexcept { return 1; }
+int32_t ConvRotInt8LinearPlugin::getNbOutputs() const noexcept {
+    return m_quantize_only ? 2 : 1;
+}
 
 int32_t ConvRotInt8LinearPlugin::getOutputDataTypes(
     nvinfer1::DataType* outputTypes, int32_t nbOutputs,
     nvinfer1::DataType const*, int32_t) const noexcept {
+    if (m_quantize_only) {
+        if (nbOutputs < 2) return -1;
+        outputTypes[0] = nvinfer1::DataType::kINT8;
+        outputTypes[1] = nvinfer1::DataType::kFLOAT;
+        return 0;
+    }
     if (nbOutputs < 1) return -1;
     if (!isSupportedPluginBoundaryDtypePair(m_input_dtype_id, m_output_dtype_id)) return -1;
     outputTypes[0] = trtTypeFromDtypeId(m_output_dtype_id);
@@ -804,14 +817,22 @@ int32_t ConvRotInt8LinearPlugin::getOutputShapes(
     nvinfer1::DimsExprs const*, int32_t,
     nvinfer1::DimsExprs* outputs, int32_t nbOutputs,
     nvinfer1::IExprBuilder& exprBuilder) noexcept {
-    if (nbOutputs < 1 || nbInputs < 1) return -1;
+    if (nbOutputs < (m_quantize_only ? 2 : 1) || nbInputs < 1) return -1;
     auto const& x_dims = inputs[0];
     int32_t ndim = x_dims.nbDims;
     if (ndim < 1) return -1;
     outputs[0].nbDims = ndim;
-    for (int32_t i = 0; i < ndim - 1; ++i)
+    for (int32_t i = 0; i < ndim; ++i)
         outputs[0].d[i] = x_dims.d[i];
-    outputs[0].d[ndim - 1] = exprBuilder.constant(m_out_features);
+    if (m_quantize_only) {
+        int32_t const groups = activationScaleGroups(m_in_features, m_group_size);
+        outputs[1].nbDims = ndim;
+        outputs[1].d[0] = exprBuilder.constant(groups);
+        for (int32_t i = 1; i < ndim; ++i)
+            outputs[1].d[i] = x_dims.d[i - 1];
+    } else {
+        outputs[0].d[ndim - 1] = exprBuilder.constant(m_out_features);
+    }
     return 0;
 }
 
@@ -821,27 +842,40 @@ bool ConvRotInt8LinearPlugin::supportsFormatCombination(
     if (pos < 0 || pos >= nbInputs + nbOutputs) return false;
     if (!isSupportedPluginBoundaryDtypePair(m_input_dtype_id, m_output_dtype_id)) return false;
 
-    // The current kernel indexes tensors as contiguous row-major memory. Keep
-    // kLINEAR as the only accepted physical layout until the packed-layout
-    // kernels land; the v2 dtype/tactic contract is independent of that future
-    // optimization. The ONNX-side preferred_format attribute is still parsed
-    // and serialized so future kernels can enable packed formats without graph
-    // changes.
+    // All public tensors use contiguous row-major storage. The quantize-only
+    // form exposes X_q and transposed X_scale as ordinary graph tensors so
+    // self-attention Q/K/V K2 instances can consume one shared K1 result.
     if (inOut[pos].desc.format != nvinfer1::PluginFormat::kLINEAR) return false;
 
     auto type = inOut[pos].desc.type;
     auto inputType = trtTypeFromDtypeId(m_input_dtype_id);
     auto outputType = trtTypeFromDtypeId(m_output_dtype_id);
+    if (m_quantize_only) {
+        if (nbInputs != 1 || nbOutputs != 2) return false;
+        if (pos == 0) return type == inputType;
+        if (pos == 1) return type == nvinfer1::DataType::kINT8;
+        if (pos == 2) return type == nvinfer1::DataType::kFLOAT;
+        return false;
+    }
+    if (m_prequantized) {
+        if (pos < nbInputs) {
+            if (pos == 0 || pos == 2) return type == nvinfer1::DataType::kINT8;  // X_q, W_q
+            if (pos == 1 || pos == 3) return type == nvinfer1::DataType::kFLOAT; // X_scale, W_scale
+            if (pos == 4) return m_has_bias && type == nvinfer1::DataType::kFLOAT;
+            return false;
+        }
+        return type == outputType;
+    }
     if (pos < nbInputs) {
         switch (pos) {
             case 0: return type == inputType;                        // x
             case 1: return type == nvinfer1::DataType::kINT8;        // weight_q
             case 2: return type == nvinfer1::DataType::kFLOAT;       // weight_scale
-            case 3: return m_has_bias && type == nvinfer1::DataType::kFLOAT; // bias stays FP32 (1D sane rule)
+            case 3: return m_has_bias && type == nvinfer1::DataType::kFLOAT; // bias stays FP32
             default: return false;
         }
     }
-    return type == outputType;  // output y
+    return type == outputType;
 }
 
 int32_t ConvRotInt8LinearPlugin::configurePlugin(
@@ -850,11 +884,17 @@ int32_t ConvRotInt8LinearPlugin::configurePlugin(
     (void)out;
     hotstep::diag::log("[ConvRotInt8Linear] configurePlugin ENTER (BUILD phase): "
                      "nbInputs=%d, nbOutputs=%d, group_size=%d, in_features=%d, "
-                     "out_features=%d, has_bias=%d, input_dtype=%s, output_dtype=%s\n",
+                     "out_features=%d, has_bias=%d, input_dtype=%s, output_dtype=%s, "
+                     "prequantized=%d, quantize_only=%d\n",
                      nbInputs, nbOutputs,
                      m_group_size, m_in_features, m_out_features, m_has_bias,
-                     dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id));
-    if (nbInputs < (m_has_bias ? 4 : 3) || nbOutputs < 1) return -1;
+                     dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id),
+                     m_prequantized, m_quantize_only);
+    int32_t const required_inputs = m_quantize_only ? 1 :
+        (m_prequantized ? (m_has_bias ? 5 : 4) : (m_has_bias ? 4 : 3));
+    int32_t const required_outputs = m_quantize_only ? 2 : 1;
+    if (nbInputs < required_inputs || nbOutputs < required_outputs) return -1;
+    if (m_quantize_only && m_prequantized) return -1;
     int64_t optM = flattenedRows(in[0].opt);
     int32_t optK = lastDim(in[0].opt);
     if (optM <= 0 || optK <= 0 || optK != m_in_features) return -1;
@@ -865,27 +905,19 @@ int32_t ConvRotInt8LinearPlugin::configurePlugin(
     m_K = optK;
     m_N = m_out_features;
 
-    // Eagerly initialize the Triton cubin during the build phase so a cubin
-    // load failure surfaces as a build-time error with a clear stderr message
-    // (via initTriton's diagnostics below), rather than as a runtime assertion
-    // inside PluginV3Runner::execute at C:\_src\runtime\gpu\cuda\pluginV3Runner.cpp:252.
-    //
-    // initTriton() will reject unsupported (group_size, has_bias, input_dtype,
-    // output_dtype) combinations with a detailed message explaining which
-    // combination was requested and which combinations are in the generated
-    // cubin header. The DiT exporter (tools/onnx-export/export_dit.py) emits
-    // FP32 plugin boundary dtypes by default, so the cubin header MUST
-    // contain the FP32IO variant (see extract_jit_cubins_autotune.py).
+    // Eagerly initialize only the cubin family required by this mode. K1-only
+    // and prequantized K2-only nodes reuse the exact existing K1/K2 cubins.
     destroyTriton();
     if (!initTriton()) {
         hotstep::diag::log(
                      "[ConvRotInt8Linear] BUILD-TIME FAILURE: initTriton() failed during "
                      "configurePlugin() for group_size=%d, in_features=%d, "
-                     "out_features=%d, has_bias=%d, input_dtype=%s, output_dtype=%s. "
-                     "See prior stderr for details.\n",
+                     "out_features=%d, has_bias=%d, input_dtype=%s, output_dtype=%s, "
+                     "prequantized=%d, quantize_only=%d. See prior stderr for details.\n",
                      m_group_size, m_in_features, m_out_features, m_has_bias,
                      dtypeNameFromId(m_input_dtype_id),
-                     dtypeNameFromId(m_output_dtype_id));
+                     dtypeNameFromId(m_output_dtype_id),
+                     m_prequantized, m_quantize_only);
         return -1;
     }
     return 0;
@@ -900,6 +932,9 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
     (void)nbInputs;
     (void)outputs;
     (void)nbOutputs;
+
+    // K1 writes directly to its two public outputs in quantize-only mode.
+    if (m_quantize_only) return 0;
 
     // TensorRT's V3 build-time contract provides concrete profile bounds in
     // min/opt/max, while desc.dims may still contain wildcards. Workspace must
@@ -921,12 +956,13 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
     int32_t const maxMPadded = static_cast<int32_t>(maxMPadded64);
 
     int32_t const scale_groups = activationScaleGroups(K, m_group_size);
-    size_t x_q_size = alignUp(static_cast<size_t>(maxMPadded) * static_cast<size_t>(K), 16);
-    // X_scale is now FP32 and uses the transposed [n_groups, M_padded]
-    // layout.  M is padded in workspace so the plain/unmasked K2 kernel can
-    // read complete BLOCK_M tiles without touching unallocated memory.
+    // A prequantized K2 reads its full aligned prefix from public tensors and
+    // needs private X_q/X_scale storage only for one padded tail tile.
+    size_t const quant_rows = m_prequantized ? kMaxK2WorkspacePadBlockM : maxMPadded;
+    size_t x_q_size = alignUp(static_cast<size_t>(quant_rows) * static_cast<size_t>(K), 16);
+    // X_scale is FP32 with transposed [n_groups, rows] layout.
     size_t x_scale_size = alignUp(
-        static_cast<size_t>(maxMPadded) * static_cast<size_t>(scale_groups) * sizeof(float),
+        static_cast<size_t>(quant_rows) * static_cast<size_t>(scale_groups) * sizeof(float),
         16);
     // K2 writes the unaligned final M tile into this small padded tail buffer,
     // then enqueue() copies only the real tail rows to TensorRT's output.  The
@@ -957,7 +993,7 @@ int32_t ConvRotInt8LinearPlugin::getValidTactics(int32_t* tactics, int32_t nbTac
 }
 
 char const* ConvRotInt8LinearPlugin::getTimingCacheID() noexcept {
-    return "ConvRotInt8Linear.v2";
+    return "ConvRotInt8Linear.v3";
 }
 
 int32_t ConvRotInt8LinearPlugin::getFormatCombinationLimit() noexcept {
@@ -972,13 +1008,15 @@ char const* ConvRotInt8LinearPlugin::getMetadataString() noexcept {
     // This is called once; the buffer must live as long as the plugin.
     static thread_local std::string meta;
     std::ostringstream oss;
-    oss << "ConvRotInt8Linear.v2(gs=" << m_group_size
+    oss << "ConvRotInt8Linear.v3(gs=" << m_group_size
         << ",K=" << m_in_features
         << ",N=" << m_out_features
         << ",bias=" << m_has_bias
         << ",in=" << dtypeNameFromId(m_input_dtype_id)
         << ",out=" << dtypeNameFromId(m_output_dtype_id)
         << ",fmt=" << m_preferred_format
+        << ",preq=" << m_prequantized
+        << ",qonly=" << m_quantize_only
         << ",tactic=" << m_tactic << ")";
     meta = oss.str();
     return meta.c_str();
@@ -1010,10 +1048,13 @@ int32_t ConvRotInt8LinearPlugin::onShapeChange(
                      dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id),
                      m_module_quant, m_module_gemm, m_tactic);
 
-    if (nbInputs < (m_has_bias ? 4 : 3) || nbOutputs < 1) {
+    int32_t const required_inputs = m_quantize_only ? 1 :
+        (m_prequantized ? (m_has_bias ? 5 : 4) : (m_has_bias ? 4 : 3));
+    int32_t const required_outputs = m_quantize_only ? 2 : 1;
+    if (nbInputs < required_inputs || nbOutputs < required_outputs) {
         hotstep::diag::log("[ConvRotInt8Linear] onShapeChange REJECT: nbInputs=%d < required=%d "
-                         "OR nbOutputs=%d < 1. m_has_bias=%d.\n",
-                         nbInputs, (m_has_bias ? 4 : 3), nbOutputs, m_has_bias);
+                         "OR nbOutputs=%d < required=%d.\n",
+                         nbInputs, required_inputs, nbOutputs, required_outputs);
         return -1;
     }
     // Extract M, K, N from the descriptors.
@@ -1061,9 +1102,12 @@ int32_t ConvRotInt8LinearPlugin::onShapeChange(
     // shapes. configurePlugin() may have eagerly loaded the cubins for the
     // profile's OPT shape, so onShapeChange() only needs to ensure the cached
     // two-kernel family is present for the concrete runtime dtype/bias config.
-    bool const have_two_kernel = (m_kernelFunc_quant != nullptr && m_kernelFunc_gemm != nullptr);
+    bool const have_required_kernels = m_quantize_only
+        ? (m_kernelFunc_quant != nullptr)
+        : (m_prequantized ? (m_kernelFunc_gemm != nullptr)
+                          : (m_kernelFunc_quant != nullptr && m_kernelFunc_gemm != nullptr));
 
-    if (!have_two_kernel) {
+    if (!have_required_kernels) {
         destroyTriton();
         if (!initTriton()) {
             hotstep::diag::log(
@@ -1090,42 +1134,64 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
     try {
         (void)inputDesc;
         (void)outputDesc;
-        int32_t M = m_M;
-        int32_t K = m_K;
-        int32_t N = m_N;
+        int32_t const M = m_M;
+        int32_t const K = m_K;
+        int32_t const N = m_N;
         if (M <= 0 || K <= 0 || N <= 0) return -1;
 
-        void const* x_ptr = inputs[0];
-        int8_t const* wq_ptr = static_cast<int8_t const*>(inputs[1]);
-        float const* ws_ptr = static_cast<float const*>(inputs[2]);
-        void const* input_bias_ptr = m_has_bias ? inputs[3] : nullptr;
+        // K1-only graph node. X_q is row-major [..., K] and X_scale is
+        // transposed [K/group_size, flattened_rows], so all Q/K/V consumers
+        // can bind the same two tensors without a copy or a special cubin.
+        if (m_quantize_only) {
+            if (!m_kernelFunc_quant || !m_desc_quant) return -1;
+            auto const* quant_desc =
+                static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
+            CUresult const status = hotstep::convrot_int8_generated::launchConvRotQuant(
+                *quant_desc,
+                static_cast<CUfunction>(m_kernelFunc_quant),
+                static_cast<CUstream>(stream),
+                inputs[0],
+                outputs[0],
+                outputs[1],
+                M,
+                K,
+                m_num_sms,
+                K,
+                1,
+                K,
+                1,
+                1,
+                M,
+                m_max_ctas_per_sm_quant);
+            return status == CUDA_SUCCESS ? 0 : -1;
+        }
+
+        int32_t const weight_base = m_prequantized ? 2 : 1;
+        void const* x_ptr = m_prequantized ? nullptr : inputs[0];
+        void* public_xq = m_prequantized ? const_cast<void*>(inputs[0]) : nullptr;
+        void* public_xs = m_prequantized ? const_cast<void*>(inputs[1]) : nullptr;
+        int8_t const* wq_ptr = static_cast<int8_t const*>(inputs[weight_base]);
+        float const* ws_ptr = static_cast<float const*>(inputs[weight_base + 1]);
+        void const* bias_ptr = m_has_bias ? inputs[weight_base + 2] : nullptr;
         void* y_ptr = outputs[0];
 
-        int32_t stride_xm = K;
-        int32_t stride_xk = 1;
-        // W_q is the canonical Linear [out_features, in_features] = [N, K]
-        // row-major initializer.  K2 handles the transpose in-kernel via
-        // tl.trans(wq) (hybrid_direct variant).
-        int32_t stride_wn = K;
-        int32_t stride_wk = 1;
-        int32_t stride_ym = N;
-        int32_t stride_yn = 1;
-
-        // Generated launch stubs in convrot_int8_kernel_cubin.h own the exact
-        // Triton launch ABI, including trailing scratch-pointer parameters.
-
-        if (!m_kernelFunc_quant || !m_kernelFunc_gemm || workspace == nullptr) {
+        if ((!m_prequantized && (!m_kernelFunc_quant || !m_desc_quant)) ||
+            !m_kernelFunc_gemm || !m_desc_gemm || workspace == nullptr) {
 #ifdef HOTSTEP_DIAGNOSTICS
-            hotstep::diag::log("[ConvRotInt8Linear] enqueue REJECT: quant=%p, gemm=%p, workspace=%p\n",
-                             (void*)m_kernelFunc_quant, (void*)m_kernelFunc_gemm, workspace);
+            hotstep::diag::log(
+                "[ConvRotInt8Linear] enqueue REJECT: prequantized=%d, quant=%p, "
+                "gemm=%p, workspace=%p\n",
+                m_prequantized, (void*)m_kernelFunc_quant,
+                (void*)m_kernelFunc_gemm, workspace);
             hotstep::diag::flush();
 #endif
             return -1;
         }
 
-        auto const* quant_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
-        auto const* gemm_desc = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
-        if (quant_desc == nullptr || gemm_desc == nullptr) return -1;
+        auto const* quant_desc =
+            static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
+        auto const* gemm_desc =
+            static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
 
         int32_t const gemm_block_m = gemm_desc->block_m > 0 ? gemm_desc->block_m : 1;
         int32_t const gemm_block_n = gemm_desc->block_n > 0 ? gemm_desc->block_n : 1;
@@ -1143,37 +1209,36 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         int32_t const M_padded = roundUpInt32(M, gemm_block_m);
         int32_t const tail_rows = M_padded - M;
         int32_t const scale_groups = activationScaleGroups(K, m_group_size);
+        int32_t const quant_workspace_rows = m_prequantized
+            ? kMaxK2WorkspacePadBlockM : M_padded;
 
-        size_t const x_q_size = alignUp(static_cast<size_t>(M_padded) * static_cast<size_t>(K), 16);
+        size_t const x_q_size = alignUp(
+            static_cast<size_t>(quant_workspace_rows) * static_cast<size_t>(K), 16);
         size_t const x_scale_size = alignUp(
-            static_cast<size_t>(M_padded) * static_cast<size_t>(scale_groups) * sizeof(float),
+            static_cast<size_t>(quant_workspace_rows) *
+                static_cast<size_t>(scale_groups) * sizeof(float),
             16);
-        size_t const y_tail_size = alignUp(
-            static_cast<size_t>(kMaxK2WorkspacePadBlockM) * static_cast<size_t>(N) *
-                dtypeSizeBytesFromId(m_output_dtype_id),
-            16);
-        void* xq_ptr = workspace;
-        void* xs_ptr = static_cast<char*>(workspace) + x_q_size;
-        void* y_tail_ptr = static_cast<char*>(xs_ptr) + x_scale_size;
-        // NOBIAS cubins compile the bias pointer and epilogue branch away.
-        void const* bias_ptr = input_bias_ptr;
+        void* workspace_xq = workspace;
+        void* workspace_xs = static_cast<char*>(workspace) + x_q_size;
+        void* xq_ptr = m_prequantized ? public_xq : workspace_xq;
+        void* xs_ptr = m_prequantized ? public_xs : workspace_xs;
+        void* y_tail_ptr = static_cast<char*>(workspace_xs) + x_scale_size;
 
-        int32_t stride_xqm = K;
-        int32_t stride_xqk = 1;
-        // X_scale workspace layout: TRANSPOSED [n_groups, M_padded] row-major.
-        // K1 is launched with the real M (so it never reads padded input rows)
-        // but stores actual rows with stride_xsg=M_padded.  The padded tail
-        // rows are zeroed below and consumed only by the plain/unmasked K2
-        // tail launch.
-        int32_t stride_xsm = 1;
-        int32_t stride_xsg = M_padded;
+        int32_t const stride_xqm = K;
+        int32_t const stride_xqk = 1;
+        int32_t const stride_xsm = 1;
+        // Public shared scales are tightly packed [groups, M]. Private normal
+        // mode scales use [groups, M_padded] for the unmasked K2 tail.
+        int32_t const stride_xsg = m_prequantized ? M : M_padded;
+        int32_t const stride_wn = K;
+        int32_t const stride_wk = 1;
+        int32_t const stride_ym = N;
+        int32_t const stride_yn = 1;
 
-        if (tail_rows > 0) {
+        if (!m_prequantized && tail_rows > 0) {
             cudaError_t zq = cudaMemsetAsync(
-                static_cast<char*>(xq_ptr) + static_cast<size_t>(M) * static_cast<size_t>(K),
-                0,
-                static_cast<size_t>(tail_rows) * static_cast<size_t>(K),
-                stream);
+                static_cast<char*>(xq_ptr) + static_cast<size_t>(M) * K,
+                0, static_cast<size_t>(tail_rows) * K, stream);
             if (zq != cudaSuccess) return -1;
             cudaError_t zs = cudaMemset2DAsync(
                 static_cast<char*>(xs_ptr) + static_cast<size_t>(M) * sizeof(float),
@@ -1185,66 +1250,29 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             if (zs != cudaSuccess) return -1;
         }
 
-        CUresult status = hotstep::convrot_int8_generated::launchConvRotQuant(
-            *quant_desc,
-            static_cast<CUfunction>(m_kernelFunc_quant),
-            static_cast<CUstream>(stream),
-            x_ptr,
-            xq_ptr,
-            xs_ptr,
-            M,
-            K,
-            m_num_sms,              // host-side persistent grid sizing only
-            stride_xm,
-            stride_xk,
-            stride_xqm,
-            stride_xqk,
-            stride_xsm,
-            stride_xsg,
-            m_max_ctas_per_sm_quant);  // occupancy cached in initTriton() (H1)
-        if (status != CUDA_SUCCESS) {
-#ifdef HOTSTEP_DIAGNOSTICS
-            char const* err_str = "unknown";
-            cuGetErrorString(status, &err_str);
-            cudaError_t async_status = cudaPeekAtLastError();
-            int shared_bytes_static = 0;
-            cuFuncGetAttribute(&shared_bytes_static,
-                               CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
-                               static_cast<CUfunction>(m_kernelFunc_quant));
-            int num_regs = 0, max_threads_per_block = 0;
-            cuFuncGetAttribute(&num_regs,
-                               CU_FUNC_ATTRIBUTE_NUM_REGS,
-                               static_cast<CUfunction>(m_kernelFunc_quant));
-            cuFuncGetAttribute(&max_threads_per_block,
-                               CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-                               static_cast<CUfunction>(m_kernelFunc_quant));
-            hotstep::diag::log(
-                         "[ConvRotInt8Linear] enqueue FAILURE: quant cuLaunchKernel failed: %s "
-                         "(code=%d, tactic=%d, group_size=%d, kernel=%s, "
-                         "persistent grid=(%u,1,1) [num_sms=%u, num_pid_m=%u, num_k_groups=%u], "
-                         "block=(%u,%u,%u), shared_mem_requested=%u, shared_mem_static=%d bytes, "
-                         "num_regs=%d, max_threads_per_block=%d, cudaPeekAtLastError=%d (%s), "
-                         "M=%d, K=%d, N=%d, input_dtype=%s, output_dtype=%s)\n",
-                         err_str, status, m_tactic, m_group_size, quant_desc->logical_name,
-                         hotstep::convrot_int8_generated::persistentGridU32(
-                             hotstep::convrot_int8_generated::ceilDivU32(M, quant_desc->block_m) *
-                             static_cast<uint32_t>(K / m_group_size),
-                             static_cast<uint32_t>(m_num_sms)),
-                         static_cast<uint32_t>(m_num_sms),
-                         hotstep::convrot_int8_generated::ceilDivU32(M, quant_desc->block_m),
-                         static_cast<uint32_t>(K / m_group_size),
-                         quant_desc->block_x, quant_desc->block_y, quant_desc->block_z,
-                         static_cast<unsigned int>(quant_desc->shared_bytes), shared_bytes_static, num_regs, max_threads_per_block,
-                         static_cast<int>(async_status), cudaGetErrorString(async_status),
-                         M, K, N,
-                         dtypeNameFromId(m_input_dtype_id),
-                         dtypeNameFromId(m_output_dtype_id));
-            hotstep::diag::flush();
-#endif
-            return -1;
+        if (!m_prequantized) {
+            CUresult const status = hotstep::convrot_int8_generated::launchConvRotQuant(
+                *quant_desc,
+                static_cast<CUfunction>(m_kernelFunc_quant),
+                static_cast<CUstream>(stream),
+                x_ptr,
+                xq_ptr,
+                xs_ptr,
+                M,
+                K,
+                m_num_sms,
+                K,
+                1,
+                stride_xqm,
+                stride_xqk,
+                stride_xsm,
+                stride_xsg,
+                m_max_ctas_per_sm_quant);
+            if (status != CUDA_SUCCESS) return -1;
         }
 
-        auto launch_gemm = [&](void* xq_base, void* xs_base, void* y_base, int32_t launch_m) -> CUresult {
+        auto launch_gemm = [&](void* xq_base, void* xs_base, void* y_base,
+                               int32_t launch_m, int32_t launch_scale_stride) -> CUresult {
             return hotstep::convrot_int8_generated::launchConvRotGemm(
                 *gemm_desc,
                 static_cast<CUfunction>(m_kernelFunc_gemm),
@@ -1258,41 +1286,79 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
                 launch_m,
                 N,
                 K,
-                m_num_sms,              // NUM_SMS (host-side persistent grid sizing only)
+                m_num_sms,
                 stride_xqm,
                 stride_xqk,
                 stride_xsm,
-                stride_xsg,
+                launch_scale_stride,
                 stride_wn,
                 stride_wk,
                 stride_ym,
                 stride_yn,
-                m_max_ctas_per_sm_gemm);  // occupancy cached in initTriton() (H1)
+                m_max_ctas_per_sm_gemm);
         };
 
-        // Plain K2 has no boundary masks.  Run the aligned prefix directly into
-        // TensorRT's output, then (only when needed) run the final padded tile
-        // into workspace and copy back the real tail rows.  This keeps the
-        // output tensor's public shape unchanged without a masked K2 variant.
         int32_t const M_aligned = M - (M % gemm_block_m);
         if (M_aligned > 0) {
-            status = launch_gemm(xq_ptr, xs_ptr, y_ptr, M_aligned);
+            CUresult const status = launch_gemm(xq_ptr, xs_ptr, y_ptr, M_aligned, stride_xsg);
             if (status != CUDA_SUCCESS) return -1;
         }
         if (M_aligned < M) {
+            int32_t const real_tail_rows = M - M_aligned;
             void* xq_tail = static_cast<char*>(xq_ptr) +
-                static_cast<size_t>(M_aligned) * static_cast<size_t>(K);
+                static_cast<size_t>(M_aligned) * K;
             void* xs_tail = static_cast<char*>(xs_ptr) +
                 static_cast<size_t>(M_aligned) * sizeof(float);
-            status = launch_gemm(xq_tail, xs_tail, y_tail_ptr, gemm_block_m);
+            int32_t tail_scale_stride = stride_xsg;
+
+            // Shared public tensors are not padded. Copy only the final partial
+            // tile into workspace and zero its inactive rows before K2.
+            if (m_prequantized) {
+                size_t const real_xq_bytes = static_cast<size_t>(real_tail_rows) * K;
+                size_t const padded_xq_bytes = static_cast<size_t>(gemm_block_m) * K;
+                cudaError_t copy_status = cudaMemcpyAsync(
+                    workspace_xq, xq_tail, real_xq_bytes,
+                    cudaMemcpyDeviceToDevice, stream);
+                if (copy_status != cudaSuccess) return -1;
+                if (padded_xq_bytes > real_xq_bytes) {
+                    copy_status = cudaMemsetAsync(
+                        static_cast<char*>(workspace_xq) + real_xq_bytes,
+                        0, padded_xq_bytes - real_xq_bytes, stream);
+                    if (copy_status != cudaSuccess) return -1;
+                }
+                copy_status = cudaMemcpy2DAsync(
+                    workspace_xs, static_cast<size_t>(gemm_block_m) * sizeof(float),
+                    xs_tail, static_cast<size_t>(M) * sizeof(float),
+                    static_cast<size_t>(real_tail_rows) * sizeof(float),
+                    static_cast<size_t>(scale_groups),
+                    cudaMemcpyDeviceToDevice, stream);
+                if (copy_status != cudaSuccess) return -1;
+                if (gemm_block_m > real_tail_rows) {
+                    copy_status = cudaMemset2DAsync(
+                        static_cast<char*>(workspace_xs) +
+                            static_cast<size_t>(real_tail_rows) * sizeof(float),
+                        static_cast<size_t>(gemm_block_m) * sizeof(float),
+                        0,
+                        static_cast<size_t>(gemm_block_m - real_tail_rows) * sizeof(float),
+                        static_cast<size_t>(scale_groups),
+                        stream);
+                    if (copy_status != cudaSuccess) return -1;
+                }
+                xq_tail = workspace_xq;
+                xs_tail = workspace_xs;
+                tail_scale_stride = gemm_block_m;
+            }
+
+            CUresult const status = launch_gemm(
+                xq_tail, xs_tail, y_tail_ptr, gemm_block_m, tail_scale_stride);
             if (status != CUDA_SUCCESS) return -1;
 
             size_t const output_elem_size = dtypeSizeBytesFromId(m_output_dtype_id);
-            size_t const tail_bytes = static_cast<size_t>(M - M_aligned) *
+            size_t const tail_bytes = static_cast<size_t>(real_tail_rows) *
                 static_cast<size_t>(N) * output_elem_size;
             cudaError_t copy_status = cudaMemcpyAsync(
                 static_cast<char*>(y_ptr) +
-                    static_cast<size_t>(M_aligned) * static_cast<size_t>(N) * output_elem_size,
+                    static_cast<size_t>(M_aligned) * N * output_elem_size,
                 y_tail_ptr,
                 tail_bytes,
                 cudaMemcpyDeviceToDevice,
@@ -1309,7 +1375,8 @@ nvinfer1::IPluginV3* ConvRotInt8LinearPlugin::clone() noexcept {
     auto* p = new ConvRotInt8LinearPlugin(m_group_size, m_in_features,
                                           m_out_features, m_has_bias,
                                           m_input_dtype_id, m_output_dtype_id,
-                                          m_preferred_format);
+                                          m_preferred_format,
+                                          m_prequantized, m_quantize_only);
     p->m_namespace = m_namespace;
     p->m_tactic = m_tactic;
     return p;
@@ -1342,13 +1409,15 @@ nvinfer1::PluginFieldCollection const* ConvRotInt8LinearPlugin::getFieldsToSeria
     m_fields.push_back({kFIELD_INPUT_DTYPE_ID,  &input_dtype_id,  nvinfer1::PluginFieldType::kINT32, 1});
     m_fields.push_back({kFIELD_OUTPUT_DTYPE_ID, &output_dtype_id, nvinfer1::PluginFieldType::kINT32, 1});
     m_fields.push_back({kFIELD_PREFERRED_FORMAT, m_preferred_format.c_str(), nvinfer1::PluginFieldType::kCHAR, static_cast<int32_t>(m_preferred_format.size() + 1)});
+    m_fields.push_back({kFIELD_PREQUANTIZED, &m_prequantized, nvinfer1::PluginFieldType::kINT32, 1});
+    m_fields.push_back({kFIELD_QUANTIZE_ONLY, &m_quantize_only, nvinfer1::PluginFieldType::kINT32, 1});
     m_fc.nbFields = static_cast<int32_t>(m_fields.size());
     m_fc.fields = m_fields.data();
     return &m_fc;
 }
 
 size_t ConvRotInt8LinearPlugin::getSerializationSize() const noexcept {
-    return 6 * sizeof(int32_t);  // group_size, in_features, out_features, has_bias, input_dtype_id, output_dtype_id
+    return 8 * sizeof(int32_t);
 }
 
 void ConvRotInt8LinearPlugin::serialize(void* buffer) const noexcept {
@@ -1359,6 +1428,8 @@ void ConvRotInt8LinearPlugin::serialize(void* buffer) const noexcept {
     std::memcpy(d, &m_has_bias,     sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(d, &m_input_dtype_id,  sizeof(int32_t)); d += sizeof(int32_t);
     std::memcpy(d, &m_output_dtype_id, sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(d, &m_prequantized, sizeof(int32_t)); d += sizeof(int32_t);
+    std::memcpy(d, &m_quantize_only, sizeof(int32_t)); d += sizeof(int32_t);
 }
 
 // ── Triton / CUDA Driver initialization ─────────────────────────────────────
@@ -1525,59 +1596,59 @@ bool ConvRotInt8LinearPlugin::initTriton() {
         return false;
     }
 
-    if (m_kernelFunc_quant != nullptr && m_kernelFunc_gemm != nullptr &&
-        m_desc_quant != nullptr && m_desc_gemm != nullptr) {
-        return true;
-    }
+    bool const need_quant = !m_prequantized;
+    bool const need_gemm = !m_quantize_only;
+    bool const have_quant = !need_quant ||
+        (m_kernelFunc_quant != nullptr && m_desc_quant != nullptr);
+    bool const have_gemm = !need_gemm ||
+        (m_kernelFunc_gemm != nullptr && m_desc_gemm != nullptr);
+    if (have_quant && have_gemm) return true;
 
-    GeneratedCubinDesc const* quant_cubin = selectCubinK1(
-        m_group_size, m_input_dtype_id, m_output_dtype_id);
-    GeneratedCubinDesc const* gemm_cubin = selectCubinK2(
-        m_group_size, m_has_bias != 0, m_input_dtype_id, m_output_dtype_id);
-    if (quant_cubin == nullptr || gemm_cubin == nullptr) {
+    GeneratedCubinDesc const* quant_cubin = need_quant ? selectCubinK1(
+        m_group_size, m_input_dtype_id, m_output_dtype_id) : nullptr;
+    GeneratedCubinDesc const* gemm_cubin = need_gemm ? selectCubinK2(
+        m_group_size, m_has_bias != 0, m_input_dtype_id, m_output_dtype_id) : nullptr;
+    if ((need_quant && quant_cubin == nullptr) ||
+        (need_gemm && gemm_cubin == nullptr)) {
         hotstep::diag::log(
             "[ConvRotInt8Linear] Missing generated cubin descriptor for group_size=%d, "
-            "has_bias=%d, input_dtype=%s, output_dtype=%s.\n",
+            "has_bias=%d, input_dtype=%s, output_dtype=%s, prequantized=%d, "
+            "quantize_only=%d.\n",
             m_group_size, m_has_bias,
-            dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id));
+            dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id),
+            m_prequantized, m_quantize_only);
         return false;
     }
 
-    bool const ok_quant = loadOrReuseKernel(
-        quant_cubin,
-        &m_module_quant,
-        &m_kernelFunc_quant);
-    bool const ok_gemm = ok_quant && loadOrReuseKernel(
-        gemm_cubin,
-        &m_module_gemm,
-        &m_kernelFunc_gemm);
-    if (!ok_gemm) return false;
+    if (need_quant && !loadOrReuseKernel(
+            quant_cubin, &m_module_quant, &m_kernelFunc_quant)) return false;
+    if (need_gemm && !loadOrReuseKernel(
+            gemm_cubin, &m_module_gemm, &m_kernelFunc_gemm)) return false;
 
     m_desc_quant = quant_cubin;
     m_desc_gemm = gemm_cubin;
 
-    // ── Query per-cubin occupancy ONCE (patch review H1) ──
-    // cuOccupancyMaxActiveBlocksPerMultiprocessor is a driver call; issuing
-    // it per-enqueue() would add 2 driver round-trips to every one of the
-    // 359 plugin invocations per DiT step.  The value is a pure function of
-    // (cubin, device), both of which are fixed after this point, so cache it
-    // here and pass it through to the generated launch stubs.
-    {
-        auto const* qd = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
-        auto const* gd = static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
-        m_max_ctas_per_sm_quant = hotstep::convrot_int8_generated::queryMaxActiveCtasPerSm(
+    // Query occupancy only for the cubins used by this mode.
+    auto const* qd =
+        static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
+    auto const* gd =
+        static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_gemm);
+    m_max_ctas_per_sm_quant = qd
+        ? hotstep::convrot_int8_generated::queryMaxActiveCtasPerSm(
             static_cast<CUfunction>(m_kernelFunc_quant),
             qd->block_x * qd->block_y * qd->block_z,
-            static_cast<uint32_t>(qd->shared_bytes));
-        m_max_ctas_per_sm_gemm = hotstep::convrot_int8_generated::queryMaxActiveCtasPerSm(
+            static_cast<uint32_t>(qd->shared_bytes))
+        : 0;
+    m_max_ctas_per_sm_gemm = gd
+        ? hotstep::convrot_int8_generated::queryMaxActiveCtasPerSm(
             static_cast<CUfunction>(m_kernelFunc_gemm),
             gd->block_x * gd->block_y * gd->block_z,
-            static_cast<uint32_t>(gd->shared_bytes));
-        hotstep::diag::log(
-            "[ConvRotInt8Linear] Occupancy (max CTAs/SM): quant=%u, gemm=%u "
-            "(0 = query failed; launch falls back to 1 CTA/SM grid).\n",
-            m_max_ctas_per_sm_quant, m_max_ctas_per_sm_gemm);
-    }
+            static_cast<uint32_t>(gd->shared_bytes))
+        : 0;
+    hotstep::diag::log(
+        "[ConvRotInt8Linear] Occupancy (max CTAs/SM): quant=%u, gemm=%u "
+        "(0 = unused/query failed).\n",
+        m_max_ctas_per_sm_quant, m_max_ctas_per_sm_gemm);
 
     // ── Query device SM count for persistent-kernel grid computation ──
     // Used only for host-side grid sizing; the kernels stride their
@@ -1648,6 +1719,8 @@ ConvRotInt8LinearPluginCreator::ConvRotInt8LinearPluginCreator() {
     m_fields.emplace_back(kFIELD_INPUT_DTYPE_ID,  nullptr, nvinfer1::PluginFieldType::kINT32, 1);
     m_fields.emplace_back(kFIELD_OUTPUT_DTYPE_ID, nullptr, nvinfer1::PluginFieldType::kINT32, 1);
     m_fields.emplace_back(kFIELD_PREFERRED_FORMAT, nullptr, nvinfer1::PluginFieldType::kCHAR, 0);
+    m_fields.emplace_back(kFIELD_PREQUANTIZED, nullptr, nvinfer1::PluginFieldType::kINT32, 1);
+    m_fields.emplace_back(kFIELD_QUANTIZE_ONLY, nullptr, nvinfer1::PluginFieldType::kINT32, 1);
     m_fc.nbFields = static_cast<int32_t>(m_fields.size());
     m_fc.fields = m_fields.data();
 }
@@ -1672,6 +1745,8 @@ nvinfer1::IPluginV3* ConvRotInt8LinearPluginCreator::createPlugin(
     int32_t group_size = 0, in_features = 0, out_features = 0, has_bias = 0;
     int32_t input_dtype_id = 10;
     int32_t output_dtype_id = 10;
+    int32_t prequantized = 0;
+    int32_t quantize_only = 0;
     std::string preferred_format = "HWC8";
     for (int32_t i = 0; i < fc->nbFields; ++i) {
         auto const& f = fc->fields[i];
@@ -1705,10 +1780,17 @@ nvinfer1::IPluginV3* ConvRotInt8LinearPluginCreator::createPlugin(
         } else if (std::strcmp(f.name, kFIELD_PREFERRED_FORMAT) == 0) {
             char tmp[32];
             if (readPluginString(f, tmp, sizeof(tmp))) preferred_format = tmp;
+        } else if (std::strcmp(f.name, kFIELD_PREQUANTIZED) == 0 &&
+                   f.type == nvinfer1::PluginFieldType::kINT32) {
+            prequantized = *static_cast<int32_t const*>(f.data);
+        } else if (std::strcmp(f.name, kFIELD_QUANTIZE_ONLY) == 0 &&
+                   f.type == nvinfer1::PluginFieldType::kINT32) {
+            quantize_only = *static_cast<int32_t const*>(f.data);
         }
     }
     return new ConvRotInt8LinearPlugin(group_size, in_features, out_features, has_bias,
-                                       input_dtype_id, output_dtype_id, preferred_format);
+                                       input_dtype_id, output_dtype_id, preferred_format,
+                                       prequantized, quantize_only);
 }
 
 }  // namespace hotstep
@@ -1771,7 +1853,7 @@ HOTSTEP_PLUGIN_EXPORT int hotstep_register_plugins() {
         }
         static hotstep::ConvRotInt8LinearPluginCreator creator;
         registry->registerCreator(creator, hotstep::kCONVROT_INT8_LINEAR_PLUGIN_NAMESPACE);
-        hotstep::diag::log("hotstep_register_plugins: ConvRotInt8Linear v2 creator registered OK.\n");
+        hotstep::diag::log("hotstep_register_plugins: ConvRotInt8Linear v3 creator registered OK.\n");
         return 0;
     } catch (...) {
         hotstep::diag::log("hotstep_register_plugins: C++ exception thrown during registration.\n");

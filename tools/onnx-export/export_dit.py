@@ -1656,6 +1656,17 @@ def _externalize_initializers_from_safetensors(
         rewrite_report = _w8a8_rewrite_dispatch(model_proto, quant_report)
         if not rewrite_report.get("rewritten_nodes"):
             raise SystemExit("W8A8 quantized weights but rewrote zero MatMul/Gemm nodes")
+        shared_quant_report = _share_w8a8_projection_quantization(model_proto)
+        rewrite_report["shared_projection_quantization"] = shared_quant_report
+        missing_shared_kinds = [
+            kind for kind in ("self_qkv", "mlp_gate_up")
+            if shared_quant_report["groups_by_kind"].get(kind, 0) == 0
+        ]
+        if missing_shared_kinds:
+            raise SystemExit(
+                "failed to create required shared ConvRot quantizer group(s): "
+                + ", ".join(missing_shared_kinds)
+            )
 
     sequence_rewrite_report = _rewrite_split_to_sequence_for_trt(model_proto)
     if sequence_rewrite_report["split_to_sequence_rewritten"]:
@@ -2396,6 +2407,180 @@ def _w8a8_rewrite_dispatch(model, quant_report: dict) -> dict:
     return report
 
 
+def _share_w8a8_projection_quantization(model) -> dict:
+    """Share ConvRot K1 for projections with identical activation inputs.
+
+    Supported groups:
+      * self-attention Q/K/V (three independent K2 consumers)
+      * MLP gate/up (two independent K2 consumers)
+
+    MLP down is intentionally excluded: it consumes the post-SwiGLU tensor,
+    not the RMSNorm/AdaLN activation consumed by gate/up, so there is no K1
+    result it can legally share with those projections.
+    """
+    import onnx
+    from onnx import helper
+    from trt_plugins import make_convrot_quantize_onnx_node
+
+    nodes = list(model.graph.node)
+    node_index = {id(node): index for index, node in enumerate(nodes)}
+    producers = {output: node for node in nodes for output in node.output if output}
+    consumers: dict[str, list] = {}
+    for node in nodes:
+        for input_name in node.input:
+            if input_name:
+                consumers.setdefault(input_name, []).append(node)
+
+    def int_attr(node, name: str, default: int = 0) -> int:
+        for attr in node.attribute:
+            if attr.name == name and attr.type == onnx.AttributeProto.INT:
+                return int(attr.i)
+        return default
+
+    def string_attr(node, name: str, default: str = "") -> str:
+        for attr in node.attribute:
+            if attr.name == name and attr.type == onnx.AttributeProto.STRING:
+                return attr.s.decode("utf-8", errors="replace")
+        return default
+
+    def set_int_attr(node, name: str, value: int) -> None:
+        kept = [attr for attr in node.attribute if attr.name != name]
+        del node.attribute[:]
+        node.attribute.extend(kept)
+        node.attribute.append(helper.make_attribute(name, int(value)))
+
+    def canonical_activation(tensor_name: str) -> str:
+        """Trace export-inserted Cast/Identity aliases to the shared source."""
+        seen = set()
+        current = tensor_name
+        while current and current not in seen:
+            seen.add(current)
+            producer = producers.get(current)
+            if producer is None or producer.op_type not in {"Cast", "Identity"} or len(producer.input) != 1:
+                break
+            current = producer.input[0]
+        return current
+
+    def classify_weight(weight_name: str):
+        if ".self_attn." in weight_name:
+            role = next((role for role in ("q", "k", "v")
+                         if weight_name.endswith(f".{role}_proj.weight")), None)
+            if role is not None:
+                prefix = weight_name.rsplit(f".{role}_proj.weight", 1)[0]
+                return "self_qkv", role, prefix
+        if ".mlp." in weight_name:
+            role = next((role for role in ("gate", "up")
+                         if weight_name.endswith(f".{role}_proj.weight")), None)
+            if role is not None:
+                prefix = weight_name.rsplit(f".{role}_proj.weight", 1)[0]
+                return "mlp_gate_up", role, prefix
+        return None
+
+    expected_roles = {
+        "self_qkv": ("q", "k", "v"),
+        "mlp_gate_up": ("gate", "up"),
+    }
+    groups: dict[tuple[str, str, str], list] = {}
+    for node in nodes:
+        if node.op_type != "ConvRotInt8Linear" or len(node.input) < 3:
+            continue
+        if int_attr(node, "prequantized") or int_attr(node, "quantize_only"):
+            continue
+        classified = classify_weight(node.input[1])
+        if classified is None:
+            continue
+        kind, role, layer_prefix = classified
+        source_name = canonical_activation(node.input[0])
+        groups.setdefault((source_name, kind, layer_prefix), []).append(
+            (role, node, node.input[1]))
+
+    selected = []
+    for (source_name, kind, layer_prefix), entries in groups.items():
+        by_role = {role: (node, weight) for role, node, weight in entries}
+        roles = expected_roles[kind]
+        if set(by_role) != set(roles) or len(entries) != len(roles):
+            continue
+        members = [by_role[role][0] for role in roles]
+        if len({int_attr(node, "group_size") for node in members}) != 1:
+            continue
+        if len({int_attr(node, "in_features") for node in members}) != 1:
+            continue
+        if len({string_attr(node, "input_dtype", "FP16") for node in members}) != 1:
+            continue
+        selected.append((source_name, kind, layer_prefix, members))
+
+    insert_before: dict[int, list] = {}
+    removable_cast_ids: set[int] = set()
+    examples = []
+    kind_counts: dict[str, int] = {kind: 0 for kind in expected_roles}
+    linear_consumers = 0
+    for source_name, kind, layer_prefix, members in selected:
+        first = min(members, key=lambda node: node_index[id(node)])
+        quant_input = first.input[0]
+        group_size = int_attr(first, "group_size")
+        in_features = int_attr(first, "in_features")
+        input_dtype = string_attr(first, "input_dtype", "FP16")
+        base = (first.name or layer_prefix).replace(" ", "_")
+        xq_name = f"{base}/shared_{kind}_xq"
+        xs_name = f"{base}/shared_{kind}_xscale"
+        quant_node = make_convrot_quantize_onnx_node(
+            helper, onnx.TensorProto,
+            quant_input, xq_name, xs_name,
+            f"{base}/SharedQuantize_{kind}",
+            group_size, in_features, input_dtype=input_dtype,
+        )
+        insert_before.setdefault(id(first), []).append(quant_node)
+
+        member_ids = {id(node) for node in members}
+        for node in members:
+            old_inputs = list(node.input)
+            old_activation = old_inputs[0]
+            del node.input[:]
+            node.input.extend([xq_name, xs_name, *old_inputs[1:]])
+            set_int_attr(node, "prequantized", 1)
+
+            # The exporter can emit one equivalent Cast per projection. Keep
+            # the Cast feeding shared K1 and delete now-dead duplicates.
+            producer = producers.get(old_activation)
+            if (old_activation != quant_input and producer is not None and producer.op_type == "Cast"):
+                if all(id(consumer) in member_ids for consumer in consumers.get(old_activation, [])):
+                    removable_cast_ids.add(id(producer))
+
+        kind_counts[kind] += 1
+        linear_consumers += len(members)
+        examples.append({
+            "kind": kind,
+            "layer": layer_prefix,
+            "source": source_name,
+            "quant_input": quant_input,
+            "consumers": len(members),
+        })
+
+    if not selected:
+        return {
+            "shared_quantizers": 0,
+            "linear_consumers": 0,
+            "groups_by_kind": kind_counts,
+            "examples": [],
+        }
+
+    rewritten_nodes = []
+    for node in nodes:
+        if id(node) in removable_cast_ids:
+            continue
+        rewritten_nodes.extend(insert_before.get(id(node), []))
+        rewritten_nodes.append(node)
+    del model.graph.node[:]
+    model.graph.node.extend(rewritten_nodes)
+    return {
+        "shared_quantizers": len(selected),
+        "linear_consumers": linear_consumers,
+        "groups_by_kind": kind_counts,
+        "removed_redundant_casts": len(removable_cast_ids),
+        "examples": examples[:8],
+    }
+
+
 def _cast_attr_to_dtype(onnx, node) -> int | None:
     for attr in node.attribute:
         if attr.name == "to" and attr.type == onnx.AttributeProto.INT:
@@ -2464,7 +2649,7 @@ def _is_adaln_modulation_tensor(tensor_name: str) -> bool:
 def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_name: str = "FP16") -> dict:
     """Make TensorRT strongly-typed elementwise islands agree on the plugin lowp dtype.
 
-    ConvRotInt8Linear v2 emits FP16 in this T4-compatible variant. In a
+    ConvRotInt8Linear v3 emits FP16 in this T4-compatible variant. In a
     strongly typed TRT network, elementwise nodes such as
     Add/Mul are not allowed to mix FP32 and lowp tensors. This pass propagates
     the target lowp dtype through dtype-preserving ONNX ops and inserts casts
@@ -2600,6 +2785,17 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
         if node.op_type == "ConvRotInt8Linear":
             in_dtype = _string_attr(node, "input_dtype", "FP32").upper()
             out_dtype = _string_attr(node, "output_dtype", "FP32").upper()
+            prequantized = bool(_node_attr(onnx, node, "prequantized", 0))
+            quantize_only = bool(_node_attr(onnx, node, "quantize_only", 0))
+
+            # Prequantized K2 inputs are explicitly INT8 X_q and FP32 X_scale;
+            # never run them through the activation-boundary cast logic.
+            if prequantized:
+                new_nodes.append(node)
+                if out_dtype == target_dtype_name:
+                    lowp.update(o for o in node.output if o)
+                continue
+
             patched_inputs = list(node.input)
             if in_dtype == "FP32" and patched_inputs[0] and patched_inputs[0] in lowp:
                 cast_out = unique_name(f"{patched_inputs[0]}_to_fp32_for_{node_name}")
@@ -2615,7 +2811,8 @@ def _rewrite_w8a8_fp16_islands(model, seed_lowp_tensors: set[str], target_dtype_
             elif in_dtype == target_dtype_name and patched_inputs[0] and patched_inputs[0] not in lowp:
                 patched_inputs[0] = cast_to_lowp(patched_inputs[0], node_name, 0)
             new_nodes.append(clone_with_inputs(node, patched_inputs) if patched_inputs != list(node.input) else node)
-            if out_dtype == target_dtype_name:
+            # K1-only outputs are INT8/FP32, not activation-boundary lowp.
+            if not quantize_only and out_dtype == target_dtype_name:
                 lowp.update(o for o in node.output if o)
             continue
 

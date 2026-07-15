@@ -29,12 +29,14 @@ ONNX custom-op identity
 -----------------------
   * domain: ``hotstep``
   * op_type: ``ConvRotInt8Linear``
-  * inputs: [x, weight_q, weight_scale, H, (bias)]
-  * outputs: [y]
+  * regular inputs: [x, weight_q, weight_scale, (bias)]
+  * shared-K1 inputs: [x_q, x_scale, weight_q, weight_scale, (bias)]
+  * outputs: [y], or [x_q, x_scale] for a quantize-only node
   * attributes: group_size, in_features, out_features, has_bias,
-    input_dtype, output_dtype, plugin_version, plugin_namespace, preferred_format
+    input_dtype, output_dtype, prequantized, quantize_only,
+    plugin_version, plugin_namespace, preferred_format
 
-The v2 contract defaults to FP16 plugin I/O. Kernel-side tactic and layout
+The v3 contract defaults to FP16 plugin I/O and can expose one shared K1 result for Q/K/V. Kernel-side tactic and layout
 optimizations are intentionally decoupled from ONNX export: the ONNX node emits
 the stable dtype/shape contract once, and TRT selects any current or future
 plugin tactic during engine build.
@@ -51,6 +53,7 @@ from .convrot_int8_plugin import (
     CONVROT_INT8_LINEAR_PLUGIN_VERSION,
     conv_rot_int8_linear_reference,
     make_convrot_int8_linear_onnx_node,
+    make_convrot_quantize_onnx_node,
     register_plugins,
     is_registered,
 )
@@ -61,6 +64,7 @@ __all__ = [
     "CONVROT_INT8_LINEAR_PLUGIN_VERSION",
     "conv_rot_int8_linear_reference",
     "make_convrot_int8_linear_onnx_node",
+    "make_convrot_quantize_onnx_node",
     "register_plugins",
     "is_registered",
 ]

@@ -15,7 +15,7 @@ This module keeps the Python-side glue in one place:
 
 Plugin contract
 ---------------
-The exported ONNX custom op has three mandatory inputs and one optional input:
+The regular exported ONNX custom op has three mandatory inputs and one optional input:
 
 ::
 
@@ -25,6 +25,10 @@ The exported ONNX custom op has three mandatory inputs and one optional input:
         weight_scale : FP32[out_features]
         bias         : FP32[out_features] (optional)
     ) -> FP16/FP32[..., out_features]
+
+Version 3 also supports a K1-only node returning ``(X_q, X_scale)`` and a
+prequantized K2-only form consuming those tensors. Self-attention Q/K/V use
+one K1-only node and three K2-only nodes.
 
 The ConvRot Hadamard matrix is *not* an ONNX input. It is only used in Python
 reference code and in the offline weight-rotation/export flow. Runtime rotation
@@ -53,7 +57,7 @@ import numpy as np
 # op and by build-trt-engine.py when verifying the plugin is registered.
 CONVROT_INT8_LINEAR_OP_NAMESPACE = "hotstep"
 CONVROT_INT8_LINEAR_OP_NAME = "ConvRotInt8Linear"
-CONVROT_INT8_LINEAR_PLUGIN_VERSION = "2"
+CONVROT_INT8_LINEAR_PLUGIN_VERSION = "3"
 
 # Module-level flag set by register_plugins(). Used by is_registered() to
 # avoid re-registering on every call (TRT logs a warning otherwise).
@@ -428,6 +432,8 @@ def make_convrot_int8_linear_onnx_node(
     input_dtype: str = "FP16",
     output_dtype: str = "FP16",
     preferred_format: str = "HWC8",
+    prequantized: bool = False,
+    activation_scale_name: str = "",
 ):
     """Build an ONNX custom-op node that maps to the ConvRotInt8Linear plugin.
 
@@ -436,7 +442,7 @@ def make_convrot_int8_linear_onnx_node(
     are carried as ONNX attributes so the TRT plugin creator can read them
     at parse time via the PluginFieldCollection. TensorRT's fallback plugin
     importer does not use the ONNX domain opset as the plugin version, so the
-    v2 creator version/namespace are also emitted explicitly as
+    v3 creator version/namespace are also emitted explicitly as
     ``plugin_version`` and ``plugin_namespace`` attributes.
 
     Args:
@@ -454,7 +460,12 @@ def make_convrot_int8_linear_onnx_node(
     Returns:
         An ``onnx.NodeProto`` for the custom op.
     """
-    inputs = [x_name, weight_q_name, weight_scale_name]
+    if prequantized:
+        if not activation_scale_name:
+            raise ValueError("prequantized ConvRotInt8Linear requires activation_scale_name")
+        inputs = [x_name, activation_scale_name, weight_q_name, weight_scale_name]
+    else:
+        inputs = [x_name, weight_q_name, weight_scale_name]
     if has_bias:
         inputs.append(bias_name)
 
@@ -472,16 +483,70 @@ def make_convrot_int8_linear_onnx_node(
         "output_dtype_id": _dtype_attr_id(tensor_proto_module, output_dtype),
         # TensorRT ONNX parser fallback-plugin lookup keys. Without these it
         # defaults to plugin version "1" and empty namespace, which cannot find
-        # the v2 creator registered as (ConvRotInt8Linear, "2", "hotstep").
+        # the v3 creator registered as (ConvRotInt8Linear, "3", "hotstep").
         "plugin_version": CONVROT_INT8_LINEAR_PLUGIN_VERSION,
         "plugin_namespace": CONVROT_INT8_LINEAR_OP_NAMESPACE,
         "preferred_format": str(preferred_format).upper(),
+        "prequantized": int(bool(prequantized)),
+        "quantize_only": 0,
     }
 
     return helper_module.make_node(
         CONVROT_INT8_LINEAR_OP_NAME,
         inputs,
         [output_name],
+        name=node_name,
+        domain=CONVROT_INT8_LINEAR_OP_NAMESPACE,
+        **attrs,
+    )
+
+
+def make_convrot_quantize_onnx_node(
+    helper_module,
+    tensor_proto_module,
+    x_name: str,
+    xq_name: str,
+    xscale_name: str,
+    node_name: str,
+    group_size: int,
+    in_features: int,
+    input_dtype: str = "FP16",
+):
+    """Emit the K1-only form used by shared self-attention Q/K/V.
+
+    ``X_q`` is INT8 with the same shape as X. ``X_scale`` is FP32 with
+    shape ``[K/group_size, *X.shape[:-1]]`` and physical layout
+    ``[groups, flattened_rows]``. Existing K1 cubins are used unchanged.
+    """
+    normalized_dtype = str(input_dtype).upper()
+    if normalized_dtype not in {
+        "FP16", "FLOAT16", "HALF", "FP32", "FLOAT", "FLOAT32"
+    }:
+        raise ValueError("ConvRot quantizer supports FP32/FP16 input only")
+
+    # Keep the serialized boundary pair homogeneous so the current cubin
+    # inventory selects the existing FP16IO or FP32IO K1 descriptor. Actual
+    # output types are declared explicitly by the plugin as INT8 and FP32.
+    boundary_dtype_id = _dtype_attr_id(tensor_proto_module, input_dtype)
+    attrs = {
+        "group_size": int(group_size),
+        "in_features": int(in_features),
+        "out_features": int(in_features),
+        "has_bias": 0,
+        "input_dtype": normalized_dtype,
+        "output_dtype": normalized_dtype,
+        "input_dtype_id": boundary_dtype_id,
+        "output_dtype_id": boundary_dtype_id,
+        "plugin_version": CONVROT_INT8_LINEAR_PLUGIN_VERSION,
+        "plugin_namespace": CONVROT_INT8_LINEAR_OP_NAMESPACE,
+        "preferred_format": "HWC8",
+        "prequantized": 0,
+        "quantize_only": 1,
+    }
+    return helper_module.make_node(
+        CONVROT_INT8_LINEAR_OP_NAME,
+        [x_name],
+        [xq_name, xscale_name],
         name=node_name,
         domain=CONVROT_INT8_LINEAR_OP_NAMESPACE,
         **attrs,
