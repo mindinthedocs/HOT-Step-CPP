@@ -7,7 +7,7 @@
  *   2. Reuse that INT8 workspace across all output-channel tiles.
  *
  * A previous specialized M==1 fused kernel was removed after profiling showed
- * the two-kernel BK64/BM128/BN128 path is faster for the M==1 workload too.
+ * the autotuned two-kernel path is faster for the M==1 workload too.
  *
  * The Hadamard/ConvRot transform itself is still implemented as in-register
  * H_4 Kronecker butterflies. No dense H matrix is staged in shared memory and

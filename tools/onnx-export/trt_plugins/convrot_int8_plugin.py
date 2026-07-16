@@ -524,9 +524,8 @@ def make_convrot_quantize_onnx_node(
     }:
         raise ValueError("ConvRot quantizer supports FP32/FP16 input only")
 
-    # Keep the serialized boundary pair homogeneous so the current cubin
-    # inventory selects the existing FP16IO or FP32IO K1 descriptor. Actual
-    # output types are declared explicitly by the plugin as INT8 and FP32.
+    # Keep the serialized boundary pair homogeneous.  Production extraction
+    # now embeds only FP16IO; actual outputs remain explicitly INT8 and FP32.
     boundary_dtype_id = _dtype_attr_id(tensor_proto_module, input_dtype)
     attrs = {
         "group_size": int(group_size),

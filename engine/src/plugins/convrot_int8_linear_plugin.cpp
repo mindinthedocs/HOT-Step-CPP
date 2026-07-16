@@ -10,8 +10,8 @@
  *       2. kernel2_gemm_dequant   — reuse that workspace across all N tiles
  *
  *   A previous dedicated fused M==1 Triton kernel was removed after profiling
- *   showed the two-kernel BK64/BM128/BN128 path is faster on the real M==1
- *   workload too. Keeping one execution family also shrinks the cubin header
+ *   showed the autotuned two-kernel path is faster on the real M==1 workload
+ *   too. Keeping one execution family also shrinks the cubin header
  *   and removes M-dependent runtime dispatch state.
  *
  * Rotation design (butterfly, not dense H-matrix matmul):
@@ -44,7 +44,7 @@
 
 #if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
 // ── Cubin header version guard ─────────────────────────────────────────────
-// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 10.
+// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 12.
 // Version 3 added per-cubin tile dimensions; version 4 additionally reflects
 // the intentionally smaller cubin inventory: G256 only (plus optional G0 sentinel), and no specialized M1
 // cubins. Referencing removed G0/G256/M1 symbols here would make the plugin
@@ -75,10 +75,14 @@
 //            the plugin rejects any loaded function with nonzero local memory.
 // Version 10: K2 supports descriptor-selected 1-D or 2-D persistent grids;
 //             arithmetic remains bitwise-checked against the v9 K2 baseline.
+// Version 11: K2 uses an explicit-layout Gluon mma_v2/cp.async pipeline and
+//             the generated inventory is FP16IO-only (FP32IO retired).
+// Version 12: K2 masks the partial final M tile.  enqueue() uses one persistent
+//             launch and no padded tail launch/copy workspace.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 10
-#  error "Cubin header version >= 10 required (strict K1/K2 exactness and K2 scheduler metadata). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 12
+#  error "Cubin header version >= 12 required (masked-M single-launch Gluon K2). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -193,11 +197,10 @@ inline CUresult launchConvRotGemm(ConvRotCubinDesc const&, CUfunction, CUstream,
 // the arch/dtype mismatch warning rather than failing).
 namespace {
 
-// K2 is intentionally plain/unmasked.  Workspace sizing therefore reserves
-// enough activation padding for any generated K2 BLOCK_M currently emitted by
-// extract_jit_cubins_autotune.py.  Runtime enqueue rejects a future cubin with
-// a larger tile instead of risking workspace overflow.
-constexpr int32_t kMaxK2WorkspacePadBlockM = 256;
+// Keep generated BLOCK_M within the reviewed Gluon layout family.  Version 12
+// masks the final M tile, so this is a descriptor sanity bound rather than a
+// workspace-padding requirement.
+constexpr int32_t kMaxK2SupportedBlockM = 256;
 
 int32_t queryDeviceComputeCapability() {
     static int32_t cached = -1;
@@ -568,9 +571,9 @@ unsigned int getDeviceMaxDynamicSharedMem() {
 //     causes access violations). The CUDA driver reclaims all GPU memory
 //     when the process exits.
 //
-// With this cache, the first DiT step loads only the unique two-kernel cubins
-// needed by the engine (for example, K1_G256_FP32IO plus the G256 FP32IO K2
-// BIAS/NOBIAS variants when both bias modes occur).
+// With this cache, the first DiT step loads only the unique FP16IO cubins
+// needed by the engine: K1_G256_FP16IO plus the G256 FP16IO K2 BIAS/NOBIAS
+// variants when both bias modes occur.
 // Subsequent steps hit the cache — zero cuModuleLoadData calls, zero
 // cuModuleGetFunction calls, zero cuFuncSetAttribute calls. initTriton()
 // becomes a single mutex + hash lookup (~200 ns).
@@ -624,11 +627,6 @@ size_t alignUp(size_t value, size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
 
-int32_t roundUpInt32(int32_t value, int32_t multiple) {
-    if (value <= 0 || multiple <= 0) return value;
-    return ((value + multiple - 1) / multiple) * multiple;
-}
-
 char* alignPtr(char* ptr, size_t alignment) {
     uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
     raw = (raw + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
@@ -672,11 +670,6 @@ nvinfer1::DataType trtTypeFromDtypeId(int32_t dtypeId) {
     return nvinfer1::DataType::kFLOAT;
 }
 
-size_t dtypeSizeBytesFromId(int32_t dtypeId) {
-    if (dtypeId == 10 || dtypeId == 16) return 2;
-    return 4;
-}
-
 int32_t kernelDtypeFromTrt(nvinfer1::DataType dtype) {
     if (dtype == nvinfer1::DataType::kHALF) return 1;
     if (dtype == nvinfer1::DataType::kBF16) return 2;
@@ -690,10 +683,10 @@ char const* dtypeNameFromId(int32_t dtypeId) {
 }
 
 bool isSupportedPluginBoundaryDtypePair(int32_t input_dtype_id, int32_t output_dtype_id) {
-    // Both FP32IO (ONNX dtype id 1) and FP16IO (ONNX dtype id 10) are supported
-    // when generated cubins are present for both (via extract_jit_cubins_autotune.py).
-    return (input_dtype_id == 1 && output_dtype_id == 1) ||
-           (input_dtype_id == 10 && output_dtype_id == 10);
+    // Version 11 intentionally ships only the production FP16IO pair.  FP32IO
+    // was a legacy export path; accepting it here would defer failure until a
+    // descriptor lookup for a cubin that is deliberately no longer embedded.
+    return input_dtype_id == 10 && output_dtype_id == 10;
 }
 
 bool readPluginString(nvinfer1::PluginField const& f, char* dst, size_t dstSize) {
@@ -933,8 +926,9 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
     (void)outputs;
     (void)nbOutputs;
 
-    // K1 writes directly to its two public outputs in quantize-only mode.
-    if (m_quantize_only) return 0;
+    // K1 writes directly to public outputs in quantize-only mode, and masked-M
+    // K2 consumes public prequantized tensors without a private tail copy.
+    if (m_quantize_only || m_prequantized) return 0;
 
     // TensorRT's V3 build-time contract provides concrete profile bounds in
     // min/opt/max, while desc.dims may still contain wildcards. Workspace must
@@ -949,29 +943,16 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
     if (K <= 0) K = m_in_features;
     if (K <= 0) return 0;
 
-    int64_t const maxMPadded64 =
-        ((maxM + kMaxK2WorkspacePadBlockM - 1) / kMaxK2WorkspacePadBlockM) *
-        static_cast<int64_t>(kMaxK2WorkspacePadBlockM);
-    if (maxMPadded64 <= 0 || maxMPadded64 > std::numeric_limits<int32_t>::max()) return 0;
-    int32_t const maxMPadded = static_cast<int32_t>(maxMPadded64);
-
+    if (maxM > std::numeric_limits<int32_t>::max()) return 0;
     int32_t const scale_groups = activationScaleGroups(K, m_group_size);
-    // A prequantized K2 reads its full aligned prefix from public tensors and
-    // needs private X_q/X_scale storage only for one padded tail tile.
-    size_t const quant_rows = m_prequantized ? kMaxK2WorkspacePadBlockM : maxMPadded;
-    size_t x_q_size = alignUp(static_cast<size_t>(quant_rows) * static_cast<size_t>(K), 16);
-    // X_scale is FP32 with transposed [n_groups, rows] layout.
-    size_t x_scale_size = alignUp(
-        static_cast<size_t>(quant_rows) * static_cast<size_t>(scale_groups) * sizeof(float),
+    size_t const x_q_size = alignUp(
+        static_cast<size_t>(maxM) * static_cast<size_t>(K), 16);
+    // X_scale is FP32 with transposed [n_groups, rows] layout.  No BLOCK_M
+    // padding or output-tail buffer is needed by the masked Gluon K2.
+    size_t const x_scale_size = alignUp(
+        static_cast<size_t>(maxM) * static_cast<size_t>(scale_groups) * sizeof(float),
         16);
-    // K2 writes the unaligned final M tile into this small padded tail buffer,
-    // then enqueue() copies only the real tail rows to TensorRT's output.  The
-    // main aligned prefix (if any) is written directly to the output tensor.
-    size_t y_tail_size = alignUp(
-        static_cast<size_t>(kMaxK2WorkspacePadBlockM) * static_cast<size_t>(m_out_features) *
-            dtypeSizeBytesFromId(m_output_dtype_id),
-        16);
-    return x_q_size + x_scale_size + y_tail_size;
+    return x_q_size + x_scale_size;
 }
 
 // ── Custom Tactics (IPluginV3OneBuild) ──────────────────────────────────────
@@ -1176,7 +1157,8 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         void* y_ptr = outputs[0];
 
         if ((!m_prequantized && (!m_kernelFunc_quant || !m_desc_quant)) ||
-            !m_kernelFunc_gemm || !m_desc_gemm || workspace == nullptr) {
+            !m_kernelFunc_gemm || !m_desc_gemm ||
+            (!m_prequantized && workspace == nullptr)) {
 #ifdef HOTSTEP_DIAGNOSTICS
             hotstep::diag::log(
                 "[ConvRotInt8Linear] enqueue REJECT: prequantized=%d, quant=%p, "
@@ -1195,60 +1177,34 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
 
         int32_t const gemm_block_m = gemm_desc->block_m > 0 ? gemm_desc->block_m : 1;
         int32_t const gemm_block_n = gemm_desc->block_n > 0 ? gemm_desc->block_n : 1;
-        if (gemm_block_m > kMaxK2WorkspacePadBlockM || (N % gemm_block_n) != 0) {
+        if (gemm_block_m > kMaxK2SupportedBlockM || (N % gemm_block_n) != 0) {
 #ifdef HOTSTEP_DIAGNOSTICS
             hotstep::diag::log(
-                "[ConvRotInt8Linear] enqueue REJECT: plain K2 requires BLOCK_M<=%d "
+                "[ConvRotInt8Linear] enqueue REJECT: masked K2 requires BLOCK_M<=%d "
                 "and N divisible by BLOCK_N (M=%d, N=%d, BLOCK_M=%d, BLOCK_N=%d).\n",
-                kMaxK2WorkspacePadBlockM, M, N, gemm_block_m, gemm_block_n);
+                kMaxK2SupportedBlockM, M, N, gemm_block_m, gemm_block_n);
             hotstep::diag::flush();
 #endif
             return -1;
         }
 
-        int32_t const M_padded = roundUpInt32(M, gemm_block_m);
-        int32_t const tail_rows = M_padded - M;
-        int32_t const scale_groups = activationScaleGroups(K, m_group_size);
-        int32_t const quant_workspace_rows = m_prequantized
-            ? kMaxK2WorkspacePadBlockM : M_padded;
-
         size_t const x_q_size = alignUp(
-            static_cast<size_t>(quant_workspace_rows) * static_cast<size_t>(K), 16);
-        size_t const x_scale_size = alignUp(
-            static_cast<size_t>(quant_workspace_rows) *
-                static_cast<size_t>(scale_groups) * sizeof(float),
-            16);
-        void* workspace_xq = workspace;
-        void* workspace_xs = static_cast<char*>(workspace) + x_q_size;
+            static_cast<size_t>(M) * static_cast<size_t>(K), 16);
+        void* workspace_xq = m_prequantized ? nullptr : workspace;
+        void* workspace_xs = m_prequantized
+            ? nullptr
+            : static_cast<char*>(workspace) + x_q_size;
         void* xq_ptr = m_prequantized ? public_xq : workspace_xq;
         void* xs_ptr = m_prequantized ? public_xs : workspace_xs;
-        void* y_tail_ptr = static_cast<char*>(workspace_xs) + x_scale_size;
 
         int32_t const stride_xqm = K;
         int32_t const stride_xqk = 1;
         int32_t const stride_xsm = 1;
-        // Public shared scales are tightly packed [groups, M]. Private normal
-        // mode scales use [groups, M_padded] for the unmasked K2 tail.
-        int32_t const stride_xsg = m_prequantized ? M : M_padded;
+        int32_t const stride_xsg = M;  // tightly packed [groups, M]
         int32_t const stride_wn = K;
         int32_t const stride_wk = 1;
         int32_t const stride_ym = N;
         int32_t const stride_yn = 1;
-
-        if (!m_prequantized && tail_rows > 0) {
-            cudaError_t zq = cudaMemsetAsync(
-                static_cast<char*>(xq_ptr) + static_cast<size_t>(M) * K,
-                0, static_cast<size_t>(tail_rows) * K, stream);
-            if (zq != cudaSuccess) return -1;
-            cudaError_t zs = cudaMemset2DAsync(
-                static_cast<char*>(xs_ptr) + static_cast<size_t>(M) * sizeof(float),
-                static_cast<size_t>(M_padded) * sizeof(float),
-                0,
-                static_cast<size_t>(tail_rows) * sizeof(float),
-                static_cast<size_t>(scale_groups),
-                stream);
-            if (zs != cudaSuccess) return -1;
-        }
 
         if (!m_prequantized) {
             CUresult const status = hotstep::convrot_int8_generated::launchConvRotQuant(
@@ -1298,73 +1254,12 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
                 m_max_ctas_per_sm_gemm);
         };
 
-        int32_t const M_aligned = M - (M % gemm_block_m);
-        if (M_aligned > 0) {
-            CUresult const status = launch_gemm(xq_ptr, xs_ptr, y_ptr, M_aligned, stride_xsg);
-            if (status != CUDA_SUCCESS) return -1;
-        }
-        if (M_aligned < M) {
-            int32_t const real_tail_rows = M - M_aligned;
-            void* xq_tail = static_cast<char*>(xq_ptr) +
-                static_cast<size_t>(M_aligned) * K;
-            void* xs_tail = static_cast<char*>(xs_ptr) +
-                static_cast<size_t>(M_aligned) * sizeof(float);
-            int32_t tail_scale_stride = stride_xsg;
-
-            // Shared public tensors are not padded. Copy only the final partial
-            // tile into workspace and zero its inactive rows before K2.
-            if (m_prequantized) {
-                size_t const real_xq_bytes = static_cast<size_t>(real_tail_rows) * K;
-                size_t const padded_xq_bytes = static_cast<size_t>(gemm_block_m) * K;
-                cudaError_t copy_status = cudaMemcpyAsync(
-                    workspace_xq, xq_tail, real_xq_bytes,
-                    cudaMemcpyDeviceToDevice, stream);
-                if (copy_status != cudaSuccess) return -1;
-                if (padded_xq_bytes > real_xq_bytes) {
-                    copy_status = cudaMemsetAsync(
-                        static_cast<char*>(workspace_xq) + real_xq_bytes,
-                        0, padded_xq_bytes - real_xq_bytes, stream);
-                    if (copy_status != cudaSuccess) return -1;
-                }
-                copy_status = cudaMemcpy2DAsync(
-                    workspace_xs, static_cast<size_t>(gemm_block_m) * sizeof(float),
-                    xs_tail, static_cast<size_t>(M) * sizeof(float),
-                    static_cast<size_t>(real_tail_rows) * sizeof(float),
-                    static_cast<size_t>(scale_groups),
-                    cudaMemcpyDeviceToDevice, stream);
-                if (copy_status != cudaSuccess) return -1;
-                if (gemm_block_m > real_tail_rows) {
-                    copy_status = cudaMemset2DAsync(
-                        static_cast<char*>(workspace_xs) +
-                            static_cast<size_t>(real_tail_rows) * sizeof(float),
-                        static_cast<size_t>(gemm_block_m) * sizeof(float),
-                        0,
-                        static_cast<size_t>(gemm_block_m - real_tail_rows) * sizeof(float),
-                        static_cast<size_t>(scale_groups),
-                        stream);
-                    if (copy_status != cudaSuccess) return -1;
-                }
-                xq_tail = workspace_xq;
-                xs_tail = workspace_xs;
-                tail_scale_stride = gemm_block_m;
-            }
-
-            CUresult const status = launch_gemm(
-                xq_tail, xs_tail, y_tail_ptr, gemm_block_m, tail_scale_stride);
-            if (status != CUDA_SUCCESS) return -1;
-
-            size_t const output_elem_size = dtypeSizeBytesFromId(m_output_dtype_id);
-            size_t const tail_bytes = static_cast<size_t>(real_tail_rows) *
-                static_cast<size_t>(N) * output_elem_size;
-            cudaError_t copy_status = cudaMemcpyAsync(
-                static_cast<char*>(y_ptr) +
-                    static_cast<size_t>(M_aligned) * N * output_elem_size,
-                y_tail_ptr,
-                tail_bytes,
-                cudaMemcpyDeviceToDevice,
-                stream);
-            if (copy_status != cudaSuccess) return -1;
-        }
+        // Version 12 handles the partial final M tile with predicated A loads,
+        // scale loads, and output stores.  One persistent launch replaces the
+        // old aligned-prefix + padded-tail + D2D-copy sequence.
+        CUresult const gemm_status = launch_gemm(
+            xq_ptr, xs_ptr, y_ptr, M, stride_xsg);
+        if (gemm_status != CUDA_SUCCESS) return -1;
         return 0;
     } catch (...) {
         return -1;
@@ -1590,8 +1485,8 @@ bool loadOrReuseKernel(GeneratedCubinDesc const* cubin,
 bool ConvRotInt8LinearPlugin::initTriton() {
     if (!isSupportedPluginBoundaryDtypePair(m_input_dtype_id, m_output_dtype_id)) {
         hotstep::diag::log(
-            "[ConvRotInt8Linear] No compiled Triton cubin for input_dtype=%s, output_dtype=%s. "
-            "Only exact FP16->FP16 and FP32->FP32 plugin boundary dtypes are supported.\n",
+            "[ConvRotInt8Linear] No compiled cubin for input_dtype=%s, output_dtype=%s. "
+            "Version 11 supports only the production FP16->FP16 boundary.\n",
             dtypeNameFromId(m_input_dtype_id), dtypeNameFromId(m_output_dtype_id));
         return false;
     }
@@ -1833,13 +1728,12 @@ HOTSTEP_PLUGIN_EXPORT int hotstep_register_plugins() {
 #  error "Cubin header is missing CONVROT_INT8_HAS_DTYPE_FP16IO. Re-run tools/onnx-export/extract_jit_cubins_autotune.py."
 #endif
 #if defined(CONVROT_INT8_HAS_DTYPE_FP32IO)
-        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = 1 (FP32-in/FP32-out cubins present)\n");
+        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = ignored legacy inventory\n");
 #else
-        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = UNDEFINED (no FP32-in/FP32-out cubins)\n");
-#  error "Cubin header is missing CONVROT_INT8_HAS_DTYPE_FP32IO. Re-run tools/onnx-export/extract_jit_cubins_autotune.py."
+        hotstep::diag::log("  CONVROT_INT8_HAS_DTYPE_FP32IO = intentionally absent (legacy)\n");
 #endif
-        hotstep::diag::log("If FP16IO or FP32IO is UNDEFINED, you forgot to re-run "
-                         "tools/onnx-export/extract_jit_cubins_autotune.py after updating DTYPE_CONFIGS.\n");
+        hotstep::diag::log("If FP16IO is UNDEFINED, re-run "
+                         "tools/onnx-export/extract_jit_cubins_autotune.py.\n");
         hotstep::diag::log("Log file path: %s (override with HOTSTEP_PLUGIN_LOG env var)\n",
                          hotstep::diag::logPath().c_str());
 

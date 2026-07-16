@@ -5,11 +5,12 @@
  *
  *   1. kernel1_convrot_quant — in-register H_4 butterfly rotation plus
  *      per-K-group dynamic INT8 activation quantization into workspace.
- *   2. kernel2_gemm_dequant  — INT8 GEMM over that workspace with per-group
- *      activation dequantization, per-channel weight scales, and optional bias.
+ *   2. kernel2_gemm_dequant  — explicit-layout Gluon mma_v2 INT8 GEMM with a
+ *      persistent cp.async pipeline, per-group activation dequantization,
+ *      per-channel weight scales, and optional bias.
  *
- * The same two-kernel BK64/BM128/BN128 path is used for every runtime M,
- * including M == 1. The previous specialized M1 Triton entry point and the
+ * The same two-kernel, autotune-selected Gluon path is used for every runtime
+ * M, including M == 1. The previous specialized M1 Triton entry point and the
  * legacy group_size=0 / group_size=256 cubin variants were intentionally
  * removed after profiling and engine-inspector review.
  *

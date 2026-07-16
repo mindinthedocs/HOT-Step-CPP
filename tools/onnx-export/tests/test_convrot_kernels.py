@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-"""Unit tests for the K1 rotation+quant kernel and the hybrid_direct K2 GEMM.
+"""Unit tests for K1 and the retained Triton K2 numerical oracle.
 
-These tests use Triton's interpreter mode (``TRITON_INTERPRET=1``) so they
-run on a CPU-only CI machine without a CUDA device.  They validate:
+The shipping K2 is Gluon and is compiled/bitwise-gated on the target GPU. These
+CPU tests use Triton's interpreter mode (``TRITON_INTERPRET=1``) to validate the
+oracle, host padding, and FP16IO arithmetic without a CUDA device.  They validate:
 
   * The K1 direct H4 Kronecker butterfly rotation matches a NumPy reference
     built from the dense H256r matrix.
   * The K1 store mask is honoured for M not divisible by BLOCK_M (canary
     bytes placed immediately after the workspace buffers remain intact).
-  * The plain/unmasked K2 hybrid_direct GEMM+dequant kernel matches a
-    NumPy reference for the canonical [N, K] W_q layout (the kernel folds
-    the transpose in via ``tl.trans(wq)``).
-  * Host-side M padding for plain K2 is emulated by zero-padding X_q /
-    X_scale, writing a padded output tile, and slicing back the real rows
-    (this mirrors the C++ plugin's enqueue-time tail handling).
+  * The plain/unmasked Triton K2 oracle matches a NumPy reference for the
+    canonical [N, K] W_q layout used by the Gluon shipping kernel.
+  * The legacy oracle's padded-M comparison path remains correct, while host
+    tests assert that shipping K2 uses one launch at real M.
   * The end-to-end K1 -> K2 pipeline matches the FP32 reference
     ``y = x @ W^T + bias`` within INT8 quant tolerance.
 
-These tests are the canonical correctness gate for the optimisations
-described in the version 7 patch.  They do NOT exercise the autotune search
-(which requires a real GPU) -- only the math.
+These tests complement the version 12 extraction-time GPU gate.  They do not
+exercise Gluon execution or the autotune search, which require a real GPU.
 
 Run with:
     TRITON_INTERPRET=1 python -m pytest tools/onnx-export/tests/test_convrot_kernels.py
@@ -34,6 +32,7 @@ os.environ.setdefault("TRITON_INTERPRET", "1")
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -72,14 +71,14 @@ def _set_k1_config(BLOCK_M):
     ]
 
 
-def _set_k2_config(BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, SCHEDULE_2D=False):
-    m.kernel2_gemm_dequant.configs = [
-        m.triton.Config(
-            {"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K,
-             "GROUP_M": GROUP_M, "SCHEDULE_2D": SCHEDULE_2D},
-            num_warps=4, num_stages=1,
-        )
-    ]
+def _k2_reference_meta(BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M,
+                       SCHEDULE_2D=False):
+    """Compile-time knobs for the interpreter-only v10 numerical oracle."""
+    return {
+        "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K,
+        "GROUP_M": GROUP_M, "SCHEDULE_2D": SCHEDULE_2D,
+        "DYNAMIC_INNER": False,
+    }
 
 
 # ─── Tests ────────────────────────────────────────────────────────────────
@@ -224,9 +223,9 @@ class TestK1UnalignedM(unittest.TestCase):
 
 
 class TestK2GemmDequant(unittest.TestCase):
-    """The hybrid_direct K2 kernel matches a NumPy reference for the canonical
-    [N, K] W_q layout.  BIAS and NOBIAS are separate compile-time variants;
-    their equivalent zero-bias math is validated below.
+    """The K2 oracle matches NumPy for canonical [N, K] weights.
+
+    BIAS and NOBIAS are separate compile-time variants, as in shipping Gluon.
     """
 
     def setUp(self):
@@ -254,21 +253,24 @@ class TestK2GemmDequant(unittest.TestCase):
                    schedule_2d=False):
         M, K = xq.shape
         N = wq_N_K.shape[0]
-        y = torch.empty((M, N), dtype=torch.float32, device=xq.device)
-        _set_k2_config(BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4,
-                       SCHEDULE_2D=schedule_2d)
+        y = torch.empty((M, N), dtype=torch.float16, device=xq.device)
+        meta = _k2_reference_meta(
+            BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4,
+            SCHEDULE_2D=schedule_2d)
 
-        # HAS_BIAS is compile-time True in the shipped cubin.  For no-bias
-        # layers the plugin passes a zero-filled bias vector.
-        bias_arg = bias if has_bias else torch.zeros((N,), dtype=torch.float32, device=xq.device)
+        # CPU interpreter tests exercise the retained Triton numerical oracle;
+        # the shipping Gluon kernel is bitwise-gated against it on the GPU.
+        bias_arg = bias if has_bias else torch.empty(
+            (1,), dtype=torch.float32, device=xq.device)
         # W_q is [N, K] row-major: stride_wn=K, stride_wk=1.
-        m.kernel2_gemm_dequant[(1,)](
+        m.kernel2_gemm_dequant_reference[(1,)](
             xq, xs, wq_N_K, ws, bias_arg, y,
             M, N, K,
             K, 1, 1, M,
             K, 1,
             N, 1,
-            GROUP_SIZE=256, HAS_BIAS=has_bias, OUTPUT_FP16=False,
+            GROUP_SIZE=256, HAS_BIAS=has_bias, OUTPUT_FP16=True,
+            **meta,
         )
         return y
 
@@ -288,14 +290,18 @@ class TestK2GemmDequant(unittest.TestCase):
     def test_zero_bias_matches_nobias_math(self):
         xq, xs, wq, ws, bias = self._build_inputs()
         y = self._triton_k2(xq, xs, wq, ws, bias, has_bias=False)
-        y_ref = self._reference(xq.numpy(), xs.numpy(), wq.numpy(), ws.numpy(), bias.numpy(), False)
+        y_ref = self._reference(
+            xq.numpy(), xs.numpy(), wq.numpy(), ws.numpy(), bias.numpy(), False
+        ).astype(np.float16)
         max_diff = float(np.max(np.abs(y.numpy() - y_ref)))
         self.assertLess(max_diff, 1e-3, f"zero-bias/nobias: max_diff={max_diff:.4e}")
 
     def test_with_bias(self):
         xq, xs, wq, ws, bias = self._build_inputs()
         y = self._triton_k2(xq, xs, wq, ws, bias, has_bias=True)
-        y_ref = self._reference(xq.numpy(), xs.numpy(), wq.numpy(), ws.numpy(), bias.numpy(), True)
+        y_ref = self._reference(
+            xq.numpy(), xs.numpy(), wq.numpy(), ws.numpy(), bias.numpy(), True
+        ).astype(np.float16)
         max_diff = float(np.max(np.abs(y.numpy() - y_ref)))
         self.assertLess(max_diff, 1e-3, f"with-bias: max_diff={max_diff:.4e}")
 
@@ -309,11 +315,10 @@ class TestK2GemmDequant(unittest.TestCase):
                                     y_2d.view(torch.int32)))
 
 
-class TestK2HostPadding(unittest.TestCase):
-    """The production plugin pads/splits M so the plain K2 kernel never needs
-    masks.  This test emulates the tail path used by enqueue(): actual rows are
-    followed by zero X_q/X_scale rows, K2 writes a padded tile, and only the
-    real rows are consumed.
+class TestK2OraclePadding(unittest.TestCase):
+    """The immutable v10 oracle still uses padding for bitwise comparison.
+
+    Shipping Gluon K2 masks the final tile and is compile-checked separately.
     """
 
     def test_unaligned_m_tail_tile(self):
@@ -337,17 +342,19 @@ class TestK2HostPadding(unittest.TestCase):
         wq = torch.from_numpy(wq_np.copy())
         ws = torch.from_numpy(ws_np.copy())
         bias = torch.from_numpy(bias_np.copy())
-        y_pad = torch.empty((M_PAD, N), dtype=torch.float32, device=xq.device)
+        y_pad = torch.empty((M_PAD, N), dtype=torch.float16, device=xq.device)
 
-        _set_k2_config(BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4)
+        meta = _k2_reference_meta(
+            BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4)
         # W_q is [N, K] row-major.
-        m.kernel2_gemm_dequant[(1,)](
+        m.kernel2_gemm_dequant_reference[(1,)](
             xq, xs, wq, ws, bias, y_pad,
             M_PAD, N, K,
             K, 1, 1, M_PAD,
             K, 1,
             N, 1,
-            GROUP_SIZE=group_size, HAS_BIAS=True, OUTPUT_FP16=False,
+            GROUP_SIZE=group_size, HAS_BIAS=True, OUTPUT_FP16=True,
+            **meta,
         )
 
         # Reference only for the real rows.  Padded rows should be finite but
@@ -356,6 +363,7 @@ class TestK2HostPadding(unittest.TestCase):
         partial = xq_np.astype(np.int32) @ wq_np.T.astype(np.int32)
         y_ref += partial.astype(np.float32) * xs_np[0, :, None] * ws_np[None, :]
         y_ref += bias_np[None, :]
+        y_ref = y_ref.astype(np.float16)
         max_diff = float(np.max(np.abs(y_pad[:M, :].numpy() - y_ref)))
         self.assertLess(max_diff, 1e-3, f"padded-tail: max_diff={max_diff:.4e}")
         self.assertTrue(np.all(np.isfinite(y_pad.numpy())))
@@ -439,7 +447,9 @@ class TestK1TargetDispatchAndGrid(unittest.TestCase):
 
     def test_spill_signature_matches_shipping_specialization(self):
         label, signature, constexprs, attrs = next(m._spill_check_variants("k1"))
-        self.assertEqual(label, "FP32IO")
+        self.assertEqual(label, "FP16IO")
+        self.assertTrue(constexprs["INPUT_FP16"])
+        self.assertEqual(m.DTYPE_CONFIGS, [("FP16IO", True, True)])
         self.assertEqual(constexprs["stride_xk"], 1)
         self.assertEqual(constexprs["stride_xqk"], 1)
         self.assertEqual(constexprs["stride_xsm"], 1)
@@ -457,6 +467,49 @@ class TestK1TargetDispatchAndGrid(unittest.TestCase):
                 "maxnreg": 128}
         self.assertEqual(m._autotune_grid_x_for_k1(1000, 20, meta), 80)
         self.assertEqual(m._autotune_grid_x_for_k1(10, 20, meta), 10)
+
+
+class TestGluonK2ConfigSpace(unittest.TestCase):
+    def test_contains_attached_winner_layout_and_fp16_only_inventory(self):
+        cfgs = m._estimate_k2_configs(
+            20, 2 * 1024 * 1024, 100 * 1024,
+            m.AUTOTUNE_SHAPES_K2, arch=86)
+        self.assertEqual(m.DTYPE_CONFIGS, [("FP16IO", True, True)])
+        self.assertTrue(any(
+            c.kwargs == {
+                "BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64,
+                "GROUP_M": 8, "WARPS_M": 1, "NUM_BUFFERS": 2,
+            } and c.num_warps == 4
+            for c in cfgs
+        ))
+        self.assertTrue(all(c.kwargs["NUM_BUFFERS"] == c.num_stages
+                            for c in cfgs))
+        self.assertTrue(all(c.kwargs["BLOCK_M"] <= m.K2_AUTOTUNE_M_ALIGNMENT
+                            for c in cfgs))
+        self.assertTrue(any(c.kwargs["BLOCK_K"] == 128 for c in cfgs))
+
+    def test_shipping_signature_keeps_real_m_and_scale_pitch_generic(self):
+        _, _, _, attrs = next(m._spill_check_variants("k2"))
+        self.assertNotIn((6,), attrs)   # M=3000 is not 16-divisible
+        self.assertNotIn((12,), attrs)  # stride_xsg=M is tightly packed
+
+    def test_shipping_benchmark_is_one_real_m_launch(self):
+        cfg = next(c for c in m._estimate_k2_configs(
+            20, 2 * 1024 * 1024, 100 * 1024,
+            m.AUTOTUNE_SHAPES_K2, arch=86)
+            if c.kwargs["BLOCK_M"] == 128)
+        pack = {
+            "xq": object(), "xs_by_pitch": {3000: object()},
+            "wq": object(), "ws": object(), "bias": object(),
+            "y": object(), "y_tail": object(),
+        }
+        with mock.patch.object(m, "_launch_k2_for_bench", return_value=20) as launch:
+            self.assertEqual(m._launch_k2_production_sequence(
+                cfg, pack, 3000, 4096, 2560, 20, True), 20)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(launch.call_args.args[2:5], (3000, 4096, 2560))
+        self.assertEqual(launch.call_args.kwargs["stride_xsg"], 3000)
+        self.assertFalse(launch.call_args.kwargs["reference"])
 
 
 class TestAutotuneGridForK2(unittest.TestCase):
@@ -527,11 +580,12 @@ class TestEndToEndPipeline(unittest.TestCase):
         bias = (np.random.randn(N) * 0.01).astype(np.float32)
         x_fp32 = (np.random.randn(M, K) * 0.5).astype(np.float32)
 
-        # FP32 reference (no rotation, no quant).
-        y_ref = x_fp32 @ w_fp32.T + bias[None, :]
+        # Shipping boundary is FP16; compare against the same rounded input.
+        x_fp16 = x_fp32.astype(np.float16)
+        y_ref = x_fp16.astype(np.float32) @ w_fp32.T + bias[None, :]
 
-        # Triton pipeline.
-        x_t = torch.from_numpy(x_fp32.copy())
+        # Triton reference pipeline (the GPU gate compares Gluon bitwise).
+        x_t = torch.from_numpy(x_fp16.copy())
         wq_t = torch.from_numpy(w_q_int8.copy())    # [N, K]
         ws_t = torch.from_numpy(w_scale.copy())
         bias_t = torch.from_numpy(bias.copy())
@@ -544,23 +598,26 @@ class TestEndToEndPipeline(unittest.TestCase):
             x_t, xq, xs,
             M, K,
             K, 1, K, 1, 1, M,
-            GROUP_SIZE=group_size, INPUT_FP16=False,
+            GROUP_SIZE=group_size, INPUT_FP16=True,
             CONTIG_XK=True,
         )
 
-        # K2 — hybrid_direct consumes W_q [N, K] via tl.trans(wq).
-        y = torch.empty((M, N), dtype=torch.float32, device=x_t.device)
-        _set_k2_config(BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4)
-        m.kernel2_gemm_dequant[(1,)](
+        # K2 oracle consumes W_q [N, K]; production Gluon is bitwise-gated
+        # against this exact FP16-output arithmetic.
+        y = torch.empty((M, N), dtype=torch.float16, device=x_t.device)
+        meta = _k2_reference_meta(
+            BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, GROUP_M=4)
+        m.kernel2_gemm_dequant_reference[(1,)](
             xq, xs, wq_t, ws_t, bias_t, y,
             M, N, K,
             K, 1, 1, M,
             K, 1,   # W_q [N, K] row-major: wn=K, wk=1
             N, 1,
-            GROUP_SIZE=group_size, HAS_BIAS=True, OUTPUT_FP16=False,
+            GROUP_SIZE=group_size, HAS_BIAS=True, OUTPUT_FP16=True,
+            **meta,
         )
 
-        y_np = y.numpy()
+        y_np = y.to(torch.float32).numpy()
         max_abs_err = float(np.max(np.abs(y_np - y_ref)))
         max_ref = float(np.max(np.abs(y_ref)))
         rel_err = max_abs_err / max_ref

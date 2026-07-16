@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Extract autotune-selected cubins from Triton's JIT cache.
+"""Build and extract autotune-selected ConvRot INT8 cubins.
 
-This version parses Triton's internal cache key to extract the exact
-constexpr kwargs alongside metadata, ensuring we select the precise winning
-cubin even when configs collide on (num_warps, num_stages).
+K1 is selected from Triton's JIT cache.  K2 uses Gluon's explicit-layout
+mma_v2/cp.async path and a fixed-budget, weighted production-workload benchmark.
+Only the production FP16IO specializations are emitted.
 """
 
 from __future__ import annotations
@@ -63,6 +63,50 @@ except ImportError as exc:
 _IS_TRITON_INTERPRETER = triton.language.constexpr(
     os.environ.get("TRITON_INTERPRET", "").strip() == "1"
 )
+
+# K2 uses Gluon rather than Triton's automatic layout/pipeline selection.  Keep
+# this import optional so the CPU interpreter tests can still exercise the
+# Triton reference kernel on installations without the experimental dialect;
+# production extraction calls _require_gluon_for_k2() and has no fallback.
+try:
+    from triton.experimental import gluon
+    from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon._runtime import GluonASTSource
+    from triton.experimental.gluon.language.nvidia.ampere import (
+        async_copy as _gluon_async_copy,
+        mma_v2 as _gluon_mma_v2,
+    )
+    GLUON_AVAILABLE = True
+    _GLUON_IMPORT_ERROR = None
+except Exception as _gluon_import_error:  # pragma: no cover - wheel dependent
+    gluon = None
+    gl = None
+    GluonASTSource = None
+    _gluon_async_copy = None
+    _gluon_mma_v2 = None
+    GLUON_AVAILABLE = False
+    _GLUON_IMPORT_ERROR = _gluon_import_error
+
+
+def _is_gluon_kernel(fn) -> bool:
+    """Return whether *fn* is a Gluon JIT function."""
+    marker = getattr(fn, "is_gluon", None)
+    if callable(marker):
+        try:
+            return bool(marker())
+        except Exception:
+            pass
+    return "triton.experimental.gluon" in (type(fn).__module__ or "")
+
+
+def _require_gluon_for_k2():
+    if GLUON_AVAILABLE:
+        return
+    raise SystemExit(
+        "[extract_jit_cubins_autotune] K2 requires Triton's Gluon dialect "
+        "(triton.experimental.gluon) and an sm80-sm89 CUDA target; import "
+        f"failed with {type(_GLUON_IMPORT_ERROR).__name__}: {_GLUON_IMPORT_ERROR}"
+    )
 
 
 # ─── Device-specs-driven autotune config builder ───────────────────────────
@@ -165,327 +209,81 @@ def _estimate_k1_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes,
 
 
 def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, arch=86):
-    """Build the autotune config list for the K2 GEMM+dequant kernel.
+    """Build the explicit-layout Gluon K2 search space.
 
-    Arch-dispatched config builder.  The kernel body is identical across
-    sm75/sm80/sm86/sm89 — only the autotune candidate set differs because
-    each arch has a different smem budget, CTA cap, and L2 size.
+    The attached sm86 winner is BM64/BN128/BK64/W4 with an MMA layout of
+    ``warps_per_cta=[1, 4]`` and two reusable operand buffers.  Automatic
+    layout selection cannot express the copy/MMA/store choices independently,
+    so Gluon tunes the useful neighbouring layouts explicitly:
 
-    sm86/sm89 (RTX 30/40, 100 KB smem/SM, 1.5-6 MB L2):
-      Primary target.  128x128 BK=32 S=4 at 1 CTA/SM is the throughput
-      optimum for memory-bound K2 (IMMA at 9%, LSU at 59% in Nsight
-      profile).  The 2.75x Triton smem tax (calibrated from 99 KB actual
-      / 36 KB naive for BK=64 BM=64 BN=128 S=3) means 128x128 BK=32 S=4
-      uses ~88 KB — fits the 99 KB optin budget.
+      * asymmetric 64x128 and 128x64 W4 tiles (including the attached layout),
+      * 64x64 W4 and 128x128 W8 traffic alternatives,
+      * a W2/BM16 family for the real M=1 bias workload,
+      * BK32/BK64 plus profiler-driven BK128 double-buffer candidates,
+      * double/triple buffering and the measured GROUP_M choices.
 
-      2 CTA/SM is NOT pursued: the (partial_int32 + acc_fp32) register
-      overlap during the per-group fold is 128 regs at W=8 for BM=BN=128,
-      which doesn't fit maxnreg=128.  Going to 64x128 to fit 2 CTA/SM
-      loses 50% on bandwidth tax (60 B/out vs 40 B/out) — a bad trade
-      for a memory-bound kernel.
-
-    sm80 (A100, 164 KB smem/SM, 4 MB L2):
-      Same 128x128 tile but deeper pipelining (S=6) enabled by the larger
-      smem budget.  BK=64 S=3 is also viable (halves MMA instruction
-      count) thanks to the 164 KB budget.
-
-    sm75 (Turing, 64 KB smem/SM, m8n8k32 IMMA):
-      128x128 BK=32 S=2 is the max that fits 48 KB optin smem (44 KB
-      after tax).  2 CTA/SM is not viable — the 24 KB budget forces
-      BM=16 tiles with 4.5x worse B/out.  Ship 1 CTA/SM with the big
-      tile and accept 25% occupancy.
+    ``WARPS_M`` controls the MMA warp topology; ``NUM_BUFFERS`` controls the
+    hand-written cp.async ring.  ``Config.num_stages`` mirrors NUM_BUFFERS only
+    for diagnostics/config identity.  Gluon's compiler pipeline itself is
+    always invoked with num_stages=1 because the kernel already owns staging.
     """
-    # ── Per-arch tile shapes and pipeline depths ──────────────────────────
-    #
-    # All arches ship 128x128 as the primary tile — it gives 40 B/output
-    # (vs 60 B/output for 64x128), which is 33% less DRAM traffic for a
-    # memory-bound kernel.  The difference between arches is pipeline
-    # depth (S) and BK, driven by the smem budget.
-    #
-    # Smem tax: Triton's auto-layout for INT8 IMMA inflates the naive
-    # smem estimate (BK × (BM + BN) × S) by ~2.75× (calibrated from the
-    # post-autotune profile: 99 KB actual / 36 KB naive for BK=64 BM=64
-    # BN=128 S=3).  The filter below uses this factor to reject configs
-    # that won't fit the per-block optin smem budget.
+    del num_sms, l2_bytes, autotune_shapes
+    arch = int(arch)
+    if not (80 <= arch <= 89):
+        raise SystemExit(
+            f"[K2 dispatch] Gluon mma_v2/cp.async K2 supports sm80-sm89, got sm{arch}"
+        )
 
-    if arch == 75:
-        # sm75 (Turing): 64 KB/SM, 48 KB/block optin.  S=2 only at 128x128.
-        tile_shapes = [
-            (128, 128, 2),    # primary: 40 B/out, 44 KB at S=2 (fits 48 KB)
-            (128, 64,  2),    # wide-M for down_proj (N=2560)
-            (64,  128, 4),    # fallback: smaller tile, bigger GM
-        ]
-        warps_stages = [(8, 2), (4, 2)]
-    elif arch == 80:
-        # sm80 (A100): 164 KB/SM, 163 KB/block optin.  Deep pipelining wins.
-        # S=6 at 128x128 BK=32 = 132 KB (fits 163 KB).
-        # BK=64 S=3 = 132 KB (also fits, halves MMA count).
-        tile_shapes = [
-            (128, 128, 4),    # primary: 40 B/out, S=6 fits
-            (128, 128, 2),    # smaller GM for K=9728 (down_proj)
-            (128, 256, 4),    # wide-N for gate_proj (N=9728)
-            (256, 128, 4),    # wide-M (if regs fit — borderline at 255)
-        ]
-        warps_stages = [(8, 2), (8, 3), (8, 4), (8, 5), (8, 6)]
-    else:
-        # sm86/sm89 (RTX 30/40): 100 KB/SM, 99 KB/block optin.
-        # S=4 at 128x128 BK=32 = 88 KB (fits 99 KB).
-        # S=5 = 110 KB (doesn't fit).  BK=64 S=2 = 88 KB (also fits).
-        tile_shapes = [
-            (128, 128, 2),    # primary: 40 B/out, S=4 fits 88 KB
-            (128, 64,  2),    # wide-M for down_proj (N=2560)
-            (64,  128, 4),    # fallback: smaller tile, bigger GM
-            (64,  256, 2),    # wide-N for gate_proj (N=9728)
-        ]
-        warps_stages = [(8, 2), (8, 3), (8, 4), (4, 2)]
-
-    # ── GROUP_M candidates (L2 pruning REMOVED) ──────────────────────────
-    #
-    # The old "L2-aware GROUP_M pruning" capped the super-group footprint
-    # (K × (GM × BM + BN)) at L2/2 and demoted every big tile to GROUP_M=1
-    # on small-L2 parts.  The ½ factor was a heuristic, the footprint used
-    # the worst-case K across all shapes, and GM only affects tile-scheduling
-    # order (not smem/registers) — so mispredicting it can never break a
-    # launch, only change L2 hit rates.  Real benchmarking decides now: keep
-    # the author-specified GM per tile and let autotune pick the winner.
-    tile_shapes = list(dict.fromkeys(tile_shapes))
-
-    # ── BK candidates ────────────────────────────────────────────────────
-    # BK=32 is the primary (smaller swizzle atom, better bank-conflict
-    # behavior, fits deeper pipelining).  BK=64 is included for arches
-    # where the smem budget allows it (halves the sub-MMA count per group).
-    if arch == 80:
-        block_k_candidates = [32, 64]
-    else:
-        block_k_candidates = [32, 64]  # both, let the smem filter decide
+    # (BM, BN, warps, WARPS_M candidates, GROUP_M candidates)
+    families = (
+        (16, 64, 2, (1,), (4,)),
+        (16, 128, 2, (1,), (4,)),
+        (64, 64, 4, (2, 4), (4, 8)),
+        (64, 128, 4, (1, 2), (4, 8)),
+        (128, 64, 4, (2, 4), (2, 4)),
+        (128, 128, 8, (2, 4), (2, 4)),
+    )
 
     configs = []
     seen = set()
-    for bm, bn, gm in tile_shapes:
-        for bk in block_k_candidates:
-            if 256 % bk != 0:
+    for bm, bn, num_warps, warp_ms, group_ms in families:
+        block_ks = (64,) if bm == 16 else (32, 64, 128)
+        for warp_m in warp_ms:
+            if num_warps % warp_m:
                 continue
-
-            for nw, ns in warps_stages:
-                # Smem filter: reject configs that don't fit the per-block
-                # optin smem budget.  Uses the 2.75x calibrated Triton smem
-                # tax for INT8 IMMA.
-                smem_per_stage = bk * (bm + bn)
-                smem_total_naive = smem_per_stage * ns
-                smem_total_est = int(smem_total_naive * 2.75)
-                if smem_total_est > shared_mem_per_sm:
+            warp_n = num_warps // warp_m
+            if bm % (16 * warp_m) or bn % (8 * warp_n):
+                continue
+            for bk in block_ks:
+                if GROUP_SIZE % bk:
                     continue
-
-                # 32x256 BK32 on small Ampere can exceed smem at S>=3.
-                if bm == 32 and bn >= 256 and bk == 32 and ns > 2:
-                    continue
-
-                if num_sms <= 32 and bm >= 256 and nw == 4:
-                    continue
-
-                cfg_kwargs = {
-                    "BLOCK_M": bm,
-                    "BLOCK_N": bn,
-                    "BLOCK_K": bk,
-                    "GROUP_M": gm,
-                    "SCHEDULE_2D": False,
-                    "DYNAMIC_INNER": False,
-                }
-                key = (bm, bn, bk, gm, nw, ns)
-                if key in seen:
-                    continue
-                seen.add(key)
-                configs.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
+                # BK128 halves the number of wait/barrier/loop-control steps;
+                # its double buffer is already as deep in bytes and compute as
+                # the current BK64 triple-buffer winner.
+                buffer_candidates = (2,) if bk == 128 else (2, 3)
+                for num_buffers in buffer_candidates:
+                    # Unlike the old automatic pipeline, the operand rings are
+                    # exact.  Layout-conversion scratch depends on WARPS_M and
+                    # is checked from compiled metadata by the strict gate.
+                    shared_bytes = num_buffers * bk * (bm + bn)
+                    if shared_mem_per_sm and shared_bytes > shared_mem_per_sm:
+                        continue
+                    for group_m in group_ms:
+                        key = (bm, bn, bk, group_m, num_warps,
+                               warp_m, num_buffers)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        configs.append(Config({
+                            "BLOCK_M": bm,
+                            "BLOCK_N": bn,
+                            "BLOCK_K": bk,
+                            "GROUP_M": group_m,
+                            "WARPS_M": warp_m,
+                            "NUM_BUFFERS": num_buffers,
+                        }, num_warps=num_warps,
+                           num_stages=num_buffers))
     return configs
-
-
-def _add_sm_aware_tile_candidates(base_configs, num_sms, shapes):
-    """Inject tile shapes whose wave count divides evenly into the SM count.
-
-    The candidate space here MUST stay a subset of the pruning decisions made
-    in _estimate_k2_configs: BLOCK_K=128 is pruned there (conflicts with
-    BM>=128 tiles and never won in profiling), and K2 configs are deliberately
-    uncapped.  A previous version of this function re-introduced BK=128 /
-    inconsistent register-cap configs through the back door; extras now use
-    the same BK space and no maxnreg caps.
-    """
-    # Deduplicate against base_configs on the full identity tuple.  Triton's
-    # Config does not define __eq__, so the previous `cfg not in base_configs`
-    # check compared object identity and never deduplicated anything.
-    def _cfg_key(c):
-        return (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
-                c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
-                bool(c.kwargs.get("SCHEDULE_2D", False)),
-                bool(c.kwargs.get("DYNAMIC_INNER", False)),
-                c.num_warps, c.num_stages)
-
-    seen = {_cfg_key(c) for c in base_configs}
-    extra = []
-    candidate_block_mns = [(32, 128), (32, 256),
-                           (64, 64), (64, 128),
-                           (128, 64), (128, 128), (128, 256), (256, 128)]
-    for (M, N, K) in shapes:
-        for bm, bn in candidate_block_mns:
-            tiles = _math.ceil(M / bm) * _math.ceil(N / bn)
-            if num_sms > 0 and tiles >= num_sms:
-                ratio = tiles / num_sms
-                if abs(ratio - round(ratio)) / ratio < 0.10:
-                    # Same BK space as _estimate_k2_configs (BK=128 pruned).
-                    for bk in [32, 64]:
-                        if 256 % bk != 0:
-                            continue
-                        if bk == 32 and (bm >= 256 and bn >= 256):
-                            continue
-                        for gm in [4, 8]:
-                            extra_warps_stages = [(4, 2), (8, 2)] if (bm == 32 and bn >= 256 and bk == 32) else [(4, 3), (8, 3)]
-                            for nw, ns in extra_warps_stages:
-                                key = (bm, bn, bk, gm, False, False, nw, ns)
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                cfg_kwargs = {
-                                    "BLOCK_M": bm,
-                                    "BLOCK_N": bn,
-                                    "BLOCK_K": bk,
-                                    "GROUP_M": gm,
-                                    "SCHEDULE_2D": False,
-                                    "DYNAMIC_INNER": False,
-                                }
-                                extra.append(Config(cfg_kwargs, num_warps=nw, num_stages=ns))
-    return base_configs + extra
-
-
-def _add_k2_small_m_candidates(base_configs, arch):
-    """Add BM16 candidates needed by the real BIAS M=1 workload."""
-    if not (80 <= int(arch) <= 89):
-        return base_configs
-    seen = {
-        (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
-         c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
-         bool(c.kwargs.get("SCHEDULE_2D", False)),
-         bool(c.kwargs.get("DYNAMIC_INNER", False)),
-         c.num_warps, c.num_stages)
-        for c in base_configs
-    }
-    extra = []
-    for bn in (64, 128):
-        for nw in (4, 8):
-            for ns in (2, 3):
-                key = (16, bn, 64, 4, False, False, nw, ns)
-                if key in seen:
-                    continue
-                seen.add(key)
-                extra.append(Config({
-                    "BLOCK_M": 16, "BLOCK_N": bn, "BLOCK_K": 64,
-                    "GROUP_M": 4, "SCHEDULE_2D": False,
-                    "DYNAMIC_INNER": False,
-                }, num_warps=nw, num_stages=ns))
-    return base_configs + extra
-
-
-def _add_k2_2d_schedule_candidates(base_configs, arch):
-    """Add a small, numerically identical 2-D persistent-scheduler family.
-
-    The arithmetic tile body is shared verbatim with the 1-D reference.  Only
-    CTA-to-output-tile ownership changes.  Restrict the initial sm80-sm89 search
-    to resource shapes that are already competitive on the RTX 3050, avoiding
-    a Cartesian doubling of the full K2 space.
-    """
-    if not (80 <= int(arch) <= 89):
-        return base_configs
-
-    specs = [
-        # Small-M BIAS projections (M=1) need a real tensor-core-sized M tile.
-        (16, 64, 64, 1, 4, 2),
-        (16, 64, 64, 1, 8, 2),
-        (16, 128, 64, 1, 4, 2),
-        (16, 128, 64, 1, 8, 2),
-        # Current sm86 winner, with tile-index division removed.
-        (128, 64, 64, 1, 8, 3),
-        # Symmetric traffic alternative that is consistently second-tier.
-        (64, 128, 64, 1, 8, 3),
-        # Smaller tile: candidate for better production-tail efficiency.
-        (64, 64, 64, 1, 8, 3),
-        # Larger output tile with shallower BK/staging; spill gate decides.
-        (128, 128, 32, 1, 8, 2),
-    ]
-
-    seen = {
-        (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
-         c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
-         bool(c.kwargs.get("SCHEDULE_2D", False)),
-         bool(c.kwargs.get("DYNAMIC_INNER", False)),
-         c.num_warps, c.num_stages, getattr(c, "maxnreg", None))
-        for c in base_configs
-    }
-    extra = []
-    for bm, bn, bk, gm, nw, ns in specs:
-        key = (bm, bn, bk, gm, True, False, nw, ns, None)
-        if key in seen:
-            continue
-        seen.add(key)
-        extra.append(Config({
-            "BLOCK_M": bm,
-            "BLOCK_N": bn,
-            "BLOCK_K": bk,
-            "GROUP_M": gm,       # unused by the 2-D schedule; ABI identity only
-            "SCHEDULE_2D": True,
-            "DYNAMIC_INNER": False,
-        }, num_warps=nw, num_stages=ns))
-    return base_configs + extra
-
-
-def _add_k2_dynamic_inner_candidates(base_configs, arch):
-    """Reuse one pipelined smem buffer across the four BK steps per G256.
-
-    The static inner loop in the v10 winner is unrolled into four independent
-    double-buffered X/W allocations (96 KB total in the attached TTGIR).  A
-    dynamic four-iteration loop keeps the same INT32 accumulation order and
-    FP32 fold boundary while allowing Triton to allocate one reusable pipeline
-    (12/24/36 KB for W4 S2/S3/S4 on the 64x128 tile).
-    """
-    if not (80 <= int(arch) <= 89):
-        return base_configs
-
-    specs = []
-    for bm, bn, gms in ((64, 128, (4, 8)),
-                        (128, 64, (2, 4)),
-                        (64, 64, (4, 8))):
-        for gm in gms:
-            for nw in (4, 8):
-                for ns in ((2, 3, 4) if nw == 4 else (2, 3)):
-                    specs.append((bm, bn, 64, gm, False, nw, ns))
-    for bm, bn in ((16, 64), (16, 128)):
-        for nw in (4, 8):
-            for ns in (2, 3):
-                specs.append((bm, bn, 64, 4, False, nw, ns))
-    # One larger-tile experiment and division-free variants of the two leaders.
-    specs += [
-        (128, 128, 64, 2, False, 8, 2),
-        (64, 128, 64, 1, True, 4, 3),
-        (128, 64, 64, 1, True, 4, 3),
-    ]
-
-    seen = {
-        (c.kwargs.get("BLOCK_M"), c.kwargs.get("BLOCK_N"),
-         c.kwargs.get("BLOCK_K"), c.kwargs.get("GROUP_M"),
-         bool(c.kwargs.get("SCHEDULE_2D", False)),
-         bool(c.kwargs.get("DYNAMIC_INNER", False)),
-         c.num_warps, c.num_stages, getattr(c, "maxnreg", None))
-        for c in base_configs
-    }
-    extra = []
-    for bm, bn, bk, gm, schedule_2d, nw, ns in specs:
-        key = (bm, bn, bk, gm, schedule_2d, True, nw, ns, None)
-        if key in seen:
-            continue
-        seen.add(key)
-        extra.append(Config({
-            "BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk,
-            "GROUP_M": gm, "SCHEDULE_2D": schedule_2d,
-            "DYNAMIC_INNER": True,
-        }, num_warps=nw, num_stages=ns))
-    return base_configs + extra
 
 
 _K1_CONFIGS: list = []
@@ -811,9 +609,8 @@ def _kernel2_compute_tile(
         tl.store(y_ptr_block, acc.to(tl.float32))
 
 
-@triton.autotune(configs=_K2_CONFIGS, key=["M", "N", "K", "HAS_BIAS", "OUTPUT_FP16"])
 @triton.jit
-def kernel2_gemm_dequant(
+def kernel2_gemm_dequant_reference(
     X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
     M, N, K,
     stride_xqm, stride_xqk,
@@ -846,8 +643,8 @@ def kernel2_gemm_dequant(
     selected BLOCK_N; the plugin rejects unsupported N rather than shipping a
     masked fallback.
 
-    Bias handling remains a compile-time specialization.  Separate BIAS and
-    NOBIAS cubins are generated so no-bias layers skip the bias load/add.
+    Bias handling remains a compile-time specialization in both this oracle and
+    shipping Gluon, so NOBIAS skips the bias load/add.
 
     sm86 optimization notes (Nsight Compute profiled):
 
@@ -922,6 +719,261 @@ def kernel2_gemm_dequant(
                 HAS_BIAS, OUTPUT_FP16, DYNAMIC_INNER,
             )
 
+# ─── K2 shipping kernel: explicit-layout Gluon IMMA + cp.async ─────────────
+#
+# The Triton kernel above is intentionally retained only as the immutable v10
+# numerical oracle.  It is never benchmarked as a shipping candidate and its
+# cubin is never emitted.  Gluon makes the three layouts and the cp.async ring
+# explicit, avoiding the four separately-unrolled shared allocations visible in
+# the attached TTGIR while retaining the exact G256 INT32/FP32 fold boundaries.
+if GLUON_AVAILABLE:
+    _k2_cp = _gluon_async_copy
+
+    @gluon.jit
+    def _kernel2_gluon_mma_step(
+        step, int32_acc, a_bufs, w_bufs,
+        Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        BLOCK_K: gl.constexpr, NUM_BUFFERS: gl.constexpr,
+        copy_layout: gl.constexpr, smem8: gl.constexpr,
+        a_layout: gl.constexpr, b_layout: gl.constexpr,
+        ISSUE_PREFETCH: gl.constexpr, WAIT_GROUP: gl.constexpr,
+    ):
+        """Consume one cp.async stage and optionally refill the freed stage.
+
+        The CTA barrier has two jobs: every warp has completed its wait before
+        any warp reads the stage, and every warp has finished reading the prior
+        stage before its buffer is reused.  The refill is issued *after* the
+        shared loads but before MMA, so it overlaps with tensor-core work.  This
+        is the synchronization missing from the earlier c7471ef experiment.
+        """
+        BK32: gl.constexpr = BLOCK_K // 4
+        _k2_cp.wait_group(WAIT_GROUP)
+        gl.barrier()
+
+        read_buf = step % NUM_BUFFERS
+        a8 = a_bufs.index(read_buf)._reinterpret(
+            gl.int8, [BLOCK_M, BLOCK_K], smem8)
+        w8 = w_bufs.index(read_buf)._reinterpret(
+            gl.int8, [BLOCK_N, BLOCK_K], smem8)
+        a = a8.load(a_layout)
+        b = w8.permute((1, 0)).load(b_layout)
+
+        if ISSUE_PREFETCH:
+            # With a prefetch distance NUM_BUFFERS-1 this is the stage consumed
+            # in the previous iteration, never the stage loaded above.
+            prefetch_step = step + NUM_BUFFERS - 1
+            write_buf = prefetch_step % NUM_BUFFERS
+            off32 = prefetch_step * BK32
+            a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
+            w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
+            # Every lane copies 16 bytes.  .cg bypasses the ~3%-hit-rate L1
+            # while retaining the cross-CTA reuse that GROUP_M creates in L2.
+            _k2_cp.async_copy_global_to_shared(
+                a_bufs.index(write_buf), a_ptrs, mask=a_row_mask[:, None],
+                cache_modifier=".cg")
+            _k2_cp.async_copy_global_to_shared(w_bufs.index(write_buf), w_ptrs,
+                              cache_modifier=".cg")
+            _k2_cp.commit_group()
+
+        return _gluon_mma_v2(a, b, int32_acc)
+
+
+    @gluon.jit(do_not_specialize_on_alignment=("M", "stride_xsg"))
+    def kernel2_gemm_dequant(
+        X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
+        M, N, K,
+        stride_xqm, stride_xqk,
+        stride_xsm, stride_xsg,
+        stride_wn, stride_wk,
+        stride_ym, stride_yn,
+        BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+        BLOCK_K: gl.constexpr, GROUP_SIZE: gl.constexpr,
+        GROUP_M: gl.constexpr, WARPS_M: gl.constexpr,
+        NUM_BUFFERS: gl.constexpr, HAS_BIAS: gl.constexpr,
+        OUTPUT_FP16: gl.constexpr,
+    ):
+        """Persistent G256 INT8 GEMM with an explicit Ampere cp.async ring."""
+        gl.static_assert(GROUP_SIZE == 256, "only GROUP_SIZE=256 is supported")
+        gl.static_assert(GROUP_SIZE % BLOCK_K == 0,
+                         "GROUP_SIZE must be divisible by BLOCK_K")
+        gl.static_assert(NUM_BUFFERS >= 2 and NUM_BUFFERS <= 3,
+                         "K2 tunes double and triple buffering")
+        gl.static_assert(OUTPUT_FP16, "FP32IO is legacy and is not shipped")
+        gl.static_assert(gl.num_warps() % WARPS_M == 0,
+                         "WARPS_M must divide num_warps")
+
+        GROUP_STEPS: gl.constexpr = GROUP_SIZE // BLOCK_K
+        BK32: gl.constexpr = BLOCK_K // 4
+        WARPS_N: gl.constexpr = gl.num_warps() // WARPS_M
+
+        mma_layout: gl.constexpr = gl.NVMMADistributedLayout(
+            version=[2, 0], warps_per_cta=[WARPS_M, WARPS_N],
+            instr_shape=[16, 8])
+        a_layout: gl.constexpr = gl.DotOperandLayout(
+            operand_index=0, parent=mma_layout, k_width=4)
+        b_layout: gl.constexpr = gl.DotOperandLayout(
+            operand_index=1, parent=mma_layout, k_width=4)
+
+        # 4xi32 = 16 bytes per lane, with the warp's K extent selected so a
+        # BK32 or BK64 row is covered exactly.  Warps are spread over rows;
+        # larger M/N tiles are represented by regular layout repetitions.
+        COPY_THREADS_K: gl.constexpr = BLOCK_K // 16
+        COPY_THREADS_M: gl.constexpr = 32 // COPY_THREADS_K
+        copy_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 4],
+            threads_per_warp=[COPY_THREADS_M, COPY_THREADS_K],
+            warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
+
+        # FP16 output uses a 16-byte vector per lane.  BN128 maps each warp to
+        # two full rows; BN64 maps it to four rows.
+        if BLOCK_N >= 128:
+            store_layout: gl.constexpr = gl.BlockedLayout(
+                size_per_thread=[1, 8], threads_per_warp=[2, 16],
+                warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
+        else:
+            store_layout: gl.constexpr = gl.BlockedLayout(
+                size_per_thread=[1, 8], threads_per_warp=[4, 8],
+                warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
+
+        smem32: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=4, per_phase=2, max_phase=4, order=[1, 0])
+        smem8: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=16, per_phase=2, max_phase=4, order=[1, 0])
+        a_bufs = gl.allocate_shared_memory(
+            gl.int32, [NUM_BUFFERS, BLOCK_M, BK32], smem32)
+        w_bufs = gl.allocate_shared_memory(
+            gl.int32, [NUM_BUFFERS, BLOCK_N, BK32], smem32)
+
+        num_pid_m = gl.cdiv(M, BLOCK_M)
+        num_pid_n = gl.cdiv(N, BLOCK_N)
+        num_tiles = num_pid_m * num_pid_n
+        num_pid_in_group = GROUP_M * num_pid_n
+        start_pid = gl.program_id(0)
+        grid_x = gl.num_programs(0)
+
+        rm_cp_base = gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, copy_layout))
+        rn_cp_base = gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(1, copy_layout))
+        rk_cp = gl.arange(0, BK32, layout=gl.SliceLayout(0, copy_layout))
+        rm_acc_base = gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, mma_layout))
+        rn_acc_base = gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, mma_layout))
+        rm_store_base = gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, store_layout))
+        rn_store_base = gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(0, store_layout))
+
+        Xq32 = X_q_ptr.cast(gl.pointer_type(gl.int32))
+        Wq32 = W_q_ptr.cast(gl.pointer_type(gl.int32))
+        sxm32 = stride_xqm // 4
+        swn32 = stride_wn // 4
+        num_groups = K // GROUP_SIZE
+
+        for tile_id in range(start_pid, num_tiles, grid_x):
+            group_id = tile_id // num_pid_in_group
+            first_pid_m = group_id * GROUP_M
+            group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+            tile_in_group = tile_id % num_pid_in_group
+            pid_m = first_pid_m + (tile_in_group % group_size_m)
+            pid_n = tile_in_group // group_size_m
+            pid_m_off = pid_m * BLOCK_M
+            pid_n_off = pid_n * BLOCK_N
+
+            rm_cp = pid_m_off + rm_cp_base
+            rn_cp = pid_n_off + rn_cp_base
+            rm_acc = pid_m_off + rm_acc_base
+            rn_acc = pid_n_off + rn_acc_base
+            a_row_mask = rm_cp < M
+            acc_row_mask = rm_acc < M
+
+            # Only M can be partial.  Predicated cp.async zero-fills inactive A
+            # rows, allowing the plugin to process the final tile in this same
+            # persistent launch instead of launching/copying a separate tail.
+            for stage in gl.static_range(0, NUM_BUFFERS - 1):
+                off32 = stage * BK32
+                a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
+                w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
+                _k2_cp.async_copy_global_to_shared(
+                    a_bufs.index(stage), a_ptrs, mask=a_row_mask[:, None],
+                    cache_modifier=".cg")
+                _k2_cp.async_copy_global_to_shared(w_bufs.index(stage), w_ptrs,
+                                  cache_modifier=".cg")
+                _k2_cp.commit_group()
+
+            acc = gl.zeros(
+                (BLOCK_M, BLOCK_N), dtype=gl.float32, layout=mma_layout)
+
+            # All complete groups except the final one run in steady state.
+            # Keeping this outer group loop is the numerical contract: one
+            # ordered INT32 sum per G256 followed by one FP32 scale fold.
+            for group_idx in range(0, num_groups - 1):
+                xs = gl.load(
+                    X_scale_ptr + group_idx * stride_xsg + rm_acc * stride_xsm,
+                    mask=acc_row_mask, other=0.0,
+                    eviction_policy="evict_last")
+                int32_acc = gl.zeros(
+                    (BLOCK_M, BLOCK_N), dtype=gl.int32, layout=mma_layout)
+                for sub in gl.static_range(0, GROUP_STEPS):
+                    step = group_idx * GROUP_STEPS + sub
+                    int32_acc = _kernel2_gluon_mma_step(
+                        step, int32_acc, a_bufs, w_bufs,
+                        Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
+                        BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
+                        copy_layout, smem8, a_layout, b_layout,
+                        ISSUE_PREFETCH=True, WAIT_GROUP=NUM_BUFFERS - 2)
+                scaled = int32_acc.to(gl.float32) * xs[:, None]
+                acc = acc + scaled
+
+            # Split the final group into steady-state and drain sections.  The
+            # descending wait counts leave zero outstanding cp.async groups at
+            # every persistent-tile boundary (the c7471ef kernel did not).
+            final_group = num_groups - 1
+            xs = gl.load(
+                X_scale_ptr + final_group * stride_xsg + rm_acc * stride_xsm,
+                mask=acc_row_mask, other=0.0,
+                eviction_policy="evict_last")
+            int32_acc = gl.zeros(
+                (BLOCK_M, BLOCK_N), dtype=gl.int32, layout=mma_layout)
+            for sub in gl.static_range(0, GROUP_STEPS - (NUM_BUFFERS - 1)):
+                step = final_group * GROUP_STEPS + sub
+                int32_acc = _kernel2_gluon_mma_step(
+                    step, int32_acc, a_bufs, w_bufs,
+                    Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
+                    BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
+                    copy_layout, smem8, a_layout, b_layout,
+                    ISSUE_PREFETCH=True, WAIT_GROUP=NUM_BUFFERS - 2)
+            for drain in gl.static_range(0, NUM_BUFFERS - 1):
+                sub = GROUP_STEPS - (NUM_BUFFERS - 1) + drain
+                step = final_group * GROUP_STEPS + sub
+                int32_acc = _kernel2_gluon_mma_step(
+                    step, int32_acc, a_bufs, w_bufs,
+                    Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
+                    BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
+                    copy_layout, smem8, a_layout, b_layout,
+                    ISSUE_PREFETCH=False,
+                    WAIT_GROUP=NUM_BUFFERS - 2 - drain)
+            scaled = int32_acc.to(gl.float32) * xs[:, None]
+            acc = acc + scaled
+
+            ws = gl.load(W_scale_ptr + rn_acc, eviction_policy="evict_last")
+            acc = acc * ws[None, :]
+            if HAS_BIAS:
+                bias = gl.load(Bias_ptr + rn_acc, eviction_policy="evict_last")
+                acc = acc + bias[None, :]
+
+            acc_store = gl.convert_layout(acc, store_layout)
+            rm_store = pid_m_off + rm_store_base
+            rn_store = pid_n_off + rn_store_base
+            y_ptrs = (Y_ptr + rm_store[:, None] * stride_ym +
+                      rn_store[None, :] * stride_yn)
+            gl.store(y_ptrs, acc_store.to(gl.float16),
+                     mask=(rm_store < M)[:, None])
+else:
+    kernel2_gemm_dequant = None
+
 
 GROUP_SIZE = 256
 DEFAULT_BLOCK_K = 64
@@ -946,20 +998,23 @@ TILE_NAME = "PersistentG256"
 #       persistent scheduler.  Selection uses a weighted multi-shape benchmark
 #       of the exact plugin prefix/tail/copy sequence and rejects any candidate
 #       that differs bitwise from the v9 BM128/BN64/BK64 reference.
-CONVROT_INT8_CUBIN_HEADER_VERSION = 10
+#  11 — K2 is an explicit-layout Gluon mma_v2 kernel with a correctly drained
+#       cp.async ring, coalesced FP16 stores, and tunable MMA warp topology.
+#       FP32IO is retired: extraction emits only FP16IO K1/K2 cubins.
+#  12 — K2 predicates its final M tile so the plugin uses one persistent launch
+#       and no longer allocates, launches, or copies a padded output tail.
+CONVROT_INT8_CUBIN_HEADER_VERSION = 12
 # K2 ships separate compile-time bias and no-bias specializations.
 BIAS_CONFIGS = [("NOBIAS", False), ("BIAS", True)]
-DTYPE_CONFIGS = [("FP32IO", False, False), ("FP16IO", True, True)]
-# Real DiT decoder K2 shapes, expressed as (M, K, N).  M=3000 is not
-# divisible by all candidate BLOCK_M values; extract_k2 pads the benchmark M
-# to 3072 so the plain/unmasked K2 can be autotuned safely while staying within
-# 2.4% of the production work.
+# FP32IO is a legacy graph boundary.  Do not compile, benchmark, emit, or make
+# the plugin require cubins that production never selects.
+DTYPE_CONFIGS = [("FP16IO", True, True)]
+# Real DiT decoder K2 shapes, expressed as (M, K, N).  M=3000 intentionally
+# exercises the masked final tile used by the version-12 single-launch path.
 #
-# The first entry is the primary compromise shape used for the single shipped
-# K2 cubin: it is one of the two dominant MLP projections and stresses wide-N
-# reuse (N=9728).  The full list still drives L2/GROUP_M pruning and
-# SM-wave-aware candidate injection, so down_proj / attention projections are
-# represented in the candidate set.
+# The first entry is the dominant wide-N projection.  The weighted custom
+# benchmark below evaluates every listed production family; config construction
+# is intentionally independent of one synthetic primary shape.
 AUTOTUNE_SHAPES_K2 = [
     (3000, 2560, 9728),  # dit.mlp.gate/up projections
     (3000, 9728, 2560),  # dit.mlp.down projection
@@ -1030,6 +1085,11 @@ _K2_CFG_OCCUPANCY: dict = {}
 # K2 additionally keeps bias-specific occupancy so NOBIAS benchmarking is not
 # under-launched merely because the BIAS epilogue needs more registers.
 _K2_CFG_OCCUPANCY_BY_BIAS: dict = {}
+# A layout may be legal for NOBIAS and spill only after adding the BIAS
+# epilogue (or vice versa).  Keep those candidate sets independent so the hot
+# NOBIAS workload does not lose a valid fast cubin merely because BIAS selects a
+# different winner.
+_K2_CFG_VALID_BY_BIAS: dict = {}
 
 
 def _cfg_occupancy_key(cfg):
@@ -1247,14 +1307,28 @@ def _ordered_runtime_signature(kernel):
     arg_names = list(getattr(fn, "arg_names", []) or [])
     ordered = []
     consumed = set()
+    # ASTSource keeps specialized integer arguments in ``signature`` but records
+    # their true compile-time status separately in ``constants``.  They are not
+    # PTX parameters and must not appear in the generated C++ launch ABI.
+    constant_indices = {
+        int(key[0]) for key in (getattr(src, "constants", {}) or {})
+        if isinstance(key, tuple) and len(key) == 1 and isinstance(key[0], int)
+    }
 
     def append_item(key, name_hint=None):
         if key in signature and key not in consumed:
+            name = name_hint or str(key)
+            try:
+                index = arg_names.index(name)
+            except ValueError:
+                index = key if isinstance(key, int) else None
+            consumed.add(key)
+            if index in constant_indices:
+                return
             ordered.append({
-                "name": name_hint or str(key),
+                "name": name,
                 "sig_type": _normalize_sig_type(signature[key]),
             })
-            consumed.add(key)
 
     for idx, arg_name in enumerate(arg_names):
         if arg_name in signature:
@@ -1753,70 +1827,57 @@ def _parallel_precompile_k1(configs, input_fp16):
         print(f"    [parallel-compile] Warning: parallel precompilation fallback ({e})", flush=True)
 
 
-def _init_k2_worker(output_fp16):
-    import torch
-    try:
-        torch.set_num_threads(1)
-    except Exception:
-        pass
-    out_dtype = torch.float16 if output_fp16 else torch.float32
+def _init_k2_worker(output_fp16, target_arch):
     _K2_WORKER_STATE.output_fp16 = output_fp16
-    _K2_WORKER_STATE.xq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
-    _K2_WORKER_STATE.xs = torch.empty((1, 1), device="cuda", dtype=torch.float32)
-    _K2_WORKER_STATE.wq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
-    _K2_WORKER_STATE.ws = torch.empty((1,), device="cuda", dtype=torch.float32)
-    _K2_WORKER_STATE.bias = torch.empty((1,), device="cuda", dtype=torch.float32)
-    _K2_WORKER_STATE.y = torch.empty((1, 1), device="cuda", dtype=out_dtype)
+    _K2_WORKER_STATE.target_arch = target_arch
 
 
 def _worker_precompile_k2(config_tuple):
-    if not hasattr(_K2_WORKER_STATE, "xq"):
-        return 0
     from triton import Config
     kwargs, nw, ns, mr = config_tuple
-    output_fp16 = _K2_WORKER_STATE.output_fp16
     try:
-        cfg = Config(kwargs, num_warps=nw, num_stages=ns, maxnreg=mr)
-        # W_q is [N, K] row-major: stride_wn=K=2560, stride_wk=1.
-        kernel2_gemm_dequant.fn.warmup(
-            _K2_WORKER_STATE.xq, _K2_WORKER_STATE.xs, _K2_WORKER_STATE.wq,
-            _K2_WORKER_STATE.ws, _K2_WORKER_STATE.bias, _K2_WORKER_STATE.y,
-            1024, 2560, 2560,
-            2560, 1, 1, 1024, 2560, 1, 2560, 1,
-            GROUP_SIZE=256, HAS_BIAS=_K2_ACTIVE_HAS_BIAS, OUTPUT_FP16=output_fp16,
-            **cfg.all_kwargs(),
-            grid=(1, 1, 1)
-        )
+        if mr is None:
+            cfg = Config(kwargs, num_warps=nw, num_stages=ns)
+        else:
+            cfg = Config(kwargs, num_warps=nw, num_stages=ns, maxnreg=mr)
+        _compile_gluon_k2(
+            cfg, _K2_ACTIVE_HAS_BIAS, _K2_WORKER_STATE.output_fp16,
+            _K2_WORKER_STATE.target_arch)
     except Exception:
+        # The authoritative spill/compile gate reports exact failures.  This
+        # pass is only a best-effort disk-cache warmer.
         pass
-    finally:
-        _flush_compiled_kernel_cache(kernel2_gemm_dequant)
     return 1
 
 
-def _parallel_precompile_k2(configs, output_fp16):
-    num_workers = int(os.environ.get("HOTSTEP_AUTOTUNE_WORKERS", min(mp.cpu_count(), len(configs), 16)))
+def _parallel_precompile_k2(configs, output_fp16, target_arch):
+    _require_gluon_for_k2()
+    num_workers = int(os.environ.get(
+        "HOTSTEP_AUTOTUNE_WORKERS", min(mp.cpu_count(), len(configs), 16)))
     if num_workers <= 1 or not configs:
         return
-    print(f"    [parallel-compile] Precompiling {len(configs)} K2 configs across {num_workers} threads...", flush=True)
-    tuples = [(c.kwargs, c.num_warps, c.num_stages, getattr(c, "maxnreg", None)) for c in configs]
+    print(f"    [parallel-compile] Precompiling {len(configs)} Gluon K2 configs "
+          f"across {num_workers} threads...", flush=True)
+    tuples = [(c.kwargs, c.num_warps, c.num_stages,
+               getattr(c, "maxnreg", None)) for c in configs]
     done = 0
     total = len(configs)
-    # Sparse newline-terminated progress (every ~10%): carriage-return
-    # progress lines interleave badly with worker-thread prints.
     progress_step = max(total // 10, 1)
     try:
         with ThreadPool(
             processes=num_workers,
             initializer=_init_k2_worker,
-            initargs=(output_fp16,)
+            initargs=(output_fp16, target_arch),
         ) as pool:
-            for _ in pool.imap_unordered(_worker_precompile_k2, tuples, chunksize=1):
+            for _ in pool.imap_unordered(
+                    _worker_precompile_k2, tuples, chunksize=1):
                 done += 1
                 if done % progress_step == 0 or done == total:
-                    print(f"    [parallel-compile] K2: {done}/{total} configs compiled", flush=True)
-    except Exception as e:
-        print(f"    [parallel-compile] Warning: parallel precompilation fallback ({e})", flush=True)
+                    print(f"    [parallel-compile] K2: {done}/{total} configs compiled",
+                          flush=True)
+    except Exception as exc:
+        print(f"    [parallel-compile] Warning: Gluon precompilation fallback "
+              f"({exc})", flush=True)
 
 
 # ─── Register spill detection (patch review §8 — robust, non-heuristic) ──
@@ -2019,19 +2080,54 @@ def _detect_spills(kernel, function_name: str = "") -> dict:
 def _compile_kernel_for_spill_check(jit_fn, signature, constexprs, attrs,
                                      num_warps, num_stages, maxnreg,
                                      target_arch):
-    """Compile one exact shipping specialization for spill analysis."""
+    """Compile one exact shipping specialization for spill analysis.
+
+    Gluon already contains an explicit cp.async pipeline, so compiler
+    ``num_stages`` must remain one; the Config's stage field is only the
+    explicit NUM_BUFFERS identity/diagnostic value.
+    """
     from triton.compiler import compile as triton_compile
     from triton.compiler.compiler import ASTSource
     from triton.backends.compiler import GPUTarget
 
-    fn = jit_fn.fn if hasattr(jit_fn, 'fn') else jit_fn
-    src = ASTSource(fn=fn, signature=signature, constexprs=constexprs,
-                    attrs=attrs or {})
+    if _is_gluon_kernel(jit_fn):
+        _require_gluon_for_k2()
+        src = GluonASTSource(fn=jit_fn, signature=signature,
+                             constexprs=constexprs, attrs=attrs or {})
+        compiler_stages = 1
+    else:
+        # ASTSource requires the JITFunction wrapper (arg_names/cache_key), not
+        # its raw Python ``.fn``.  Autotuner wrappers are unwrapped only until
+        # that JIT holder is reached.
+        fn = _find_jit_holder(jit_fn)
+        if fn is None:
+            raise TypeError(f"could not locate Triton JITFunction for {jit_fn!r}")
+        src = ASTSource(fn=fn, signature=signature, constexprs=constexprs,
+                        attrs=attrs or {})
+        compiler_stages = num_stages
     target = GPUTarget(backend='cuda', arch=target_arch, warp_size=32)
-    options = {'num_warps': num_warps, 'num_stages': num_stages}
+    options = {'num_warps': num_warps, 'num_stages': compiler_stages}
     if maxnreg is not None:
         options['maxnreg'] = maxnreg
     return triton_compile(src, target=target, options=options)
+
+
+def _compile_gluon_k2(cfg, has_bias, output_fp16, target_arch):
+    """Compile the exact AOT Gluon specialization used for launch/emission."""
+    _require_gluon_for_k2()
+    wanted = f"{'BIAS' if has_bias else 'NOBIAS'}_FP16IO"
+    for label, signature, extra, attrs in _spill_check_variants("k2"):
+        if label != wanted:
+            continue
+        if not output_fp16:
+            raise RuntimeError("FP32IO K2 compilation is retired")
+        constexprs = dict(extra)
+        constexprs.update(cfg.kwargs)
+        return _compile_kernel_for_spill_check(
+            kernel2_gemm_dequant, signature, constexprs, attrs,
+            cfg.num_warps, cfg.num_stages,
+            getattr(cfg, "maxnreg", None), target_arch)
+    raise RuntimeError(f"missing Gluon K2 spill/ABI variant {wanted}")
 
 
 # ─── Parallel spill-check worker state ────────────────────────────────────
@@ -2127,11 +2223,12 @@ def _spill_check_variants(stage):
                     'stride_wk': 1,
                     'stride_yn': 1,
                 }
-                # Match every production K2 specialization: pointers, M/N/K,
-                # row pitches and the padded scale pitch are 16-byte divisible.
+                # M and stride_xsg are the real, tightly packed row count (for
+                # example 3000) and must remain generic.  Pointers, N/K and the
+                # K/N row pitches retain their 16-byte divisibility contracts.
                 attrs = {
                     (i,): [["tt.divisibility", 16]]
-                    for i in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15)
+                    for i in (0, 1, 2, 3, 4, 5, 7, 8, 9, 13, 15)
                 }
                 yield (f"{bias_suffix}_{dtype_suffix}", signature,
                        constexprs, attrs)
@@ -2143,9 +2240,9 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
     ZERO TOLERANCE: any config with STACK > 0 (from cuobjdump) or any
     PTX-level ld.local/st.local is rejected.  No thresholds.
 
-    Every SHIPPED constexpr variant (currently bias-enabled K2 only × DTYPE_CONFIGS) is
-    checked — a config survives only if it is spill-free in all of them
-    (see _spill_check_variants).
+    Every shipped constexpr variant is checked.  K1 legality is global; K2
+    legality is tracked independently for BIAS and NOBIAS so one epilogue's
+    register pressure cannot suppress a valid candidate for the other.
 
     Uses the same 16-thread ThreadPool as the precompile step — sequential
     compilation of 50+ configs takes minutes; parallel takes seconds.
@@ -2211,21 +2308,32 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
                 results.append(_worker_check_spills(task))
                 _progress(len(results))
 
-    # A config is rejected if ANY of its shipped variants spills or fails to
-    # compile.  Aggregate per-config over all variant results.
+    # K1 has one shipping dtype and therefore rejects a config globally.  K2
+    # records legality per BIAS/NOBIAS specialization: an epilogue-only spill in
+    # BIAS must not remove an otherwise valid NOBIAS candidate from the hot path.
     def _cfg_id(c):
         return (tuple(sorted(c.kwargs.items())), c.num_warps, c.num_stages,
                 getattr(c, 'maxnreg', None))
 
     reject_reasons: dict = {}
+    variant_reject_reasons: dict = {}
+
+    def _record_reject(cid, variant_label, reason):
+        tagged = f"[{variant_label}] {reason}"
+        reject_reasons.setdefault(cid, []).append(tagged)
+        if stage == "k2":
+            has_bias_variant = variant_label.startswith("BIAS_")
+            variant_reject_reasons.setdefault(
+                (cid, has_bias_variant), []).append(tagged)
+
     for cfg, variant_label, spill_info, error in results:
         cid = _cfg_id(cfg)
         if error is not None:
-            reject_reasons.setdefault(cid, []).append(
-                f"[{variant_label}] compile failed: {error}")
+            _record_reject(cid, variant_label, f"compile failed: {error}")
         elif spill_info['spilling']:
-            reject_reasons.setdefault(cid, []).append(
-                f"[{variant_label}] SPILLS: {spill_info['method']}: "
+            _record_reject(
+                cid, variant_label,
+                f"SPILLS: {spill_info['method']}: "
                 f"local_bytes={spill_info['local_bytes']}, "
                 f"ptx_spills={spill_info['ptx_spills']}, "
                 f"sass_local_ops={spill_info.get('sass_local_ops', -1)}, "
@@ -2233,21 +2341,18 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
                 f"regs={spill_info['registers']}")
         elif (stage == "k2" and spill_info.get("shared_bytes", 0) >
               _max_shared_bytes_per_block(target_arch)):
-            reject_reasons.setdefault(cid, []).append(
-                f"[{variant_label}] shared_bytes={spill_info.get('shared_bytes', 0)} "
-                f"> architectural block limit={_max_shared_bytes_per_block(target_arch)}")
+            _record_reject(
+                cid, variant_label,
+                f"shared_bytes={spill_info.get('shared_bytes', 0)} > "
+                f"architectural block limit={_max_shared_bytes_per_block(target_arch)}")
         elif (stage == "k2" and K2_MAX_SHARED_BYTES > 0 and
               spill_info.get("shared_bytes", 0) > K2_MAX_SHARED_BYTES):
-            reject_reasons.setdefault(cid, []).append(
-                f"[{variant_label}] shared_bytes={spill_info.get('shared_bytes', 0)} "
-                f"> K2_MAX_SHARED_BYTES={K2_MAX_SHARED_BYTES}")
+            _record_reject(
+                cid, variant_label,
+                f"shared_bytes={spill_info.get('shared_bytes', 0)} > "
+                f"K2_MAX_SHARED_BYTES={K2_MAX_SHARED_BYTES}")
 
-    filtered = []
-    rejected = []
-    # ── Per-config occupancy: minimum CTAs/SM over all shipped variants ──
-    # We take the min so the autotune grid never over-launches beyond what
-    # the tightest variant supports.  Both K1 and K2 publish exact-config
-    # occupancy; the old fixed K1=2 assumption under-launched the sm86 winner.
+    # ── Per-config occupancy from each exact shipping specialization ──────
     occ_map: dict = {}
     variant_occ_map: dict = {}
     for cfg, variant_label, spill_info, error in results:
@@ -2268,39 +2373,76 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
             vprev = variant_occ_map.get(vkey)
             variant_occ_map[vkey] = cur if vprev is None else min(vprev, cur)
 
-    for cfg in configs:
-        reasons = reject_reasons.get(_cfg_id(cfg))
-        if reasons:
-            rejected.append((cfg, "; ".join(reasons)))
-        else:
-            filtered.append(cfg)
+    filtered = []
+    rejected = []
+    variant_disabled = []
+    if stage == "k2":
+        _K2_CFG_VALID_BY_BIAS.clear()
+        for cfg in configs:
+            cid = _cfg_id(cfg)
+            legal_any = False
+            for has_bias in (False, True):
+                reasons = variant_reject_reasons.get((cid, has_bias))
+                valid = not reasons
+                _K2_CFG_VALID_BY_BIAS[(_cfg_occupancy_key(cfg), has_bias)] = valid
+                legal_any = legal_any or valid
+                if reasons:
+                    variant_disabled.append(
+                        (cfg, has_bias, "; ".join(reasons)))
+            if legal_any:
+                filtered.append(cfg)
+            else:
+                rejected.append((cfg, "; ".join(reject_reasons.get(
+                    cid, ["no legal shipping specialization"]))))
+    else:
+        for cfg in configs:
+            reasons = reject_reasons.get(_cfg_id(cfg))
+            if reasons:
+                rejected.append((cfg, "; ".join(reasons)))
+            else:
+                filtered.append(cfg)
 
     occupancy_dst = _K1_CFG_OCCUPANCY if stage == "k1" else _K2_CFG_OCCUPANCY
     occupancy_dst.clear()
-    for cfg in filtered:
-        occ = occ_map.get(_cfg_id(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
-        occupancy_dst[_cfg_occupancy_key(cfg)] = int(occ)
     if stage == "k2":
         _K2_CFG_OCCUPANCY_BY_BIAS.clear()
         for cfg in filtered:
             cid = _cfg_id(cfg)
+            valid_occs = []
             for has_bias in (False, True):
+                key = (_cfg_occupancy_key(cfg), has_bias)
+                if not _K2_CFG_VALID_BY_BIAS.get(key, False):
+                    continue
                 occ = variant_occ_map.get(
-                    (cid, has_bias),
-                    occ_map.get(cid, AUTOTUNE_OCCUPANCY_ASSUMPTION))
-                _K2_CFG_OCCUPANCY_BY_BIAS[(_cfg_occupancy_key(cfg), has_bias)] = int(occ)
+                    (cid, has_bias), AUTOTUNE_OCCUPANCY_ASSUMPTION)
+                _K2_CFG_OCCUPANCY_BY_BIAS[key] = int(occ)
+                valid_occs.append(int(occ))
+            occupancy_dst[_cfg_occupancy_key(cfg)] = (
+                min(valid_occs) if valid_occs else AUTOTUNE_OCCUPANCY_ASSUMPTION)
+    else:
+        for cfg in filtered:
+            occ = occ_map.get(_cfg_id(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
+            occupancy_dst[_cfg_occupancy_key(cfg)] = int(occ)
 
     if rejected:
-        print(f"    [spill-check] {stage}: REJECTED {len(rejected)} configs "
-              f"(zero-tolerance: any spill in any shipped variant = reject):", flush=True)
+        print(f"    [spill-check] {stage}: globally rejected {len(rejected)} "
+              f"config(s):", flush=True)
         for cfg, reason in rejected[:10]:
             mr = getattr(cfg, 'maxnreg', None)
-            print(f"      REJECT {cfg.kwargs} W={cfg.num_warps} S={cfg.num_stages} MR={mr}: {reason}", flush=True)
+            print(f"      REJECT {cfg.kwargs} W={cfg.num_warps} "
+                  f"S={cfg.num_stages} MR={mr}: {reason}", flush=True)
         if len(rejected) > 10:
             print(f"      ... and {len(rejected) - 10} more", flush=True)
-    else:
-        print(f"    [spill-check] {stage}: all {len(configs)} configs are spill-free "
-              f"in all shipped variants", flush=True)
+    if stage == "k2" and variant_disabled:
+        print(f"    [spill-check] k2: disabled {len(variant_disabled)} "
+              f"individual BIAS/NOBIAS specialization(s); other variants remain",
+              flush=True)
+        for cfg, has_bias, reason in variant_disabled[:10]:
+            print(f"      DISABLE {'BIAS' if has_bias else 'NOBIAS'} "
+                  f"{cfg.kwargs}: {reason}", flush=True)
+    if not rejected and not variant_disabled:
+        print(f"    [spill-check] {stage}: all {len(configs)} configs are "
+              f"spill-free in all shipped variants", flush=True)
 
     return filtered
 
@@ -2314,10 +2456,9 @@ def _filter_spilling_configs(configs, jit_fn, stage, target_arch):
 # ``benchmark_k2_tuning_space_hybrid.py`` uses a fixed ``warmup=20``,
 # ``iters=50`` CUDA-event loop and consistently ranks the same config
 # combinations — with ~0.5% run-to-run noise vs. the ~2% swings we saw
-# from Triton's built-in.  K2 v10 retains that fixed event methodology but
-# benchmarks the exact plugin sequence (prefix launch + padded tail launch +
-# copy-back) over every production shape, rather than one artificial M=3072
-# gate-projection launch.
+# from Triton's built-in.  K2 v12 retains that fixed event methodology and
+# benchmarks the exact one-launch masked-M plugin path over every production
+# shape, rather than one artificial M=3072 gate-projection launch.
 #
 # Environment variables (all optional):
 #   HOTSTEP_K2_BENCH_WARMUP   — warmup iterations per config (default 20)
@@ -2410,12 +2551,12 @@ def _k2_workload(has_bias):
 
 
 def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
-                         stride_xsg=None):
+                         stride_xsg=None, reference=False):
     """Launch one K2 config with the occupancy-scaled production grid.
 
-    Uses ``kernel2_gemm_dequant.fn[grid](...)`` (the raw JITFunction, no
-    autotune wrapping) with the config's constexprs passed explicitly so
-    each call is a straight launch — no measurement is done here.
+    Shipping candidates call the raw Gluon JIT function with compiler staging
+    disabled (the kernel has its own cp.async ring).  ``reference=True`` calls
+    the retained Triton v10 oracle and is used only for the bitwise gate.
     """
     xq, xs, wq, ws, bias, y = tensors
     if stride_xsg is None:
@@ -2443,11 +2584,17 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
     kwargs["HAS_BIAS"] = _K2_ACTIVE_HAS_BIAS
     kwargs["OUTPUT_FP16"] = output_fp16
     kwargs["num_warps"] = cfg.num_warps
-    kwargs["num_stages"] = cfg.num_stages
+    # Explicit Gluon cp.async staging must not be pipelined a second time by
+    # compiler options.  The reference retains its historical Config stages.
+    kwargs["num_stages"] = cfg.num_stages if reference else 1
     mr = getattr(cfg, "maxnreg", None)
     if mr is not None:
         kwargs["maxnreg"] = mr
-    kernel2_gemm_dequant.fn[grid](
+    launch_fn = (kernel2_gemm_dequant_reference if reference
+                 else kernel2_gemm_dequant)
+    if launch_fn is None:
+        _require_gluon_for_k2()
+    launch_fn[grid](
         xq, xs, wq, ws, bias, y,
         M, N, K,
         K, 1,
@@ -2480,8 +2627,9 @@ def _make_k2_production_bench_pack(configs, M, N, K, has_bias, output_fp16,
     n_groups = K // GROUP_SIZE
     xs_valid = torch.rand((n_groups, M), generator=gen, device="cuda",
                           dtype=torch.float32) * 0.02 + 0.001
-    pitches = sorted({_math.ceil(M / c.kwargs["BLOCK_M"]) * c.kwargs["BLOCK_M"]
-                      for c in configs})
+    pitches = sorted(
+        {M} | {_math.ceil(M / c.kwargs["BLOCK_M"]) * c.kwargs["BLOCK_M"]
+               for c in configs})
     xs_by_pitch = {}
     for pitch in pitches:
         xs = torch.zeros((n_groups, pitch), device="cuda", dtype=torch.float32)
@@ -2504,26 +2652,33 @@ def _make_k2_production_bench_pack(configs, M, N, K, has_bias, output_fp16,
 
 
 def _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms,
-                                   output_fp16):
-    """Mirror plugin enqueue: aligned prefix, padded tail, then copy-back."""
+                                   output_fp16, reference=False):
+    """Mirror the shipping launch; retain split-tail only for the v10 oracle."""
+    if not reference:
+        # Version 12 masks the final M tile in-kernel.  Public prequantized
+        # tensors and private K1 tensors are both tightly packed, and K2 writes
+        # the real output directly in one persistent launch.
+        xs = pack["xs_by_pitch"][M]
+        return _launch_k2_for_bench(
+            cfg,
+            (pack["xq"], xs, pack["wq"], pack["ws"], pack["bias"], pack["y"]),
+            M, N, K, num_sms, output_fp16, stride_xsg=M,
+            reference=False)
+
+    # The immutable unmasked Triton oracle still needs the old split/copy path;
+    # only its resulting bits are compared, never its timing.
     bm = cfg.kwargs["BLOCK_M"]
     m_aligned = M - (M % bm)
     m_padded = _math.ceil(M / bm) * bm
     xs = pack["xs_by_pitch"][m_padded]
     total_ctas = 0
 
-    # enqueue() zero-fills padded K1 workspace on every call.  Include those
-    # operations because BLOCK_M controls the amount of padding and can change
-    # the real end-to-end ranking.
-    if m_padded > M:
-        pack["xq"][M:m_padded].zero_()
-        xs[:, M:m_padded].zero_()
-
     if m_aligned > 0:
         total_ctas += _launch_k2_for_bench(
             cfg,
             (pack["xq"], xs, pack["wq"], pack["ws"], pack["bias"], pack["y"]),
-            m_aligned, N, K, num_sms, output_fp16, stride_xsg=m_padded)
+            m_aligned, N, K, num_sms, output_fp16, stride_xsg=m_padded,
+            reference=reference)
     if m_aligned < M:
         tail_rows = M - m_aligned
         xq_tail = pack["xq"][m_aligned:]
@@ -2532,7 +2687,8 @@ def _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms,
         total_ctas += _launch_k2_for_bench(
             cfg,
             (xq_tail, xs_tail, pack["wq"], pack["ws"], pack["bias"], y_tail),
-            bm, N, K, num_sms, output_fp16, stride_xsg=m_padded)
+            bm, N, K, num_sms, output_fp16, stride_xsg=m_padded,
+            reference=reference)
         # Contiguous copy_ lowers to the same D2D copy class used by enqueue.
         pack["y"][m_aligned:M].copy_(y_tail[:tail_rows])
     return total_ctas
@@ -2540,7 +2696,7 @@ def _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms,
 
 def _bench_k2_config_production(cfg, pack, M, N, K, num_sms, output_fp16,
                                 warmup=None, iters=None):
-    """Time the exact two-launch/copy production sequence for one config."""
+    """Time the exact single-launch masked-M production path."""
     import torch
     warmup = K2_BENCH_WARMUP if warmup is None else warmup
     iters = K2_BENCH_ITERS if iters is None else iters
@@ -2582,9 +2738,8 @@ def _tensor_bitwise_equal(a, b):
 def _bench_k2_workload(configs, num_sms, has_bias, output_fp16):
     """Select one K2 cubin on the weighted, exact plugin workload.
 
-    Each candidate must first match the previously shipped K2 output bitwise on
-    every production shape.  Timing includes the real M-aligned prefix launch,
-    padded tail launch and copy-back instead of the old single M=3072 launch.
+    Each candidate must first match the v10 oracle bitwise on every production
+    shape.  Timing covers the version-12 single persistent launch at real M.
     """
     import torch
 
@@ -2610,7 +2765,8 @@ def _bench_k2_workload(configs, num_sms, has_bias, output_fp16):
         # Current shipped arithmetic/scheduler is the immutable numerical
         # reference, but it is timed only if present as a normal candidate.
         _launch_k2_production_sequence(
-            reference, pack, M, N, K, num_sms, output_fp16)
+            reference, pack, M, N, K, num_sms, output_fp16,
+            reference=True)
         torch.cuda.synchronize()
         if not torch.isfinite(pack["y"]).all().item():
             raise SystemExit(
@@ -2682,10 +2838,8 @@ def _print_k2_workload_topn(results, topn=None):
             continue
         print(f"      total={ms:9.4f} ms  BM={cfg.kwargs['BLOCK_M']} "
               f"BN={cfg.kwargs['BLOCK_N']} BK={cfg.kwargs['BLOCK_K']} "
-              f"GM={cfg.kwargs['GROUP_M']} "
-              f"SCH={'2D' if cfg.kwargs.get('SCHEDULE_2D', False) else '1D'} "
-              f"INNER={'DYN' if cfg.kwargs.get('DYNAMIC_INNER', False) else 'STATIC'} "
-              f"W={cfg.num_warps} S={cfg.num_stages} "
+              f"GM={cfg.kwargs['GROUP_M']} WM={cfg.kwargs.get('WARPS_M', '-')} "
+              f"BUF={cfg.kwargs.get('NUM_BUFFERS', '-')} W={cfg.num_warps} "
               f"MR={getattr(cfg, 'maxnreg', None)}", flush=True)
 
 
@@ -2705,10 +2859,9 @@ def _print_k2_bench_topn(results, M, K, N, topn=None):
         print(f"      {ms:7.4f} ms  {tops:6.2f} TOPS  grid={grid_x:4d}  "
               f"BM={cfg.kwargs.get('BLOCK_M')} BN={cfg.kwargs.get('BLOCK_N')} "
               f"BK={cfg.kwargs.get('BLOCK_K')} GM={cfg.kwargs.get('GROUP_M')} "
-              f"SCH={'2D' if cfg.kwargs.get('SCHEDULE_2D', False) else '1D'} "
-              f"INNER={'DYN' if cfg.kwargs.get('DYNAMIC_INNER', False) else 'STATIC'} "
-              f"W={cfg.num_warps} S={cfg.num_stages} MR={mr}",
-              flush=True)
+              f"WM={cfg.kwargs.get('WARPS_M', '-')} "
+              f"BUF={cfg.kwargs.get('NUM_BUFFERS', '-')} "
+              f"W={cfg.num_warps} MR={mr}", flush=True)
 
 
 def _launch_k1_raw_config(cfg, x, xq, xs, M, K, stride_xsg, num_sms):
@@ -2921,14 +3074,20 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
         _K2_ACTIVE_HAS_BIAS = _has_bias
         for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
             config_name = f"{bias_suffix}_{dtype_suffix}"
-            print(f"\n  K2 G256 {config_name} (custom-bench selection)...", flush=True)
-            _parallel_precompile_k2(_K2_CONFIGS, output_fp16)
-            # Select on all production shape families, using the exact enqueue
-            # sequence (aligned prefix + padded tail + copy-back).  Every
-            # candidate must first match the previously shipped K2 output
+            variant_configs = [
+                cfg for cfg in _K2_CONFIGS
+                if _K2_CFG_VALID_BY_BIAS.get(
+                    (_cfg_occupancy_key(cfg), bool(_has_bias)), True)
+            ]
+            print(f"\n  K2 G256 {config_name} (Gluon custom-bench selection, "
+                  f"{len(variant_configs)} legal configs)...", flush=True)
+            _parallel_precompile_k2(variant_configs, output_fp16, arch)
+            # Select on all production shape families using the exact masked-M
+            # single-launch enqueue path.  Every candidate must first match the
+            # previously shipped K2 output
             # bit-for-bit on every shape.
             best_cfg, bench_results = _bench_k2_workload(
-                _K2_CONFIGS, num_sms, _has_bias, output_fp16)
+                variant_configs, num_sms, _has_bias, output_fp16)
             if best_cfg is None:
                 failures = [err for _, _, _, err in bench_results if err]
                 raise SystemExit(
@@ -2936,29 +3095,23 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                     f"config passed all shapes. First failures: {failures[:3]}")
             _print_k2_workload_topn(bench_results)
 
-            # Recreate the primary shape and launch the winner so the exact JIT
-            # cache entry is present for artifact extraction.
-            M, K, N = AUTOTUNE_SHAPES_K2[0]
-            primary_pack = _make_k2_production_bench_pack(
-                [best_cfg], M, N, K, _has_bias, output_fp16, seed=0x4B32FFFF)
-            _launch_k2_production_sequence(
-                best_cfg, primary_pack, M, N, K, num_sms, output_fp16)
-            torch.cuda.synchronize()
-
-            kernel, best_cfg, cache_dir = _get_compiled_kernel_for_cfg(
-                kernel2_gemm_dequant, best_cfg,
-                debug_dump=debug_dump,
-                GROUP_SIZE=GROUP_SIZE,
-                HAS_BIAS=_has_bias,
-                OUTPUT_FP16=output_fp16,
-            )
+            # Gluon has no @triton.autotune wrapper/cache walk.  Compile the
+            # exact signature/attrs specialization used by the spill gate and
+            # harvest that CompiledKernel directly (normally a disk-cache hit).
+            kernel = _compile_gluon_k2(
+                best_cfg, _has_bias, output_fp16, arch)
+            cache_dir = _get_kernel_cache_dir(kernel)
+            if debug_dump:
+                print(f"    [gluon-cache] winner cache_dir={cache_dir}", flush=True)
 
             block_m = best_cfg.kwargs["BLOCK_M"]
             block_n = best_cfg.kwargs["BLOCK_N"]
             block_k_winning = best_cfg.kwargs["BLOCK_K"]
             group_m = best_cfg.kwargs["GROUP_M"]
-            schedule_2d = bool(best_cfg.kwargs.get("SCHEDULE_2D", False))
-            dynamic_inner = bool(best_cfg.kwargs.get("DYNAMIC_INNER", False))
+            warp_m = best_cfg.kwargs["WARPS_M"]
+            num_buffers = best_cfg.kwargs["NUM_BUFFERS"]
+            schedule_2d = False
+            dynamic_inner = True
             nw = best_cfg.num_warps
             ns = best_cfg.num_stages
             mr = getattr(best_cfg, "maxnreg", None)
@@ -2982,7 +3135,7 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                     f"({spill_info['method']}: local_bytes={spill_info['local_bytes']}, "
                     f"ptx_spills={spill_info['ptx_spills']}, regs={spill_info['registers']}). "
                     f"Config: BM={block_m} BN={block_n} BK={block_k_winning} "
-                    f"GM={group_m} W={nw} S={ns} MR={mr}. "
+                    f"GM={group_m} WM={warp_m} W={nw} BUF={num_buffers} MR={mr}. "
                     f"Zero tolerance: refusing to write a spilling cubin into "
                     f"the generated header."
                 )
@@ -2998,10 +3151,9 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             if win_row is not None:
                 _, win_ms = win_row
                 win_note = f", modeled total K2={win_ms:.4f} ms/engine-call"
-            schedule_name = "2D" if schedule_2d else "1D-GROUP_M"
-            inner_name = "DYNAMIC-REUSE" if dynamic_inner else "STATIC-UNROLLED"
-            print(f"  -> Custom-bench winner: BM={block_m} BN={block_n} BK={block_k_winning} GM={group_m} "
-                  f"schedule={schedule_name} inner={inner_name} W={nw} S={ns} MR={mr}"
+            print(f"  -> Gluon custom-bench winner: BM={block_m} BN={block_n} "
+                  f"BK={block_k_winning} GM={group_m} WM={warp_m} "
+                  f"W={nw} BUF={num_buffers} MR={mr}"
                   f"{occ_note}{win_note}", flush=True)
             print(
                 f"     shared={shared/1024:.0f}KB, cubin={len(cubin)}B, "
@@ -3025,6 +3177,8 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
                 "block_n": int(block_n),
                 "block_k": int(block_k_winning),
                 "group_m": int(group_m),
+                "warp_m": int(warp_m),
+                "num_buffers": int(num_buffers),
                 "schedule_2d": schedule_2d,
                 "dynamic_inner": dynamic_inner,
                 "num_warps": nw,
@@ -3065,9 +3219,9 @@ def write_header(k1_results, k2_results, output_path):
         "#include <cuda.h>",
         "",
         "// AUTO-GENERATED by tools/onnx-export/extract_jit_cubins_autotune.py.",
-        "// Cubins extracted from Triton's JIT cache after @triton.autotune.",
-        "// NO triton.compile() / AOT path was used — these are the exact cubins",
-        "// that Triton's JIT produced and autotune benchmarked as fastest.",
+        "// K1 comes from Triton's JIT cache; K2 is the exact GluonASTSource",
+        "// specialization compiled, bitwise-gated, and custom-benchmarked here.",
+        "// Only production FP16IO specializations are embedded.",
         "// Runtime parameter packing below is generated from CompiledKernel.src.signature",
         "// and cross-checked against the PTX .entry prototype for the same cubin.",
         f"#define CONVROT_INT8_CUBIN_HEADER_VERSION {CONVROT_INT8_CUBIN_HEADER_VERSION}",
@@ -3512,7 +3666,7 @@ def write_header(k1_results, k2_results, output_path):
         "",
         "} // namespace hotstep::convrot_int8_generated",
         "",
-        "// End of generated Triton cubins and launch descriptors.",
+        "// End of generated Triton/Gluon cubins and launch descriptors.",
     ]
     output_path.write_text("\n".join(header_lines) + "\n")
     print(f"\n[extract_jit_cubins_autotune] Wrote {total} cubins to {output_path}", flush=True)
@@ -3585,21 +3739,17 @@ def main():
     _K1_CONFIGS[:] = _estimate_k1_configs(
         num_sms, l2_bytes, shared_mem_per_sm, AUTOTUNE_SHAPES_K2,
         target_backend=target_backend, target_arch=target_arch)
-    # Arch-dispatched K2 config builder.  Pass arch so the config space is
-    # tailored to the target GPU's smem budget, L2 size, and CTA cap.
-    _K2_CONFIGS[:] = _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm,
-                                          AUTOTUNE_SHAPES_K2, arch=arch)
-    _K2_CONFIGS[:] = _add_sm_aware_tile_candidates(
-        _K2_CONFIGS, num_sms, AUTOTUNE_SHAPES_K2)
-    _K2_CONFIGS[:] = _add_k2_small_m_candidates(_K2_CONFIGS, arch)
-    _K2_CONFIGS[:] = _add_k2_2d_schedule_candidates(_K2_CONFIGS, arch)
-    _K2_CONFIGS[:] = _add_k2_dynamic_inner_candidates(_K2_CONFIGS, arch)
+    if target_backend != "cuda":
+        raise SystemExit("[K2 dispatch] Gluon K2 requires the CUDA backend")
+    _require_gluon_for_k2()
+    # The Gluon builder is already the complete, deliberately bounded search
+    # space; do not feed it the old Triton auto-layout candidate injectors.
+    _K2_CONFIGS[:] = _estimate_k2_configs(
+        num_sms, l2_bytes, shared_mem_per_sm, AUTOTUNE_SHAPES_K2, arch=arch)
     # The plugin's workspace/tail contract is strict; never benchmark a tile
     # that could win extraction but be rejected by enqueue.
-    _K2_CONFIGS[:] = [
-        c for c in _K2_CONFIGS
-        if c.kwargs.get("BLOCK_M", 0) <= K2_AUTOTUNE_M_ALIGNMENT
-    ]
+    _K2_CONFIGS[:] = [c for c in _K2_CONFIGS
+                      if c.kwargs["BLOCK_M"] <= K2_AUTOTUNE_M_ALIGNMENT]
 
     # ── Register spill filtering (patch review §8) ───────────────────────
     # Triton will SILENTLY spill registers to local memory (DRAM) when a
@@ -3613,12 +3763,12 @@ def main():
     _K2_CONFIGS[:] = _filter_spilling_configs(_K2_CONFIGS, kernel2_gemm_dequant, "k2", arch)
 
     kernel1_convrot_quant.configs = _K1_CONFIGS
-    kernel2_gemm_dequant.configs = _K2_CONFIGS
 
     print(f"[extract_jit_cubins_autotune] GROUP_SIZE={GROUP_SIZE}", flush=True)
     print(f"[extract_jit_cubins_autotune] K2 max shared cap: {K2_MAX_SHARED_BYTES if K2_MAX_SHARED_BYTES > 0 else 'disabled'} bytes", flush=True)
     print(f"[extract_jit_cubins_autotune] K1 configs: {len(_K1_CONFIGS)} (heuristic-pruned + spill-filtered)", flush=True)
-    print(f"[extract_jit_cubins_autotune] K2 configs: {len(_K2_CONFIGS)} (heuristic-pruned + SM-aware + spill-filtered)", flush=True)
+    print(f"[extract_jit_cubins_autotune] K2 configs: {len(_K2_CONFIGS)} "
+          f"(explicit Gluon layouts + spill-filtered)", flush=True)
     # Every timed candidate uses the occupancy derived from its exact compiled
     # specialization, matching the production persistent-grid formula.
     from collections import Counter
