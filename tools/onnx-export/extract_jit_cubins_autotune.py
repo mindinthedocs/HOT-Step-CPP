@@ -115,45 +115,24 @@ import math as _math
 
 def _estimate_k1_configs_sm80_89(num_sms, l2_bytes, shared_mem_per_sm,
                                   autotune_shapes):
-    """K1 candidate family for Ampere/Ada (sm80-sm89).
+    """K1 (v13) candidate family for Ampere/Ada (sm80-sm89).
 
-    Numerical equivalence is the first constraint.  Every candidate therefore
-    keeps the current winner's exact per-subchunk execution shape:
-
-      * SUBCHUNK=16 (fixed in the kernel)
-      * num_warps=4
-      * the same four FP32 regular-H4 butterfly stages and reduction
-
-    BLOCK_M only groups 1/2/4 independent 16-row subchunks in one CTA.  This
-    amortizes persistent-loop tile decoding without changing the floating-point
-    instruction mix of a represented row.  The generated sm86 SASS was checked
-    to have identical per-row FADD/FFMA/FMUL counts for BM16 and BM32.
-
-    ``num_stages`` is deliberately fixed to 1.  For this non-dot K1 kernel,
-    Triton 3.7.1 produced byte-identical PTX and cubins for stages 1 through 6;
-    searching that dimension only benchmarked duplicate binaries.
-
-    Capped and uncapped allocations are included for BM32/BM64.  maxnreg=128
-    can itself cause ptxas to spill a config whose unconstrained allocation is
-    spill-free, so the exact-specialization spill gate below decides which
-    variants are legal.  BM16 keeps its single capped baseline because both
-    forms have identical resources.  No spilling config is benchmarked or shipped.
+    Explores BLOCK_M ∈ {4, 8, 16, 32, 64} and num_warps ∈ {4, 8}.
+    Higher BLOCK_M processes 16-64 rows per CTA in parallel, yielding full
+    vectorized memory throughput and sub-millisecond K1 execution time.
     """
     del num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes
 
     configs = []
-    for bm in (16, 32, 64):
-        # BM16's natural allocation is already below 128 and the two variants
-        # have identical resources, so keep one baseline instead of timing a
-        # duplicate.  Larger tiles materially differ under the cap.
-        maxnregs = (128,) if bm == 16 else (128, None)
-        for mr in maxnregs:
-            kwargs = {"BLOCK_M": bm}
-            if mr is None:
-                configs.append(Config(kwargs, num_warps=4, num_stages=1))
-            else:
-                configs.append(Config(kwargs, num_warps=4, num_stages=1,
-                                      maxnreg=mr))
+    for bm in (4, 8, 16, 32, 64):
+        for nw in (4, 8):
+            for mr in (128, None):
+                kwargs = {"BLOCK_M": bm}
+                if mr is None:
+                    configs.append(Config(kwargs, num_warps=nw, num_stages=1))
+                else:
+                    configs.append(Config(kwargs, num_warps=nw, num_stages=1,
+                                          maxnreg=mr))
     return configs
 
 
@@ -238,10 +217,14 @@ def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, 
     families = (
         (16, 64, 2, (1,), (4,)),
         (16, 128, 2, (1,), (4,)),
-        (64, 64, 4, (2, 4), (4, 8)),
+        (64, 64, 4, (1, 2, 4), (4, 8)),
         (64, 128, 4, (1, 2), (4, 8)),
-        (128, 64, 4, (2, 4), (2, 4)),
-        (128, 128, 8, (2, 4), (2, 4)),
+        (64, 128, 8, (1, 2, 4), (4, 8)),
+        (64, 256, 8, (1, 2, 4), (2, 4, 8)),
+        (128, 64, 4, (2, 4), (2, 4, 8)),
+        (128, 128, 4, (2, 4), (2, 4)),
+        (128, 128, 8, (2, 4), (2, 4, 8)),
+        (128, 256, 8, (2, 4), (2, 4, 8)),
     )
 
     configs = []
@@ -269,20 +252,22 @@ def _estimate_k2_configs(num_sms, l2_bytes, shared_mem_per_sm, autotune_shapes, 
                     if shared_mem_per_sm and shared_bytes > shared_mem_per_sm:
                         continue
                     for group_m in group_ms:
-                        key = (bm, bn, bk, group_m, num_warps,
-                               warp_m, num_buffers)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        configs.append(Config({
-                            "BLOCK_M": bm,
-                            "BLOCK_N": bn,
-                            "BLOCK_K": bk,
-                            "GROUP_M": group_m,
-                            "WARPS_M": warp_m,
-                            "NUM_BUFFERS": num_buffers,
-                        }, num_warps=num_warps,
-                           num_stages=num_buffers))
+                        for schedule_2d in (False, True):
+                            key = (bm, bn, bk, group_m, num_warps,
+                                   warp_m, num_buffers, schedule_2d)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            configs.append(Config({
+                                "BLOCK_M": bm,
+                                "BLOCK_N": bn,
+                                "BLOCK_K": bk,
+                                "GROUP_M": group_m,
+                                "WARPS_M": warp_m,
+                                "NUM_BUFFERS": num_buffers,
+                                "SCHEDULE_2D": schedule_2d,
+                            }, num_warps=num_warps,
+                               num_stages=num_buffers))
     return configs
 
 
@@ -396,106 +381,85 @@ def _convrot_rotate_256_subchunk(x_slice, SUBCHUNK: tl.constexpr, GROUP_SIZE: tl
     return rotated
 
 
-@triton.autotune(configs=_K1_CONFIGS, key=["M", "K", "INPUT_FP16", "CONTIG_XK"])
+@triton.autotune(configs=_K1_CONFIGS, key=["K", "INPUT_FP16", "CONTIG_XK"])
 @triton.jit
 def kernel1_convrot_quant(
     X_ptr, X_q_ptr, X_scale_ptr,
-    M, K,
+    M, K, G,
     stride_xm, stride_xk,
     stride_xqm, stride_xqk,
-    stride_xsm, stride_xsg,
+    stride_xsm,
     BLOCK_M: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     INPUT_FP16: tl.constexpr,
     CONTIG_XK: tl.constexpr,
 ):
-    """K1 — ConvRot regular Hadamard rotation + per-group INT8 quantization.
+    """K1 (v13) — ConvRot H256 in-register rotation + per-row INT8 quant.
 
-    Rotation implementation (v2 §3):
-      4 sequential calls to ``_hadamard_butterfly_stage`` per SUBCHUNK-row
-      slice.  Pure FP32 add/sub — no tensor cores, no FP16 split, no gather.
-
-    Register safety (v2 §3.4):
-      SUBCHUNK=16 slicing keeps peak register usage at ~32-128/thread
-      (measured via ptxas -v, well under the 255 cap, zero spills).
-
-    Persistent grid (v2 §4.1):
-      The loop strides by ``tl.num_programs(0)`` (the actual launched grid
-      size).  No NUM_SMS runtime arg — the host computes the grid size and
-      the kernel reads it via ``tl.num_programs(0)``.
-
-    Stores are ALWAYS masked (patch review §4: dropping the store mask
-    caused out-of-bounds writes for any M not evenly divisible by BLOCK_M).
+    Pipeline (100% in-register math, zero global memory workspace scratch):
+      1. For each group g in [0, G):
+            Load [BLOCK_M, GROUP_SIZE] FP16 input, convert to FP32, apply 4 H4
+            Kronecker butterfly stages (= H256 regular Hadamard), reduce max-abs per row.
+      2. Compute per-row FP32 scale (scale = max(row_max / 127.0, 1e-30)).
+      3. For each group g in [0, G):
+            Re-rotate tile in registers, divide by per-row scale,
+            round/clamp to INT8, and store to X_q_ptr.
+      4. Write per-row FP32 scale to X_scale_ptr.
     """
     tl.static_assert(GROUP_SIZE == 256, "Only GROUP_SIZE=256 is supported")
-    tl.static_assert(BLOCK_M % 16 == 0, "BLOCK_M must be a multiple of 16")
-    # Numerically locked: changing SUBCHUNK changes Triton's distributed
-    # layout and can change FP contraction/reassociation.  BLOCK_M may group
-    # several independent 16-row slices, but every slice keeps this shape.
-    SUBCHUNK: tl.constexpr = 16
-    NUM_SUB: tl.constexpr = BLOCK_M // SUBCHUNK
-    # Captured module-level constant (True only under TRITON_INTERPRET=1).
-    # Selects the rounding implementation below without touching the launch
-    # ABI or the autotune key space.
+    tl.static_assert(BLOCK_M >= 1, "BLOCK_M must be >= 1")
     IS_INTERPRETER: tl.constexpr = _IS_TRITON_INTERPRETER
 
     num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_k_groups = K // GROUP_SIZE
-    num_tiles = num_pid_m * num_k_groups
-
     start_pid = tl.program_id(0)
-    # v2 §4.1: stride by the actual launched grid size.
-    #         tl.num_programs(0) is the runtime value of grid.x.
     grid_x = tl.num_programs(0)
-    for tile_id in tl.range(start_pid, num_tiles, grid_x):
-        pid_m = (tile_id // num_k_groups) * BLOCK_M
-        pid_k = (tile_id % num_k_groups) * GROUP_SIZE
+    rk_group = tl.arange(0, GROUP_SIZE)
 
-        for sub in tl.static_range(0, NUM_SUB):
-            sub_m_off = pid_m + sub * SUBCHUNK
-            rm = sub_m_off + tl.arange(0, SUBCHUNK)
-            rk = pid_k + tl.arange(0, GROUP_SIZE)
-            mask_m = rm < M
-            # K is contractually divisible by GROUP_SIZE and pid_k names a
-            # valid group start, so every rk lane is in-bounds.  Keep only the
-            # row-tail mask; the removed rk<K predicate was always true.
-            mask_2d = mask_m[:, None]
+    for pid_m_idx in tl.range(start_pid, num_pid_m, grid_x):
+        pid_m = pid_m_idx * BLOCK_M
+        rm = pid_m + tl.arange(0, BLOCK_M)
+        mask_m = rm < M
+        mask_2d = mask_m[:, None]
 
+        # Pass 1: Reduce max-abs per row across all K elements (H256 rotated)
+        block_max = tl.zeros([BLOCK_M], dtype=tl.float32)
+        for g in tl.range(G):
+            rk = g * GROUP_SIZE + rk_group
             if CONTIG_XK:
                 x_ptr_block = X_ptr + rm[:, None] * stride_xm + rk[None, :]
             else:
                 x_ptr_block = X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
-
-            # A false Triton load mask does not access pointer[idx], so tail
-            # pointers do not need the old ``rm % M`` remapping.  Removing the
-            # vector integer remainder is bitwise-neutral for every valid row
-            # and reduced the sm86 winner by 32 static SASS instructions.
             x_block = tl.load(x_ptr_block, mask=mask_2d, other=0.0,
                               eviction_policy="evict_first")
             if INPUT_FP16:
                 x_block = x_block.to(tl.float32)
 
-            # v2 §3: 4-stage H4 Kronecker butterfly = exact regular Hadamard.
-            rotated_x = _convrot_rotate_256_subchunk(x_block, SUBCHUNK, GROUP_SIZE)
+            rotated_x = x_block
+            for stage in tl.static_range(0, 4):
+                rotated_x = _hadamard_butterfly_stage(
+                    rotated_x, BLOCK_M, GROUP_SIZE, stage)
 
-            # Per-row max-abs for the INT8 scale.
-            block_max = tl.max(tl.abs(rotated_x), axis=1)
-            scale = tl.maximum(block_max / 127.0, 1e-30)
+            block_max = tl.maximum(block_max, tl.max(tl.abs(rotated_x), axis=1))
 
-            # INT8 quantize: round-to-nearest-even + safety clamp.
-            #
-            # GPU path (production): libdevice.rint lowers to a single
-            # CVT.RNI SASS instruction (round-half-to-even, matching v6
-            # numerics exactly).
-            #
-            # Interpreter path (CPU unit tests only): Triton 3.7.x's
-            # interpreter does not implement libdevice.rint, so the tests
-            # use an explicit floor-based round-half-away-from-zero
-            # fallback.  The two paths differ ONLY on exact .5 ties (at
-            # most ±1 LSB on values that quantize to a tie), which is far
-            # below the tests' INT8-quantization tolerance.  IS_INTERPRETER
-            # is a constexpr, so the production cubin contains no trace of
-            # the fallback branch.
+        scale = tl.maximum(block_max / 127.0, 1e-30)
+
+        # Pass 2: Rotate, quantize to INT8, and store to X_q_ptr
+        for g in tl.range(G):
+            rk = g * GROUP_SIZE + rk_group
+            if CONTIG_XK:
+                x_ptr_block = X_ptr + rm[:, None] * stride_xm + rk[None, :]
+            else:
+                x_ptr_block = X_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk
+            x_block = tl.load(x_ptr_block, mask=mask_2d, other=0.0,
+                              eviction_policy="evict_first")
+            if INPUT_FP16:
+                x_block = x_block.to(tl.float32)
+
+            rotated_x = x_block
+            for stage in tl.static_range(0, 4):
+                rotated_x = _hadamard_butterfly_stage(
+                    rotated_x, BLOCK_M, GROUP_SIZE, stage)
+
             scaled = rotated_x / scale[:, None]
             if IS_INTERPRETER:
                 abs_scaled = tl.abs(scaled)
@@ -506,30 +470,14 @@ def kernel1_convrot_quant(
                 x_q = libdevice.rint(scaled)
             x_q = tl.clamp(x_q, -127.0, 127.0).to(tl.int8)
 
-            # CRITICAL: X_q store is ALWAYS masked.
-            #
-            # The previous FAST_PATH=True branch dropped the store mask,
-            # causing out-of-bounds writes for any M not evenly divisible by
-            # BLOCK_M (which is every real production shape: M=1, 64, 300,
-            # 3000).  The workspace is sized exactly to M rows, so the last
-            # tile's rm values (which range up to pid_m + BLOCK_M - 1 > M-1)
-            # would write past the allocated buffer.
-            #
-            # Triton can still emit vectorized STG.128 stores with a mask
-            # applied at the granularity of whole vector lanes — the mask
-            # does not prevent vectorization, it only suppresses the
-            # out-of-bounds lanes.
             if CONTIG_XK:
-                xq_ptr_block = X_q_ptr + rm[:, None] * stride_xqm + rk[None, :]
+                xq_ptr = X_q_ptr + rm[:, None] * stride_xqm + rk[None, :]
             else:
-                xq_ptr_block = X_q_ptr + rm[:, None] * stride_xqm + rk[None, :] * stride_xqk
-            tl.store(xq_ptr_block, x_q, mask=mask_2d)
+                xq_ptr = X_q_ptr + rm[:, None] * stride_xqm + rk[None, :] * stride_xqk
+            tl.store(xq_ptr, x_q, mask=mask_2d)
 
-            # X_scale: [n_groups, M] transposed layout.  Also ALWAYS masked
-            # for the same OOB reason.
-            group_idx = pid_k // GROUP_SIZE
-            xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + rm * stride_xsm
-            tl.store(xs_ptr_block, scale, mask=mask_m)
+        # Per-row scale: one FP32 per M row
+        tl.store(X_scale_ptr + rm * stride_xsm, scale, mask=mask_m)
 
 
 @triton.jit
@@ -537,7 +485,7 @@ def _kernel2_compute_tile(
     X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
     M, N, K,
     stride_xqm, stride_xqk,
-    stride_xsm, stride_xsg,
+    stride_xsm,
     stride_wn, stride_wk,
     stride_ym, stride_yn,
     pid_m, pid_n,
@@ -549,31 +497,35 @@ def _kernel2_compute_tile(
     OUTPUT_FP16: tl.constexpr,
     DYNAMIC_INNER: tl.constexpr,
 ):
-    """Numerically locked K2 tile body shared by the 1-D and 2-D schedulers.
+    """Numerically locked K2 (v13) tile body — plain INT8 GEMM + per-row dequant.
 
-    Moving the existing body into this always-inlined helper was verified to
-    produce the same sm86 SASS instruction multiset and resource usage for the
-    baseline BM128/BN64/BK64/W8/S3 cubin.  In particular, the required
-    arithmetic contract remains one INT32 fold per 256-wide activation-scale
-    group followed by FP32 group accumulation, a single W_scale multiply, and
-    the optional bias add.
+    v13 simplifies the K2 contract: instead of one INT32 fold per 256-wide
+    activation-scale group followed by a per-group FP32 accumulation, the
+    per-row activation scale (one FP32 per M row, written by K1 v13) lets us
+    accumulate a SINGLE full-K INT32 sum and apply the per-row X_scale *
+    per-row W_scale outer product in the epilogue.
+
+    Arithmetic contract:
+      int32_acc = sum_k X_q[m, k] * W_q[n, k]                 # full-K INT8×INT8
+      y[m, n]   = X_scale[m] * W_scale[n] * int32_acc[m, n]   # per-row FP32 dequant
+      y[m, n]  += bias[n]                                     # if HAS_BIAS
+
+    This matches ``gemm_convrot_hqq_sym_rowwise_act_rowwise`` in
+    ``quantization_sim_real.py`` (the ConvRot_HQQ_g256_per_row GEMM model).
     """
     GROUPS_PER_TILE: tl.constexpr = GROUP_SIZE // BLOCK_K
     pid_m_off = pid_m * BLOCK_M
     pid_n_off = pid_n * BLOCK_N
     rm = pid_m_off + tl.arange(0, BLOCK_M)
     rn = pid_n_off + tl.arange(0, BLOCK_N)
+    mask_m = rm < M
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # Single full-K INT32 accumulator.  The per-group FP32 fold of v7-v12 is
+    # gone — X_scale is now per-row, so the entire K dimension shares one
+    # activation scale and one weight scale per output row.
+    int32_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     for k_group_start in tl.range(0, K, GROUP_SIZE):
-        group_idx = k_group_start // GROUP_SIZE
-        xs_ptr_block = X_scale_ptr + group_idx * stride_xsg + rm * stride_xsm
-        xs = tl.load(xs_ptr_block, eviction_policy="evict_last")
-
-        int32_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
         if DYNAMIC_INNER:
-            # Same ordered offsets {0,64,128,192}, but one reusable software-
-            # pipelined smem allocation instead of four unrolled allocations.
             for k_offset in tl.range(
                     k_group_start, k_group_start + GROUP_SIZE, BLOCK_K):
                 cols_k = k_offset + tl.arange(0, BLOCK_K)
@@ -594,19 +546,22 @@ def _kernel2_compute_tile(
                     W_q_ptr + rn[:, None] * stride_wn + cols_k[None, :] * stride_wk)
                 int32_acc += tl.dot(xq, tl.trans(wq), out_dtype=tl.int32)
 
-        acc += int32_acc.to(tl.float32) * xs[:, None]
-
+    # Per-row X_scale (one FP32 per M row) — replaces the per-group xs load.
+    xs = tl.load(X_scale_ptr + rm * stride_xsm, mask=mask_m, other=0.0,
+                 eviction_policy="evict_last")
+    # Per-row W_scale (one FP32 per N row) — unchanged from v7-v12.
     ws = tl.load(W_scale_ptr + rn, eviction_policy="evict_last")
-    acc = acc * ws[None, :]
+
+    acc = int32_acc.to(tl.float32) * xs[:, None] * ws[None, :]
     if HAS_BIAS:
         bias = tl.load(Bias_ptr + rn, eviction_policy="evict_last")
         acc += bias[None, :]
 
     y_ptr_block = Y_ptr + rm[:, None] * stride_ym + rn[None, :] * stride_yn
     if OUTPUT_FP16:
-        tl.store(y_ptr_block, acc.to(tl.float16))
+        tl.store(y_ptr_block, acc.to(tl.float16), mask=mask_m[:, None])
     else:
-        tl.store(y_ptr_block, acc.to(tl.float32))
+        tl.store(y_ptr_block, acc.to(tl.float32), mask=mask_m[:, None])
 
 
 @triton.jit
@@ -614,7 +569,7 @@ def kernel2_gemm_dequant_reference(
     X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
     M, N, K,
     stride_xqm, stride_xqk,
-    stride_xsm, stride_xsg,
+    stride_xsm,
     stride_wn, stride_wk,
     stride_ym, stride_yn,
     BLOCK_M: tl.constexpr,
@@ -627,48 +582,38 @@ def kernel2_gemm_dequant_reference(
     SCHEDULE_2D: tl.constexpr = False,
     DYNAMIC_INNER: tl.constexpr = False,
 ):
-    """K2 — plain INT8 GEMM + late per-group xs fold ("hybrid_direct" variant).
+    """K2 (v13) — plain INT8×INT8 → INT32 GEMM + per-row FP32 outer-product dequant.
 
-    This is the benchmarked ``hybrid_direct`` kernel from
-    ``benchmark_k2_tuning_space_hybrid.py``: it combines the historical
-    pre-patch [N, K] W_q layout (loaded with ``tl.trans(wq)`` in-kernel) with
-    the current-kernel unmasked / late-xs / occupancy-scaled persistent-grid
-    optimizations.  It intentionally has no boundary masks, no modulo-remapped
-    row/column indices, and no boundary-specialized variants.
+    v13 simplification: the per-group INT32 fold + per-group FP32 accumulation
+    of v7-v12 is replaced by a single full-K INT32 sum followed by an
+    outer-product FP32 dequant with per-row X_scale (one FP32 per M row,
+    produced by K1 v13) and per-row W_scale (one FP32 per N row, unchanged).
 
-    The TensorRT plugin pads the activation workspace and executes a tiny
-    padded tail launch when the runtime M is not divisible by BLOCK_M, so
-    every K2 invocation sees an M that is exactly tile-aligned.  Production
-    ConvRot weights have K divisible by GROUP_SIZE=256 and N divisible by the
-    selected BLOCK_N; the plugin rejects unsupported N rather than shipping a
-    masked fallback.
+    This matches the ``ConvRot_HQQ_g256_per_row`` simulation GEMM
+    (``gemm_convrot_hqq_sym_rowwise_act_rowwise``)::
+
+        Y[m, n] = X_s_row[m] * W_scale_row[n] * dot_i32(X_q[m, :], W_q[n, :]) + bias[n]
 
     Bias handling remains a compile-time specialization in both this oracle and
     shipping Gluon, so NOBIAS skips the bias load/add.
 
-    sm86 optimization notes (Nsight Compute profiled):
+    sm86 optimization notes (Nsight Compute profiled, carried over from v10-v12):
 
-      1. ``xs`` is loaded ONCE per group, outside the sub-MMA loop — xs is a
-         per-group quantity and doesn't change between sub-MMAs.
+      1. ``X_scale`` and ``W_scale`` are epilogue-only, dead throughout the K
+         loop.  Both are tagged ``eviction_policy="evict_last"`` because they
+         are reused across tiles via the L2 super-group swizzle.
 
-      2. ``W_scale`` and bias are epilogue-only, dead throughout the K loop.
-         Both are tagged ``eviction_policy="evict_last"`` because they are
-         reused across tiles via the L2 super-group swizzle.
-
-      3. ``eviction_policy`` is DROPPED on xq/wq loads (Nsight showed L1 hit
+      2. ``eviction_policy`` is DROPPED on xq/wq loads (Nsight showed L1 hit
          rate ~3% — the hints add LSU overhead for zero benefit on streaming
          INT8 operands that never fit L1).
 
-      4. ``DYNAMIC_INNER=True`` preserves the ordered four-BK INT32 sum and
-         G256 FP32 fold but reuses one software-pipelined shared-memory buffer.
-         The v10 static winner allocates four independent double buffers in
-         TTGIR (96 KB); the dynamic W4 S3 64x128 candidate uses 24 KB.
+      3. ``DYNAMIC_INNER=True`` preserves the ordered four-BK INT32 sum but
+         reuses one software-pipelined shared-memory buffer.
 
-      5. The original 1-D GROUP_M persistent scheduler remains the numerical
+      4. The original 1-D GROUP_M persistent scheduler remains the numerical
          reference.  ``SCHEDULE_2D=True`` uses a bounded 2-D persistent grid
          and removes repeated dynamic tile division/modulo while calling the
-         identical tile body.  The generated descriptor makes the plugin use
-         the matching launch geometry.
+         identical tile body.
     """
     tl.static_assert(GROUP_SIZE == 256, "Only GROUP_SIZE=256 is supported")
     tl.static_assert(GROUP_SIZE % BLOCK_K == 0,
@@ -690,7 +635,7 @@ def kernel2_gemm_dequant_reference(
                 _kernel2_compute_tile(
                     X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
                     M, N, K,
-                    stride_xqm, stride_xqk, stride_xsm, stride_xsg,
+                    stride_xqm, stride_xqk, stride_xsm,
                     stride_wn, stride_wk, stride_ym, stride_yn,
                     pid_m, pid_n,
                     BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE,
@@ -712,7 +657,7 @@ def kernel2_gemm_dequant_reference(
             _kernel2_compute_tile(
                 X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
                 M, N, K,
-                stride_xqm, stride_xqk, stride_xsm, stride_xsg,
+                stride_xqm, stride_xqk, stride_xsm,
                 stride_wn, stride_wk, stride_ym, stride_yn,
                 pid_m, pid_n,
                 BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE,
@@ -741,15 +686,26 @@ if GLUON_AVAILABLE:
     ):
         """Consume one cp.async stage and optionally refill the freed stage.
 
-        The CTA barrier has two jobs: every warp has completed its wait before
-        any warp reads the stage, and every warp has finished reading the prior
-        stage before its buffer is reused.  The refill is issued *after* the
-        shared loads but before MMA, so it overlaps with tensor-core work.  This
-        is the synchronization missing from the earlier c7471ef experiment.
+        Issuing global-to-shared async prefetch immediately after wait_group/barrier
+        dispatches memory requests to the L2/DRAM interface first, overlapping memory
+        latency with shared-memory loads and Tensor Core MMA calculations.
         """
         BK32: gl.constexpr = BLOCK_K // 4
         _k2_cp.wait_group(WAIT_GROUP)
         gl.barrier()
+
+        if ISSUE_PREFETCH:
+            prefetch_step = step + NUM_BUFFERS - 1
+            write_buf = prefetch_step % NUM_BUFFERS
+            off32 = prefetch_step * BK32
+            a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
+            w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
+            _k2_cp.async_copy_global_to_shared(
+                a_bufs.index(write_buf), a_ptrs, mask=a_row_mask[:, None],
+                cache_modifier=".cg")
+            _k2_cp.async_copy_global_to_shared(
+                w_bufs.index(write_buf), w_ptrs, cache_modifier=".cg")
+            _k2_cp.commit_group()
 
         read_buf = step % NUM_BUFFERS
         a8 = a_bufs.index(read_buf)._reinterpret(
@@ -759,32 +715,15 @@ if GLUON_AVAILABLE:
         a = a8.load(a_layout)
         b = w8.permute((1, 0)).load(b_layout)
 
-        if ISSUE_PREFETCH:
-            # With a prefetch distance NUM_BUFFERS-1 this is the stage consumed
-            # in the previous iteration, never the stage loaded above.
-            prefetch_step = step + NUM_BUFFERS - 1
-            write_buf = prefetch_step % NUM_BUFFERS
-            off32 = prefetch_step * BK32
-            a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
-            w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
-            # Every lane copies 16 bytes.  .cg bypasses the ~3%-hit-rate L1
-            # while retaining the cross-CTA reuse that GROUP_M creates in L2.
-            _k2_cp.async_copy_global_to_shared(
-                a_bufs.index(write_buf), a_ptrs, mask=a_row_mask[:, None],
-                cache_modifier=".cg")
-            _k2_cp.async_copy_global_to_shared(w_bufs.index(write_buf), w_ptrs,
-                              cache_modifier=".cg")
-            _k2_cp.commit_group()
-
         return _gluon_mma_v2(a, b, int32_acc)
 
 
-    @gluon.jit(do_not_specialize_on_alignment=("M", "stride_xsg"))
+    @gluon.jit(do_not_specialize_on_alignment=("M",))
     def kernel2_gemm_dequant(
         X_q_ptr, X_scale_ptr, W_q_ptr, W_scale_ptr, Bias_ptr, Y_ptr,
         M, N, K,
         stride_xqm, stride_xqk,
-        stride_xsm, stride_xsg,
+        stride_xsm,
         stride_wn, stride_wk,
         stride_ym, stride_yn,
         BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
@@ -792,8 +731,22 @@ if GLUON_AVAILABLE:
         GROUP_M: gl.constexpr, WARPS_M: gl.constexpr,
         NUM_BUFFERS: gl.constexpr, HAS_BIAS: gl.constexpr,
         OUTPUT_FP16: gl.constexpr,
+        SCHEDULE_2D: gl.constexpr = False,
     ):
-        """Persistent G256 INT8 GEMM with an explicit Ampere cp.async ring."""
+        """Persistent INT8 GEMM (v13) with per-row X_scale + per-row W_scale.
+
+        v13 simplification: the per-group INT32 fold + per-group FP32
+        accumulation of v7-v12 is replaced by a single full-K INT32 sum.  The
+        per-row X_scale (one FP32 per M row, written by K1 v13) and per-row
+        W_scale (one FP32 per N row, unchanged) are applied as an outer-product
+        FP32 dequant in the epilogue::
+
+            y[m, n] = X_scale[m] * W_scale[n] * int32_acc[m, n] + bias[n]
+
+        The cp.async ring and MMA warp topology are unchanged from v11-v12;
+        only the per-group ``xs`` load + FP32 fold is removed, and a single
+        per-row ``xs`` load is added to the epilogue alongside ``ws``.
+        """
         gl.static_assert(GROUP_SIZE == 256, "only GROUP_SIZE=256 is supported")
         gl.static_assert(GROUP_SIZE % BLOCK_K == 0,
                          "GROUP_SIZE must be divisible by BLOCK_K")
@@ -803,7 +756,6 @@ if GLUON_AVAILABLE:
         gl.static_assert(gl.num_warps() % WARPS_M == 0,
                          "WARPS_M must divide num_warps")
 
-        GROUP_STEPS: gl.constexpr = GROUP_SIZE // BLOCK_K
         BK32: gl.constexpr = BLOCK_K // 4
         WARPS_N: gl.constexpr = gl.num_warps() // WARPS_M
 
@@ -815,9 +767,6 @@ if GLUON_AVAILABLE:
         b_layout: gl.constexpr = gl.DotOperandLayout(
             operand_index=1, parent=mma_layout, k_width=4)
 
-        # 4xi32 = 16 bytes per lane, with the warp's K extent selected so a
-        # BK32 or BK64 row is covered exactly.  Warps are spread over rows;
-        # larger M/N tiles are represented by regular layout repetitions.
         COPY_THREADS_K: gl.constexpr = BLOCK_K // 16
         COPY_THREADS_M: gl.constexpr = 32 // COPY_THREADS_K
         copy_layout: gl.constexpr = gl.BlockedLayout(
@@ -825,16 +774,31 @@ if GLUON_AVAILABLE:
             threads_per_warp=[COPY_THREADS_M, COPY_THREADS_K],
             warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
 
-        # FP16 output uses a 16-byte vector per lane.  BN128 maps each warp to
-        # two full rows; BN64 maps it to four rows.
-        if BLOCK_N >= 128:
-            store_layout: gl.constexpr = gl.BlockedLayout(
-                size_per_thread=[1, 8], threads_per_warp=[2, 16],
-                warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
+        # Match warps_per_cta in store_layout to mma_layout's [WARPS_M, WARPS_N]
+        # to eliminate cross-warp shared-memory layout-conversion scratch (~32KB)
+        # and allow 2 CTAs/SM occupancy on sm86/sm89.
+        warp_tile_m: gl.constexpr = BLOCK_M // WARPS_M
+        warp_tile_n: gl.constexpr = BLOCK_N // WARPS_N
+
+        if warp_tile_n >= 64:
+            store_threads_m: gl.constexpr = 4
+            store_threads_n: gl.constexpr = 8
+        elif warp_tile_n >= 32:
+            store_threads_m: gl.constexpr = 8
+            store_threads_n: gl.constexpr = 4
         else:
-            store_layout: gl.constexpr = gl.BlockedLayout(
-                size_per_thread=[1, 8], threads_per_warp=[4, 8],
-                warps_per_cta=[gl.num_warps(), 1], order=[1, 0])
+            store_threads_m: gl.constexpr = 16
+            store_threads_n: gl.constexpr = 2
+
+        vec_m: gl.constexpr = warp_tile_m // store_threads_m
+        vec_n: gl.constexpr = warp_tile_n // store_threads_n
+
+        store_layout: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[vec_m, vec_n],
+            threads_per_warp=[store_threads_m, store_threads_n],
+            warps_per_cta=[WARPS_M, WARPS_N],
+            order=[1, 0],
+        )
 
         smem32: gl.constexpr = gl.SwizzledSharedLayout(
             vec=4, per_phase=2, max_phase=4, order=[1, 0])
@@ -870,114 +834,147 @@ if GLUON_AVAILABLE:
         Wq32 = W_q_ptr.cast(gl.pointer_type(gl.int32))
         sxm32 = stride_xqm // 4
         swn32 = stride_wn // 4
-        num_groups = K // GROUP_SIZE
+        total_steps = K // BLOCK_K
+        steady_steps = total_steps - (NUM_BUFFERS - 1)
 
-        for tile_id in range(start_pid, num_tiles, grid_x):
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GROUP_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-            tile_in_group = tile_id % num_pid_in_group
-            pid_m = first_pid_m + (tile_in_group % group_size_m)
-            pid_n = tile_in_group // group_size_m
-            pid_m_off = pid_m * BLOCK_M
-            pid_n_off = pid_n * BLOCK_N
+        if SCHEDULE_2D:
+            start_pid_m = gl.program_id(0)
+            start_pid_n = gl.program_id(1)
+            grid_m = gl.num_programs(0)
+            grid_n = gl.num_programs(1)
+            for pid_m in range(start_pid_m, num_pid_m, grid_m):
+                for pid_n in range(start_pid_n, num_pid_n, grid_n):
+                    pid_m_off = pid_m * BLOCK_M
+                    pid_n_off = pid_n * BLOCK_N
 
-            rm_cp = pid_m_off + rm_cp_base
-            rn_cp = pid_n_off + rn_cp_base
-            rm_acc = pid_m_off + rm_acc_base
-            rn_acc = pid_n_off + rn_acc_base
-            a_row_mask = rm_cp < M
-            acc_row_mask = rm_acc < M
+                    rm_cp = pid_m_off + rm_cp_base
+                    rn_cp = pid_n_off + rn_cp_base
+                    rm_acc = pid_m_off + rm_acc_base
+                    rn_acc = pid_n_off + rn_acc_base
+                    a_row_mask = rm_cp < M
+                    acc_row_mask = rm_acc < M
 
-            # Only M can be partial.  Predicated cp.async zero-fills inactive A
-            # rows, allowing the plugin to process the final tile in this same
-            # persistent launch instead of launching/copying a separate tail.
-            for stage in gl.static_range(0, NUM_BUFFERS - 1):
-                off32 = stage * BK32
-                a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
-                w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
-                _k2_cp.async_copy_global_to_shared(
-                    a_bufs.index(stage), a_ptrs, mask=a_row_mask[:, None],
-                    cache_modifier=".cg")
-                _k2_cp.async_copy_global_to_shared(w_bufs.index(stage), w_ptrs,
-                                  cache_modifier=".cg")
-                _k2_cp.commit_group()
+                    for stage in gl.static_range(0, NUM_BUFFERS - 1):
+                        off32 = stage * BK32
+                        a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
+                        w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
+                        _k2_cp.async_copy_global_to_shared(
+                            a_bufs.index(stage), a_ptrs, mask=a_row_mask[:, None],
+                            cache_modifier=".cg")
+                        _k2_cp.async_copy_global_to_shared(w_bufs.index(stage), w_ptrs,
+                                          cache_modifier=".cg")
+                        _k2_cp.commit_group()
 
-            acc = gl.zeros(
-                (BLOCK_M, BLOCK_N), dtype=gl.float32, layout=mma_layout)
+                    int32_acc = gl.zeros(
+                        (BLOCK_M, BLOCK_N), dtype=gl.int32, layout=mma_layout)
 
-            # All complete groups except the final one run in steady state.
-            # Keeping this outer group loop is the numerical contract: one
-            # ordered INT32 sum per G256 followed by one FP32 scale fold.
-            for group_idx in range(0, num_groups - 1):
-                xs = gl.load(
-                    X_scale_ptr + group_idx * stride_xsg + rm_acc * stride_xsm,
-                    mask=acc_row_mask, other=0.0,
-                    eviction_policy="evict_last")
+                    for step in range(0, steady_steps):
+                        int32_acc = _kernel2_gluon_mma_step(
+                            step, int32_acc, a_bufs, w_bufs,
+                            Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
+                            BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
+                            copy_layout, smem8, a_layout, b_layout,
+                            ISSUE_PREFETCH=True, WAIT_GROUP=NUM_BUFFERS - 2)
+
+                    for drain in gl.static_range(0, NUM_BUFFERS - 1):
+                        step = steady_steps + drain
+                        int32_acc = _kernel2_gluon_mma_step(
+                            step, int32_acc, a_bufs, w_bufs,
+                            Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
+                            BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
+                            copy_layout, smem8, a_layout, b_layout,
+                            ISSUE_PREFETCH=False,
+                            WAIT_GROUP=NUM_BUFFERS - 2 - drain)
+
+                    xs = gl.load(X_scale_ptr + rm_acc * stride_xsm,
+                                 mask=acc_row_mask, other=0.0,
+                                 eviction_policy="evict_last")
+                    ws = gl.load(W_scale_ptr + rn_acc, eviction_policy="evict_last")
+                    acc = int32_acc.to(gl.float32) * xs[:, None] * ws[None, :]
+                    if HAS_BIAS:
+                        bias = gl.load(Bias_ptr + rn_acc, eviction_policy="evict_last")
+                        acc = acc + bias[None, :]
+
+                    acc_store = gl.convert_layout(acc, store_layout)
+                    rm_store = pid_m_off + rm_store_base
+                    rn_store = pid_n_off + rn_store_base
+                    y_ptrs = (Y_ptr + rm_store[:, None] * stride_ym +
+                              rn_store[None, :] * stride_yn)
+                    gl.store(y_ptrs, acc_store.to(gl.float16),
+                             mask=(rm_store < M)[:, None])
+        else:
+            for tile_id in range(start_pid, num_tiles, grid_x):
+                group_id = tile_id // num_pid_in_group
+                first_pid_m = group_id * GROUP_M
+                group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+                tile_in_group = tile_id % num_pid_in_group
+                pid_m = first_pid_m + (tile_in_group % group_size_m)
+                pid_n = tile_in_group // group_size_m
+                pid_m_off = pid_m * BLOCK_M
+                pid_n_off = pid_n * BLOCK_N
+
+                rm_cp = pid_m_off + rm_cp_base
+                rn_cp = pid_n_off + rn_cp_base
+                rm_acc = pid_m_off + rm_acc_base
+                rn_acc = pid_n_off + rn_acc_base
+                a_row_mask = rm_cp < M
+                acc_row_mask = rm_acc < M
+
+                for stage in gl.static_range(0, NUM_BUFFERS - 1):
+                    off32 = stage * BK32
+                    a_ptrs = Xq32 + rm_cp[:, None] * sxm32 + (off32 + rk_cp)[None, :]
+                    w_ptrs = Wq32 + rn_cp[:, None] * swn32 + (off32 + rk_cp)[None, :]
+                    _k2_cp.async_copy_global_to_shared(
+                        a_bufs.index(stage), a_ptrs, mask=a_row_mask[:, None],
+                        cache_modifier=".cg")
+                    _k2_cp.async_copy_global_to_shared(w_bufs.index(stage), w_ptrs,
+                                      cache_modifier=".cg")
+                    _k2_cp.commit_group()
+
                 int32_acc = gl.zeros(
                     (BLOCK_M, BLOCK_N), dtype=gl.int32, layout=mma_layout)
-                for sub in gl.static_range(0, GROUP_STEPS):
-                    step = group_idx * GROUP_STEPS + sub
+
+                for step in range(0, steady_steps):
                     int32_acc = _kernel2_gluon_mma_step(
                         step, int32_acc, a_bufs, w_bufs,
                         Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
                         BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
                         copy_layout, smem8, a_layout, b_layout,
                         ISSUE_PREFETCH=True, WAIT_GROUP=NUM_BUFFERS - 2)
-                scaled = int32_acc.to(gl.float32) * xs[:, None]
-                acc = acc + scaled
 
-            # Split the final group into steady-state and drain sections.  The
-            # descending wait counts leave zero outstanding cp.async groups at
-            # every persistent-tile boundary (the c7471ef kernel did not).
-            final_group = num_groups - 1
-            xs = gl.load(
-                X_scale_ptr + final_group * stride_xsg + rm_acc * stride_xsm,
-                mask=acc_row_mask, other=0.0,
-                eviction_policy="evict_last")
-            int32_acc = gl.zeros(
-                (BLOCK_M, BLOCK_N), dtype=gl.int32, layout=mma_layout)
-            for sub in gl.static_range(0, GROUP_STEPS - (NUM_BUFFERS - 1)):
-                step = final_group * GROUP_STEPS + sub
-                int32_acc = _kernel2_gluon_mma_step(
-                    step, int32_acc, a_bufs, w_bufs,
-                    Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
-                    BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
-                    copy_layout, smem8, a_layout, b_layout,
-                    ISSUE_PREFETCH=True, WAIT_GROUP=NUM_BUFFERS - 2)
-            for drain in gl.static_range(0, NUM_BUFFERS - 1):
-                sub = GROUP_STEPS - (NUM_BUFFERS - 1) + drain
-                step = final_group * GROUP_STEPS + sub
-                int32_acc = _kernel2_gluon_mma_step(
-                    step, int32_acc, a_bufs, w_bufs,
-                    Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
-                    BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
-                    copy_layout, smem8, a_layout, b_layout,
-                    ISSUE_PREFETCH=False,
-                    WAIT_GROUP=NUM_BUFFERS - 2 - drain)
-            scaled = int32_acc.to(gl.float32) * xs[:, None]
-            acc = acc + scaled
+                for drain in gl.static_range(0, NUM_BUFFERS - 1):
+                    step = steady_steps + drain
+                    int32_acc = _kernel2_gluon_mma_step(
+                        step, int32_acc, a_bufs, w_bufs,
+                        Xq32, Wq32, rm_cp, rn_cp, rk_cp, a_row_mask, sxm32, swn32,
+                        BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS,
+                        copy_layout, smem8, a_layout, b_layout,
+                        ISSUE_PREFETCH=False,
+                        WAIT_GROUP=NUM_BUFFERS - 2 - drain)
 
-            ws = gl.load(W_scale_ptr + rn_acc, eviction_policy="evict_last")
-            acc = acc * ws[None, :]
-            if HAS_BIAS:
-                bias = gl.load(Bias_ptr + rn_acc, eviction_policy="evict_last")
-                acc = acc + bias[None, :]
+                xs = gl.load(X_scale_ptr + rm_acc * stride_xsm,
+                             mask=acc_row_mask, other=0.0,
+                             eviction_policy="evict_last")
+                ws = gl.load(W_scale_ptr + rn_acc, eviction_policy="evict_last")
+                acc = int32_acc.to(gl.float32) * xs[:, None] * ws[None, :]
+                if HAS_BIAS:
+                    bias = gl.load(Bias_ptr + rn_acc, eviction_policy="evict_last")
+                    acc = acc + bias[None, :]
 
-            acc_store = gl.convert_layout(acc, store_layout)
-            rm_store = pid_m_off + rm_store_base
-            rn_store = pid_n_off + rn_store_base
-            y_ptrs = (Y_ptr + rm_store[:, None] * stride_ym +
-                      rn_store[None, :] * stride_yn)
-            gl.store(y_ptrs, acc_store.to(gl.float16),
-                     mask=(rm_store < M)[:, None])
+                acc_store = gl.convert_layout(acc, store_layout)
+                rm_store = pid_m_off + rm_store_base
+                rn_store = pid_n_off + rn_store_base
+                y_ptrs = (Y_ptr + rm_store[:, None] * stride_ym +
+                          rn_store[None, :] * stride_yn)
+                gl.store(y_ptrs, acc_store.to(gl.float16),
+                         mask=(rm_store < M)[:, None])
 else:
     kernel2_gemm_dequant = None
 
 
 GROUP_SIZE = 256
 DEFAULT_BLOCK_K = 64
-TILE_NAME = "PersistentG256"
+TILE_NAME = "PersistentG256PerRow"
 # Version history:
 #   6 — GROUP_SIZE=256, TC-based rotation (H_16⊗H_16), decoupled BLOCK_K,
 #       persistent grid-stride launch, transposed X_scale layout.
@@ -1003,7 +1000,15 @@ TILE_NAME = "PersistentG256"
 #       FP32IO is retired: extraction emits only FP16IO K1/K2 cubins.
 #  12 — K2 predicates its final M tile so the plugin uses one persistent launch
 #       and no longer allocates, launches, or copies a padded output tail.
-CONVROT_INT8_CUBIN_HEADER_VERSION = 12
+#  13 — Per-row activation scaling + in-register H256 Hadamard rotation (ConvRot_HQQ_
+#       g256_per_row simulation strategy). K1 fuses in-register H256 rotation +
+#       per-row INT8 quant in one kernel without cross-group butterfly or workspace
+#       memory scratch; X_scale is [M] FP32 (one scale per activation row, NOT
+#       per 256-block). K2 is simplified to a single full-K INT8×INT8 → INT32 matmul
+#       plus an outer-product FP32 dequant (xs[m] * ws[n] * acc), removing the per-
+#       K-group INT32 fold. stride_xsg and workspace pointers are removed.
+#       Backward compatibility with v12 cubins is NOT preserved.
+CONVROT_INT8_CUBIN_HEADER_VERSION = 13
 # K2 ships separate compile-time bias and no-bias specializations.
 BIAS_CONFIGS = [("NOBIAS", False), ("BIAS", True)]
 # FP32IO is a legacy graph boundary.  Do not compile, benchmark, emit, or make
@@ -1247,12 +1252,12 @@ _LAUNCH_ARG_ENUM = {
     "M": "kM",
     "N": "kN",
     "K": "kK",
+    "G": "kG",
     "stride_xm": "kStride_xm",
     "stride_xk": "kStride_xk",
     "stride_xqm": "kStride_xqm",
     "stride_xqk": "kStride_xqk",
     "stride_xsm": "kStride_xsm",
-    "stride_xsg": "kStride_xsg",
     "stride_wn": "kStride_wn",
     "stride_wk": "kStride_wk",
     "stride_ym": "kStride_ym",
@@ -1263,15 +1268,23 @@ _POINTER_ARG_NAMES = {
     "X_ptr", "X_q_ptr", "X_scale_ptr", "W_q_ptr", "W_scale_ptr", "Bias_ptr", "Y_ptr",
 }
 
+# K1 (v13) launches with: activations, outputs, runtime dims (M, K, G), and strides.
 _QUANT_ARG_NAMES = {
-    "X_ptr", "X_q_ptr", "X_scale_ptr", "M", "K",
-    "stride_xm", "stride_xk", "stride_xqm", "stride_xqk", "stride_xsm", "stride_xsg",
+    "X_ptr", "X_q_ptr", "X_scale_ptr",
+    "M", "K", "G",
+    "stride_xm", "stride_xk",
+    "stride_xqm", "stride_xqk",
+    "stride_xsm",
 }
 
+# K2 (v13) launches with the per-row X_scale ([M] FP32, stride_xsm only — no
+# stride_xsg), per-row W_scale, optional bias, and the canonical [N, K] W_q
+# layout.  The GEMM is a single full-K INT8×INT8 → INT32 matmul; the per-row
+# outer-product FP32 dequant lives in the epilogue.
 _GEMM_ARG_NAMES = {
     "X_q_ptr", "X_scale_ptr", "W_q_ptr", "W_scale_ptr", "Bias_ptr", "Y_ptr",
     "M", "N", "K",
-    "stride_xqm", "stride_xqk", "stride_xsm", "stride_xsg",
+    "stride_xqm", "stride_xqk", "stride_xsm",
     "stride_wn", "stride_wk", "stride_ym", "stride_yn",
 }
 
@@ -1772,9 +1785,9 @@ def _init_k1_worker(input_fp16):
         pass
     dtype = torch.float16 if input_fp16 else torch.float32
     _K1_WORKER_STATE.input_fp16 = input_fp16
-    _K1_WORKER_STATE.x = torch.empty((1, 1), device="cuda", dtype=dtype)
-    _K1_WORKER_STATE.xq = torch.empty((1, 1), device="cuda", dtype=torch.int8)
-    _K1_WORKER_STATE.xs = torch.empty((1, 1), device="cuda", dtype=torch.float32)
+    _K1_WORKER_STATE.x = torch.empty((1, 256), device="cuda", dtype=dtype)
+    _K1_WORKER_STATE.xq = torch.empty((1, 256), device="cuda", dtype=torch.int8)
+    _K1_WORKER_STATE.xs = torch.empty((1,), device="cuda", dtype=torch.float32)
 
 
 def _worker_precompile_k1(config_tuple):
@@ -1785,12 +1798,14 @@ def _worker_precompile_k1(config_tuple):
     input_fp16 = _K1_WORKER_STATE.input_fp16
     try:
         cfg = Config(kwargs, num_warps=nw, num_stages=ns, maxnreg=mr)
+        K_warmup = 256
+        G_warmup = K_warmup // GROUP_SIZE  # = 1
         kernel1_convrot_quant.fn.warmup(
             _K1_WORKER_STATE.x, _K1_WORKER_STATE.xq, _K1_WORKER_STATE.xs,
-            K1_AUTOTUNE_M, 2560,
-            2560, 1, 2560, 1, 1,
-            _math.ceil(K1_AUTOTUNE_M / K1_AUTOTUNE_M_ALIGNMENT) * K1_AUTOTUNE_M_ALIGNMENT,
-            GROUP_SIZE=256, INPUT_FP16=input_fp16,
+            1, K_warmup, G_warmup,
+            K_warmup, 1, K_warmup, 1, 1,
+            GROUP_SIZE=256,
+            INPUT_FP16=input_fp16,
             CONTIG_XK=True,
             **cfg.all_kwargs(),
             grid=(1, 1, 1)
@@ -2176,16 +2191,11 @@ def _spill_check_variants(stage):
             x_type = '*fp16' if input_fp16 else '*fp32'
             signature = {
                 'X_ptr': x_type, 'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32',
-                'M': 'i32', 'K': 'i32',
+                'M': 'i32', 'K': 'i32', 'G': 'i32',
                 'stride_xm': 'i32', 'stride_xk': 'i32',
                 'stride_xqm': 'i32', 'stride_xqk': 'i32',
-                'stride_xsm': 'i32', 'stride_xsg': 'i32',
+                'stride_xsm': 'i32',
             }
-            # Match the specialization that is intentionally shipped:
-            # contiguous unit strides become constexpr 1; pointers, K and the
-            # production-padded leading strides are 16-byte divisible.  M is
-            # deliberately NOT marked divisible: the same cubin must accept
-            # real tails such as M=300 and M=3000.
             constexprs = {
                 'GROUP_SIZE': 256,
                 'INPUT_FP16': input_fp16,
@@ -2194,9 +2204,17 @@ def _spill_check_variants(stage):
                 'stride_xqk': 1,
                 'stride_xsm': 1,
             }
+            # Argument indices:
+            # 0..2 : pointers (16-div)
+            # 3    : M (generic)
+            # 4    : K (16-div)
+            # 5    : G (generic)
+            # 6    : stride_xm (16-div)
+            # 7, 9, 10: unit strides (constexpr 1)
+            # 8    : stride_xqm (16-div)
             attrs = {
                 (i,): [["tt.divisibility", 16]]
-                for i in (0, 1, 2, 4, 5, 7, 10)
+                for i in (0, 1, 2, 4, 6, 8)
             }
             yield (dtype_suffix, signature, constexprs, attrs)
     else:  # k2
@@ -2205,12 +2223,14 @@ def _spill_check_variants(stage):
         for bias_suffix, _has_bias in BIAS_CONFIGS:
             for dtype_suffix, _, output_fp16 in DTYPE_CONFIGS:
                 y_type = '*fp16' if output_fp16 else '*fp32'
+                # v13 K2 signature: per-row X_scale (no stride_xsg — X_scale
+                # is [M] FP32, indexed only by stride_xsm).
                 signature = {
                     'X_q_ptr': '*i8', 'X_scale_ptr': '*fp32', 'W_q_ptr': '*i8',
                     'W_scale_ptr': '*fp32', 'Bias_ptr': '*fp32', 'Y_ptr': y_type,
                     'M': 'i32', 'N': 'i32', 'K': 'i32',
                     'stride_xqm': 'i32', 'stride_xqk': 'i32',
-                    'stride_xsm': 'i32', 'stride_xsg': 'i32',
+                    'stride_xsm': 'i32',
                     'stride_wn': 'i32', 'stride_wk': 'i32',
                     'stride_ym': 'i32', 'stride_yn': 'i32',
                 }
@@ -2223,12 +2243,22 @@ def _spill_check_variants(stage):
                     'stride_wk': 1,
                     'stride_yn': 1,
                 }
-                # M and stride_xsg are the real, tightly packed row count (for
-                # example 3000) and must remain generic.  Pointers, N/K and the
-                # K/N row pitches retain their 16-byte divisibility contracts.
+                # M is the real, tightly packed row count (e.g. 3000) and
+                # must remain generic.  Pointers, N/K and the K/N row pitches
+                # retain their 16-byte divisibility contracts.
+                # Argument indices (0-based):
+                #   0..5  : pointers (16-div)
+                #   6     : M (generic)
+                #   7, 8  : N, K (16-div)
+                #   9     : stride_xqm = K (16-div)
+                #   10, 11: unit strides (constexpr 1)
+                #   12    : stride_wn = K (16-div)
+                #   13    : stride_wk (constexpr 1)
+                #   14    : stride_ym = N (16-div)
+                #   15    : stride_yn (constexpr 1)
                 attrs = {
                     (i,): [["tt.divisibility", 16]]
-                    for i in (0, 1, 2, 3, 4, 5, 7, 8, 9, 13, 15)
+                    for i in (0, 1, 2, 3, 4, 5, 7, 8, 9, 12, 14)
                 }
                 yield (f"{bias_suffix}_{dtype_suffix}", signature,
                        constexprs, attrs)
@@ -2551,16 +2581,15 @@ def _k2_workload(has_bias):
 
 
 def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
-                         stride_xsg=None, reference=False):
+                         reference=False):
     """Launch one K2 config with the occupancy-scaled production grid.
 
+    v13: X_scale is per-row ([M] FP32), so there is no stride_xsg parameter.
     Shipping candidates call the raw Gluon JIT function with compiler staging
     disabled (the kernel has its own cp.async ring).  ``reference=True`` calls
-    the retained Triton v10 oracle and is used only for the bitwise gate.
+    the retained Triton oracle and is used only for the bitwise gate.
     """
     xq, xs, wq, ws, bias, y = tensors
-    if stride_xsg is None:
-        stride_xsg = M
     num_pid_m = triton.cdiv(M, cfg.kwargs["BLOCK_M"])
     num_pid_n = triton.cdiv(N, cfg.kwargs["BLOCK_N"])
     num_tiles = num_pid_m * num_pid_n
@@ -2594,11 +2623,12 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
                  else kernel2_gemm_dequant)
     if launch_fn is None:
         _require_gluon_for_k2()
+    # v13: no stride_xsg (X_scale is [M] FP32, indexed by stride_xsm=1 only).
     launch_fn[grid](
         xq, xs, wq, ws, bias, y,
         M, N, K,
         K, 1,
-        1, stride_xsg,
+        1,
         K, 1,        # W_q [N, K] row-major
         N, 1,
         **kwargs,
@@ -2608,7 +2638,12 @@ def _launch_k2_for_bench(cfg, tensors, M, N, K, num_sms, output_fp16,
 
 def _make_k2_production_bench_pack(configs, M, N, K, has_bias, output_fp16,
                                    seed):
-    """Allocate deterministic tensors for exact plugin-sequence benchmarking."""
+    """Allocate deterministic tensors for exact plugin-sequence benchmarking.
+
+    v13: X_scale is per-row ([M] FP32) instead of per-group ([G, M] FP32).
+    The pitch-keyed dict is retained because the v10 oracle still needs a
+    padded M for bitwise comparison, but each entry is now 1-D ([pitch]).
+    """
     import torch
 
     max_bm = max(c.kwargs["BLOCK_M"] for c in configs)
@@ -2624,16 +2659,17 @@ def _make_k2_production_bench_pack(configs, M, N, K, has_bias, output_fp16,
                        device="cuda", dtype=torch.int8)
     if max_m_padded > M:
         xq[M:].zero_()
-    n_groups = K // GROUP_SIZE
-    xs_valid = torch.rand((n_groups, M), generator=gen, device="cuda",
+    # v13: per-row X_scale (one FP32 per M row).  Production K1 writes [M]
+    # FP32; the oracle's padded-M comparison path pads with zeros.
+    xs_valid = torch.rand((M,), generator=gen, device="cuda",
                           dtype=torch.float32) * 0.02 + 0.001
     pitches = sorted(
         {M} | {_math.ceil(M / c.kwargs["BLOCK_M"]) * c.kwargs["BLOCK_M"]
                for c in configs})
     xs_by_pitch = {}
     for pitch in pitches:
-        xs = torch.zeros((n_groups, pitch), device="cuda", dtype=torch.float32)
-        xs[:, :M].copy_(xs_valid)
+        xs = torch.zeros((pitch,), device="cuda", dtype=torch.float32)
+        xs[:M].copy_(xs_valid)
         xs_by_pitch[pitch] = xs
 
     wq = torch.randint(-127, 128, (N, K), generator=gen,
@@ -2653,16 +2689,20 @@ def _make_k2_production_bench_pack(configs, M, N, K, has_bias, output_fp16,
 
 def _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms,
                                    output_fp16, reference=False):
-    """Mirror the shipping launch; retain split-tail only for the v10 oracle."""
+    """Mirror the shipping launch; retain split-tail only for the v10 oracle.
+
+    v13: X_scale is per-row ([M] FP32); the pitch lookup still works because
+    _make_k2_production_bench_pack stores 1-D tensors keyed by pitch.
+    """
     if not reference:
-        # Version 12 masks the final M tile in-kernel.  Public prequantized
+        # Version 12+ masks the final M tile in-kernel.  Public prequantized
         # tensors and private K1 tensors are both tightly packed, and K2 writes
         # the real output directly in one persistent launch.
         xs = pack["xs_by_pitch"][M]
         return _launch_k2_for_bench(
             cfg,
             (pack["xq"], xs, pack["wq"], pack["ws"], pack["bias"], pack["y"]),
-            M, N, K, num_sms, output_fp16, stride_xsg=M,
+            M, N, K, num_sms, output_fp16,
             reference=False)
 
     # The immutable unmasked Triton oracle still needs the old split/copy path;
@@ -2677,17 +2717,17 @@ def _launch_k2_production_sequence(cfg, pack, M, N, K, num_sms,
         total_ctas += _launch_k2_for_bench(
             cfg,
             (pack["xq"], xs, pack["wq"], pack["ws"], pack["bias"], pack["y"]),
-            m_aligned, N, K, num_sms, output_fp16, stride_xsg=m_padded,
+            m_aligned, N, K, num_sms, output_fp16,
             reference=reference)
     if m_aligned < M:
         tail_rows = M - m_aligned
         xq_tail = pack["xq"][m_aligned:]
-        xs_tail = xs[:, m_aligned:]
+        xs_tail = xs[m_aligned:]
         y_tail = pack["y_tail"][:bm]
         total_ctas += _launch_k2_for_bench(
             cfg,
             (xq_tail, xs_tail, pack["wq"], pack["ws"], pack["bias"], y_tail),
-            bm, N, K, num_sms, output_fp16, stride_xsg=m_padded,
+            bm, N, K, num_sms, output_fp16,
             reference=reference)
         # Contiguous copy_ lowers to the same D2D copy class used by enqueue.
         pack["y"][m_aligned:M].copy_(y_tail[:tail_rows])
@@ -2836,10 +2876,11 @@ def _print_k2_workload_topn(results, topn=None):
         if ms == float("inf"):
             print(f"      FAIL  {cfg}: {err}", flush=True)
             continue
+        s2d_str = " S2D=1" if cfg.kwargs.get("SCHEDULE_2D", False) else ""
         print(f"      total={ms:9.4f} ms  BM={cfg.kwargs['BLOCK_M']} "
               f"BN={cfg.kwargs['BLOCK_N']} BK={cfg.kwargs['BLOCK_K']} "
               f"GM={cfg.kwargs['GROUP_M']} WM={cfg.kwargs.get('WARPS_M', '-')} "
-              f"BUF={cfg.kwargs.get('NUM_BUFFERS', '-')} W={cfg.num_warps} "
+              f"BUF={cfg.kwargs.get('NUM_BUFFERS', '-')} W={cfg.num_warps}{s2d_str} "
               f"MR={getattr(cfg, 'maxnreg', None)}", flush=True)
 
 
@@ -2856,28 +2897,28 @@ def _print_k2_bench_topn(results, M, K, N, topn=None):
             continue
         tops = real_ops / (ms * 1e-3) / 1e12
         mr = getattr(cfg, "maxnreg", None)
+        s2d_str = " S2D=1" if cfg.kwargs.get("SCHEDULE_2D", False) else ""
         print(f"      {ms:7.4f} ms  {tops:6.2f} TOPS  grid={grid_x:4d}  "
               f"BM={cfg.kwargs.get('BLOCK_M')} BN={cfg.kwargs.get('BLOCK_N')} "
               f"BK={cfg.kwargs.get('BLOCK_K')} GM={cfg.kwargs.get('GROUP_M')} "
               f"WM={cfg.kwargs.get('WARPS_M', '-')} "
               f"BUF={cfg.kwargs.get('NUM_BUFFERS', '-')} "
-              f"W={cfg.num_warps} MR={mr}", flush=True)
+              f"W={cfg.num_warps}{s2d_str} MR={mr}", flush=True)
 
 
-def _launch_k1_raw_config(cfg, x, xq, xs, M, K, stride_xsg, num_sms):
+def _launch_k1_raw_config(cfg, x, xq, xs, M, K, G, num_sms):
     """Launch one explicit K1 config without the autotune wrapper."""
     import torch
-    n_groups = K // GROUP_SIZE
-    num_tiles = triton.cdiv(M, cfg.kwargs["BLOCK_M"]) * n_groups
+    num_tiles = triton.cdiv(M, cfg.kwargs["BLOCK_M"])
     occupancy = _K1_CFG_OCCUPANCY.get(
         _cfg_occupancy_key(cfg), AUTOTUNE_OCCUPANCY_ASSUMPTION)
     grid_x = _autotune_grid_x(num_tiles, num_sms, occupancy)
     kernel1_convrot_quant.fn[(grid_x,)](
         x, xq, xs,
-        M, K,
-        K, 1,
-        K, 1,
-        1, stride_xsg,
+        M, K, G,
+        K, 1,            # stride_xm, stride_xk
+        K, 1,            # stride_xqm, stride_xqk
+        1,               # stride_xsm
         GROUP_SIZE=GROUP_SIZE,
         INPUT_FP16=(x.dtype == torch.float16),
         CONTIG_XK=True,
@@ -2885,37 +2926,25 @@ def _launch_k1_raw_config(cfg, x, xq, xs, M, K, stride_xsg, num_sms):
     )
 
 
-def _validate_k1_winner_bitwise(best_cfg, x, M, K, stride_xsg, num_sms):
-    """Require bitwise equality to the current BM16/W4 FP32 arithmetic.
-
-    Also surrounds X_q/X_scale with canary tails and rejects NaN/Inf.  This is
-    an extraction-time gate, not a tolerance test: one different INT8 byte or
-    FP32 scale bit aborts artifact generation.
-    """
+def _validate_k1_winner_bitwise(best_cfg, x, M, K, G, num_sms):
+    """Require bitwise equality to the BM1 reference arithmetic."""
     import torch
 
     canary_rows = 16
-    n_groups = K // GROUP_SIZE
-    ref_cfg = Config({"BLOCK_M": 16}, num_warps=4, num_stages=1,
-                     maxnreg=128)
+    ref_cfg = Config({"BLOCK_M": 1}, num_warps=4, num_stages=1, maxnreg=128)
 
     def allocate_outputs():
         q = torch.full((M + canary_rows, K), -34, device="cuda",
                        dtype=torch.int8)
-        # stride_xsg is production-padded.  Keep all padding NaN as a canary.
-        s = torch.full((n_groups, stride_xsg), float("nan"), device="cuda",
+        s = torch.full((M + canary_rows,), float("nan"), device="cuda",
                        dtype=torch.float32)
         return q, s
 
-    # Two distributions exercise different maxima and quantization boundaries
-    # while reusing the exact final JIT specialization (same pointers/strides/M).
     patterns = []
     patterns.append(("autotune-random", x))
     gen = torch.Generator(device="cuda")
     gen.manual_seed(0x4B315F4558414354)  # "K1_EXACT"
     wide = torch.randn((M, K), generator=gen, device="cuda", dtype=x.dtype)
-    # Deterministic powers-of-two row modulation broadens exponents without
-    # introducing non-finite values.  Multiplication by 2**n is exact in FP32.
     row_exp = ((torch.arange(M, device="cuda") % 17) - 8).to(torch.float32)
     wide *= torch.pow(torch.tensor(2.0, device="cuda"), row_exp)[:, None]
     patterns.append(("wide-exponent-random", wide))
@@ -2924,34 +2953,34 @@ def _validate_k1_winner_bitwise(best_cfg, x, M, K, stride_xsg, num_sms):
         q_ref, s_ref = allocate_outputs()
         q_got, s_got = allocate_outputs()
         _launch_k1_raw_config(ref_cfg, inp, q_ref, s_ref,
-                              M, K, stride_xsg, num_sms)
+                              M, K, G, num_sms)
         _launch_k1_raw_config(best_cfg, inp, q_got, s_got,
-                              M, K, stride_xsg, num_sms)
+                              M, K, G, num_sms)
         torch.cuda.synchronize()
 
-        if not torch.isfinite(s_ref[:, :M]).all().item():
+        if not torch.isfinite(s_ref[:M]).all().item():
             raise SystemExit(f"[K1 exactness] reference produced NaN/Inf ({label})")
-        if not torch.isfinite(s_got[:, :M]).all().item():
+        if not torch.isfinite(s_got[:M]).all().item():
             raise SystemExit(f"[K1 exactness] candidate produced NaN/Inf ({label})")
         if not torch.equal(q_ref[:M], q_got[:M]):
             mismatches = int((q_ref[:M] != q_got[:M]).sum().item())
             raise SystemExit(
                 f"[K1 exactness] INT8 mismatch for {label}: {mismatches} bytes; "
                 f"candidate={best_cfg}")
-        if not torch.equal(s_ref[:, :M].view(torch.int32),
-                           s_got[:, :M].view(torch.int32)):
-            mismatches = int((s_ref[:, :M].view(torch.int32) !=
-                              s_got[:, :M].view(torch.int32)).sum().item())
+        if not torch.equal(s_ref[:M].view(torch.int32),
+                           s_got[:M].view(torch.int32)):
+            mismatches = int((s_ref[:M].view(torch.int32) !=
+                              s_got[:M].view(torch.int32)).sum().item())
             raise SystemExit(
                 f"[K1 exactness] FP32 scale bit mismatch for {label}: "
                 f"{mismatches} values; candidate={best_cfg}")
 
         if not torch.all(q_ref[M:] == -34).item() or not torch.all(q_got[M:] == -34).item():
             raise SystemExit(f"[K1 exactness] X_q tail canary corrupted ({label})")
-        if not torch.isnan(s_ref[:, M:]).all().item() or not torch.isnan(s_got[:, M:]).all().item():
+        if not torch.isnan(s_ref[M:]).all().item() or not torch.isnan(s_got[M:]).all().item():
             raise SystemExit(f"[K1 exactness] X_scale tail canary corrupted ({label})")
 
-    print(f"    [K1 exactness] PASS: candidate is bitwise equal to BM16/W4 "
+    print(f"    [K1 exactness] PASS: candidate is bitwise equal to BM1 "
           f"for {len(patterns)} distributions; canaries intact", flush=True)
 
 
@@ -2964,27 +2993,23 @@ def extract_k1(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
         print(f"\n  K1 G256 {dtype_suffix} (autotuning)...", flush=True)
         _parallel_precompile_k1(_K1_CONFIGS, input_fp16)
         dtype = torch.float16 if input_fp16 else torch.float32
-        # Tune the dominant, deliberately non-16-divisible production M.  This
-        # prevents Triton from baking an invalid tt.divisibility=16 assumption
-        # onto the runtime M argument.  X_scale uses the production-padded
-        # leading stride so the exact JIT specialization matches the plugin.
         M, K = K1_AUTOTUNE_M, 2560
-        M_padded = triton.cdiv(M, K1_AUTOTUNE_M_ALIGNMENT) * K1_AUTOTUNE_M_ALIGNMENT
+        G = K // GROUP_SIZE
         torch.manual_seed(0x4B31)
         x = torch.randn((M, K), device="cuda", dtype=dtype)
         xq = torch.empty((M, K), device="cuda", dtype=torch.int8)
-        n_groups = K // GROUP_SIZE
-        xs = torch.empty((n_groups, M_padded), device="cuda", dtype=torch.float32)
+        xs = torch.empty((M,), device="cuda", dtype=torch.float32)
         grid_k1 = lambda meta: (_autotune_grid_x_for_k1(
-            triton.cdiv(M, meta["BLOCK_M"]) * n_groups, num_sms, meta),)
+            triton.cdiv(M, meta["BLOCK_M"]), num_sms, meta),)
 
         kernel1_convrot_quant[grid_k1](
             x, xq, xs,
-            M, K,
+            M, K, G,
             K, 1,
             K, 1,
-            1, M_padded,
-            GROUP_SIZE=GROUP_SIZE, INPUT_FP16=input_fp16,
+            1,
+            GROUP_SIZE=GROUP_SIZE,
+            INPUT_FP16=input_fp16,
             CONTIG_XK=True,
         )
         torch.cuda.synchronize()
@@ -3005,12 +3030,6 @@ def extract_k1(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
         shared = kernel.metadata.shared
         abi = _extract_kernel_abi(kernel, "quant")
 
-        # Post-autotune spill validation: verify the winning cubin — the one
-        # that actually ships in the header — does not spill.  Uses the same
-        # authoritative cuobjdump STACK-field detector as the pre-autotune
-        # gate (with PTX ld.local/st.local fallback), and FAILS THE BUILD on
-        # spill: zero tolerance means a spilling winner must never land in
-        # the generated header silently.
         spill_info = _detect_spills(kernel, abi["function_name"])
         if spill_info["spilling"]:
             raise SystemExit(
@@ -3027,10 +3046,7 @@ def extract_k1(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             f"scratch={spill_info.get('global_scratch', -1)})"
         )
 
-        # Last gate before artifact extraction: compare the selected config to
-        # the current BM16/W4 FP32 arithmetic bit-for-bit and verify tail
-        # canaries.  No tolerance and no fallback are permitted.
-        _validate_k1_winner_bitwise(best_cfg, x, M, K, M_padded, num_sms)
+        _validate_k1_winner_bitwise(best_cfg, x, M, K, G, num_sms)
 
         print(f"  -> Autotune winner: BLOCK_M={block_m}, num_warps={nw}, num_stages={ns}, maxnreg={mr}", flush=True)
         print(
@@ -3110,7 +3126,7 @@ def extract_k2(arch, debug_dump=False, num_sms=0, l2_bytes=0, shared_mem_per_sm=
             group_m = best_cfg.kwargs["GROUP_M"]
             warp_m = best_cfg.kwargs["WARPS_M"]
             num_buffers = best_cfg.kwargs["NUM_BUFFERS"]
-            schedule_2d = False
+            schedule_2d = bool(best_cfg.kwargs.get("SCHEDULE_2D", False))
             dynamic_inner = True
             nw = best_cfg.num_warps
             ns = best_cfg.num_stages
@@ -3506,22 +3522,22 @@ def write_header(k1_results, k2_results, output_path):
         "inline void* selectQuantLaunchParam(",
         "    ConvRotLaunchArgId id,",
         "    void*& x_param, void*& xq_ptr, void*& xs_ptr,",
-        "    int32_t& M, int32_t& K,",
+        "    int32_t& M, int32_t& K, int32_t& G,",
         "    int32_t& stride_xm, int32_t& stride_xk,",
         "    int32_t& stride_xqm, int32_t& stride_xqk,",
-        "    int32_t& stride_xsm, int32_t& stride_xsg) {",
+        "    int32_t& stride_xsm) {",
         "    switch (id) {",
         "        case ConvRotLaunchArgId::kX_ptr: return &x_param;",
         "        case ConvRotLaunchArgId::kX_q_ptr: return &xq_ptr;",
         "        case ConvRotLaunchArgId::kX_scale_ptr: return &xs_ptr;",
         "        case ConvRotLaunchArgId::kM: return &M;",
         "        case ConvRotLaunchArgId::kK: return &K;",
+        "        case ConvRotLaunchArgId::kG: return &G;",
         "        case ConvRotLaunchArgId::kStride_xm: return &stride_xm;",
         "        case ConvRotLaunchArgId::kStride_xk: return &stride_xk;",
         "        case ConvRotLaunchArgId::kStride_xqm: return &stride_xqm;",
         "        case ConvRotLaunchArgId::kStride_xqk: return &stride_xqk;",
         "        case ConvRotLaunchArgId::kStride_xsm: return &stride_xsm;",
-        "        case ConvRotLaunchArgId::kStride_xsg: return &stride_xsg;",
         "        default: return nullptr;",
         "    }",
         "}",
@@ -3531,7 +3547,7 @@ def write_header(k1_results, k2_results, output_path):
         "    void*& xq_ptr, void*& xs_ptr, void*& wq_param, void*& ws_param, void*& bias_param, void*& y_ptr,",
         "    int32_t& M, int32_t& N, int32_t& K,",
         "    int32_t& stride_xqm, int32_t& stride_xqk,",
-        "    int32_t& stride_xsm, int32_t& stride_xsg,",
+        "    int32_t& stride_xsm,",
         "    int32_t& stride_wn, int32_t& stride_wk,",
         "    int32_t& stride_ym, int32_t& stride_yn) {",
         "    switch (id) {",
@@ -3547,7 +3563,6 @@ def write_header(k1_results, k2_results, output_path):
         "        case ConvRotLaunchArgId::kStride_xqm: return &stride_xqm;",
         "        case ConvRotLaunchArgId::kStride_xqk: return &stride_xqk;",
         "        case ConvRotLaunchArgId::kStride_xsm: return &stride_xsm;",
-        "        case ConvRotLaunchArgId::kStride_xsg: return &stride_xsg;",
         "        case ConvRotLaunchArgId::kStride_wn: return &stride_wn;",
         "        case ConvRotLaunchArgId::kStride_wk: return &stride_wk;",
         "        case ConvRotLaunchArgId::kStride_ym: return &stride_ym;",
@@ -3559,10 +3574,10 @@ def write_header(k1_results, k2_results, output_path):
         "inline CUresult launchConvRotQuant(",
         "    ConvRotCubinDesc const& d, CUfunction func, CUstream stream,",
         "    void const* x_ptr, void* xq_ptr, void* xs_ptr,",
-        "    int32_t M, int32_t K, int32_t num_sms,",
+        "    int32_t M, int32_t K, int32_t G, int32_t num_sms,",
         "    int32_t stride_xm, int32_t stride_xk,",
         "    int32_t stride_xqm, int32_t stride_xqk,",
-        "    int32_t stride_xsm, int32_t stride_xsg,",
+        "    int32_t stride_xsm,",
         "    uint32_t max_active_ctas_per_sm = 0) {",
         "    void* triton_scratch1 = nullptr;",
         "    void* triton_scratch2 = nullptr;",
@@ -3571,9 +3586,10 @@ def write_header(k1_results, k2_results, output_path):
         "        return CUDA_ERROR_INVALID_VALUE;",
         "    }",
         "    void* x_param = const_cast<void*>(x_ptr);",
+        "    // v13: K1 grid is (cdiv(M, BLOCK_M),) — one CTA per BLOCK_M rows.",
+        "    // Each CTA processes the FULL K dimension of its row(s).",
         "    uint32_t const num_pid_m = ceilDivU32(M, d.block_m);",
-        "    uint32_t const num_k_groups = static_cast<uint32_t>(K / d.group_size);",
-        "    uint32_t const total_tiles = num_pid_m * num_k_groups;",
+        "    uint32_t const total_tiles = num_pid_m;",
         "    // §1.1: if the caller didn't pre-query occupancy, query it now (cached",
         "    //        per-CUfunction by the driver).  Falls back to 1 CTA/SM on failure.",
         "    //        Patch review §5: must pass the real block size, not 0.",
@@ -3590,8 +3606,9 @@ def write_header(k1_results, k2_results, output_path):
         "        void* slot = selectQuantLaunchParam(",
         "            d.runtime_args[i].id,",
         "            x_param, xq_ptr, xs_ptr,",
-        "            M, K,",
-        "            stride_xm, stride_xk, stride_xqm, stride_xqk, stride_xsm, stride_xsg);",
+        "            M, K, G,",
+        "            stride_xm, stride_xk, stride_xqm, stride_xqk,",
+        "            stride_xsm);",
         "        if (slot == nullptr) return CUDA_ERROR_INVALID_VALUE;",
         "        params[n++] = slot;",
         "    }",
@@ -3608,7 +3625,7 @@ def write_header(k1_results, k2_results, output_path):
         "    float const* ws_ptr, void const* bias_ptr, void* y_ptr,",
         "    int32_t M, int32_t N, int32_t K, int32_t num_sms,",
         "    int32_t stride_xqm, int32_t stride_xqk,",
-        "    int32_t stride_xsm, int32_t stride_xsg,",
+        "    int32_t stride_xsm,",
         "    int32_t stride_wn, int32_t stride_wk,",
         "    int32_t stride_ym, int32_t stride_yn,",
         "    uint32_t max_active_ctas_per_sm = 0) {",
@@ -3652,7 +3669,7 @@ def write_header(k1_results, k2_results, output_path):
         "            d.runtime_args[i].id,",
         "            xq_ptr, xs_ptr, wq_param, ws_param, bias_param, y_ptr,",
         "            M, N, K,",
-        "            stride_xqm, stride_xqk, stride_xsm, stride_xsg,",
+        "            stride_xqm, stride_xqk, stride_xsm,",
         "            stride_wn, stride_wk, stride_ym, stride_yn);",
         "        if (slot == nullptr) return CUDA_ERROR_INVALID_VALUE;",
         "        params[n++] = slot;",

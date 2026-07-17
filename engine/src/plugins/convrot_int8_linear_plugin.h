@@ -2,16 +2,18 @@
  * convrot_int8_linear_plugin.h — HOT-Step ConvRotInt8Linear TensorRT 11 plugin.
  *
  * This plugin exposes the ConvRot + W8A8 linear path as one TensorRT custom op.
- * The runtime uses the same two-kernel Triton pipeline for every M:
- *   1. Rotate and quantize activations once into reusable workspace.
- *   2. Reuse that INT8 workspace across all output-channel tiles.
+ * v13 contract:
+ *   * K1 performs H256 in-register rotation + per-row INT8 quantization.
+ *     X_scale is [M] FP32 (one scale per activation row, NOT per 256-block).
+ *   * K2 is a plain INT8×INT8 → INT32 GEMM with a per-row X_scale × per-row
+ *     W_scale outer-product FP32 dequant in the epilogue.  The per-group
+ *     INT32 fold of v7-v12 is gone.
+ *   * The runtime uses the same two-kernel Triton pipeline for every M:
+ *     1. K1: rotate + quantize activations into reusable workspace.
+ *     2. K2: reuse that INT8 workspace across all output-channel tiles.
  *
- * A previous specialized M==1 fused kernel was removed after profiling showed
- * the autotuned two-kernel path is faster for the M==1 workload too.
- *
- * The Hadamard/ConvRot transform itself is still implemented as in-register
- * H_4 Kronecker butterflies. No dense H matrix is staged in shared memory and
- * no H tensor is passed through the plugin boundary.
+ * The Hadamard/ConvRot transform itself is implemented as in-register
+ * H_4 Kronecker butterflies. No dense H matrix is staged in shared memory.
  */
 
 #pragma once
@@ -156,15 +158,15 @@ private:
     int32_t m_N{0};
 
 
-    // Kernel 1: activation rotation + quantization. m_desc_quant points to a
-    // generated launch descriptor in convrot_int8_kernel_cubin.h; the plugin
-    // treats it opaquely so this public header need not include the large
-    // generated cubin inventory.
+    // Kernel 1: activation rotation + quantization. m_desc_quant
+    // points to a generated launch descriptor in convrot_int8_kernel_cubin.h;
+    // the plugin treats it opaquely so this public header need not include
+    // the large generated cubin inventory.
     void* m_module_quant{nullptr};
     void* m_kernelFunc_quant{nullptr};
     void const* m_desc_quant{nullptr};
 
-    // Kernel 2: INT8 GEMM + per-group dequant. Launch geometry, dynamic shared
+    // Kernel 2: INT8 GEMM + per-row dequant.  Launch geometry, dynamic shared
     // memory, and Triton ABI details live in the generated descriptor/stub.
     void* m_module_gemm{nullptr};
     void* m_kernelFunc_gemm{nullptr};

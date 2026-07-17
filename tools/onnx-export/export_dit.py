@@ -2206,6 +2206,7 @@ def _quantize_w8a8_weight_array(
     if group_size is not None and H is not None and w_canonical.shape[1] % group_size == 0:
         from convrot import rotate_weight
 
+        # Per-row ConvRot pipeline: apply the regular Hadamard H256 rotation.
         w_canonical = rotate_weight(w_canonical, H, group_size)
         rotated = True
 
@@ -2314,7 +2315,7 @@ def _quantize_w8a8_initializers_with_convrot(
 
     # Single shared H initializer for activation rotation. The v2 plugin
     # contract uses FP16 activation/H/bias tensors by default; the CUDA
-    # butterfly implementation does not read H at runtime, but typing it as
+    # in-register H256 implementation does not read H at runtime, but typing it as
     # FP16 keeps the ONNX contract cast-free at the plugin boundary.
     H_name = "convrot.hadamard"
     H_already_present = any(init.name == H_name for init in model.graph.initializer)

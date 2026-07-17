@@ -1,30 +1,37 @@
 /*
- * convrot_int8_linear_kernel.cuh — CUDA kernels for ConvRotInt8Linear.
+ * convrot_int8_linear_kernel.cuh — CUDA kernels for ConvRotInt8Linear (v13).
  *
- * Only the ConvRot activation rotation + per-row INT8 quantization kernel
- * lives here. The INT8 GEMM is handled by cuBLASLt (called from the plugin's
- * enqueue method), and the dequant+bias epilogue is a separate pointwise
- * kernel.
+ * Only the ConvRot activation rotation + per-row INT8 quantization
+ * launch helper lives here.  The actual kernels are AOT-compiled Triton/Gluon
+ * cubins (see extract_jit_cubins_autotune.py); this header is a compatibility
+ * shim for the legacy launcher API.
  *
- * ConvRot rotation kernel
- * -----------------------
- * One block per row of x [K]. Each block:
- *   1. Applies the regular Hadamard as H4 Kronecker butterflies per group
- *      (the H input is kept for graph/API compatibility but is not staged)
- *   2. Computes per-row max-abs from the rotated values
- *   3. Computes per-row max-abs → scale = max(|x_rot|) / 127
- *   4. Recomputes the rotation and quantizes:
- *      x_q = clip(round(x_rot / scale), -127, 127)
+ * v13 contract:
+ *   * K1 rotates activations with H256 in registers and computes per-row INT8
+ *     quantization.  X_scale is [M] FP32 (one scale per activation row, NOT
+ *     per 256-block).
+ *   * K2 is a plain INT8×INT8 → INT32 GEMM with a per-row X_scale × per-row
+ *     W_scale outer-product FP32 dequant in the epilogue.  The per-group
+ *     INT32 fold of v7-v12 is gone.
  *
- * Outputs: x_q [M, K] INT8, x_scale [M] FP32
+ * ConvRot rotation kernel (v13)
+ * -----------------------------
+ * One CTA per BLOCK_M rows of x [K]. Each block:
+ *   1. For each group g in [0, G): loads [BLOCK_M, GROUP_SIZE] FP16 input,
+ *      converts to FP32, applies 4 H4 Kronecker stages (H256),
+ *      accumulates max-abs per row.
+ *   2. Computes per-row max-abs scale (one FP32 per M row).
+ *   3. Quantizes: x_q = clip(round(x_rot / scale), -127, 127).
  *
- * Dequant+epilogue kernel
- * -----------------------
+ * Outputs: x_q [M, K] INT8, x_scale [M] FP32  (per-row, NOT per-group)
+ *
+ * INT8 GEMM + per-row dequant kernel (v13)
+ * ----------------------------------------
  * One block per output tile [BLOCK_M × BLOCK_N]. Each block:
- *   1. Reads INT32 accumulator from cuBLASLt output
- *   2. Loads x_scale[m] and w_scale[n]
- *   3. Computes y = acc * x_scale * w_scale + bias
- *   4. Writes FP16 output by default (or FP32 for explicit fallback)
+ *   1. Accumulates a single full-K INT32 sum: int32_acc = sum_k X_q[m,k] * W_q[n,k]
+ *   2. Loads x_scale[m] (per-row FP32) and w_scale[n] (per-row FP32).
+ *   3. Computes y = int32_acc * x_scale * w_scale + bias  (FP32 epilogue).
+ *   4. Writes FP16 output by default (or FP32 for explicit fallback).
  */
 
 #pragma once

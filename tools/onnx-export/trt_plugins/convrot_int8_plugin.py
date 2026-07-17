@@ -32,7 +32,7 @@ one K1-only node and three K2-only nodes.
 
 The ConvRot Hadamard matrix is *not* an ONNX input. It is only used in Python
 reference code and in the offline weight-rotation/export flow. Runtime rotation
-inside the Triton kernels is implemented directly as an in-register butterfly.
+inside the Triton kernels is implemented directly as an in-register H256 Hadamard transform.
 
 For every M, including M==1, the runtime plugin uses the same two-kernel Triton
 path:
@@ -80,26 +80,25 @@ def conv_rot_int8_linear_reference(
     has_bias: bool,
     output_dtype: str = "FP16",
 ) -> np.ndarray:
-    """NumPy reference implementation of the ConvRotInt8Linear op.
+    """NumPy reference implementation of the ConvRotInt8Linear op (v13).
 
-    The runtime plugin uses the two-kernel path for all M: rotate/quantize
-    activations into reusable workspace, then run an INT8 GEMM that dequantizes
-    one K-group at a time. This reference follows that math:
+    v13 contract: per-row activation scaling + in-register H256 Hadamard rotation.
+    The runtime plugin uses the two-kernel path for all M:
 
-      1. Apply the activation-side ConvRot transform group-wise. The compiled
-         TensorRT plugin supports ``group_size == 256`` (per
-         CONVROT_OPTIMAL_TWO_KERNEL_SPEC.md).  ``group_size == 0`` is also
-         accepted as a no-rotation sentinel for testing with small inputs.
-      2. Split K into ``group_size``-wide quantization groups.
-      3. For each group, compute one activation scale per row, quantize the
-         group to INT8, form the INT32 dot product against the matching weight
-         slice, and immediately dequantize that partial sum.
-      4. Add bias once after all K-groups have been accumulated.
+      1. K1: rotate+quantize activations once into reusable workspace.
+         * Apply ConvRot H_{group_size} regular Hadamard (4 H4 stages in registers).
+         * Compute ONE per-row FP32 scale (max-abs over the full K).
+         * Quantize to INT8 with the per-row scale.
+      2. K2: single full-K INT8×INT8 → INT32 matmul + outer-product
+         FP32 dequant (X_scale[m] * W_scale[n] * acc) + bias.
+
+    This reference follows that math, matching the
+    ``ConvRot_HQQ_g256_per_row`` simulation GEMM
+    (``gemm_convrot_hqq_sym_rowwise_act_rowwise``) in
+    ``quantization_sim_real.py``.
 
     ``H`` is only used here for reference math. The runtime Triton kernels
-    generate a 16x16 regular-Hadamard factor in registers and compute the
-    full ``H_256`` via a separable ``tl.dot``-based Kronecker transform (not
-    a dense matrix multiply).
+    generate the regular H4 stages in registers (no ONNX graph input).
     """
     if x.shape[-1] != in_features:
         raise ValueError(f"x last dim {x.shape[-1]} != in_features {in_features}")
@@ -125,31 +124,28 @@ def conv_rot_int8_linear_reference(
     orig_shape = x_f32.shape
 
     if group_size == 0:
-        # No-rotation sentinel (testing only): skip the Hadamard, treat the
-        # entire row as one quantization group.
+        # No-rotation sentinel (testing only): skip the Hadamard rotation.
         x_rot = x_f32
-        block_k = in_features if in_features > 0 else 1
     else:
         n_groups = in_features // group_size
         x_grouped = x_f32.reshape(*orig_shape[:-1], n_groups, group_size)
         H_f32 = np.ascontiguousarray(H, dtype=np.float32)
         x_rot = np.matmul(x_grouped, H_f32).reshape(*orig_shape[:-1], in_features)
-        block_k = group_size
 
+    # v13: per-ROW activation quantization (one FP32 scale per M row,
+    # covering the entire K dimension — NOT per-256-block).
     x_rot_2d = x_rot.reshape(-1, in_features)
-    weight_scale_2d = weight_scale.reshape(1, out_features)
-    out_2d = np.zeros((x_rot_2d.shape[0], out_features), dtype=np.float32)
+    M = x_rot_2d.shape[0]
+    row_max = np.max(np.abs(x_rot_2d), axis=1)
+    row_scale = np.maximum(row_max, np.float32(1e-30)) / np.float32(127.0)
+    x_q = np.clip(np.rint(x_rot_2d / row_scale[:, None]),
+                  -127, 127).astype(np.int8)
 
-    for start in range(0, in_features, block_k):
-        end = min(start + block_k, in_features)
-        x_rot_g = x_rot_2d[:, start:end]
-        group_max = np.max(np.abs(x_rot_g), axis=1, keepdims=True)
-        group_scale = np.maximum(group_max, np.float32(1e-30)) / np.float32(127.0)
-        x_q_g = np.clip(np.rint(x_rot_g / group_scale), -127, 127).astype(np.int8)
-
-        w_q_g = weight_q[:, start:end].astype(np.int32)
-        partial = np.matmul(x_q_g.astype(np.int32), w_q_g.T)
-        out_2d += partial.astype(np.float32) * group_scale * weight_scale_2d
+    # Single full-K INT8×INT8 → INT32 matmul + outer-product FP32 dequant.
+    dot = x_q.astype(np.int32) @ weight_q.astype(np.int32).T  # [M, N] int32
+    out_2d = (row_scale.astype(np.float32)[:, None]
+              * weight_scale.astype(np.float32)[None, :]
+              * dot.astype(np.float32))
 
     if has_bias:
         bias_f32 = np.ascontiguousarray(bias, dtype=np.float32)
@@ -514,9 +510,10 @@ def make_convrot_quantize_onnx_node(
 ):
     """Emit the K1-only form used by shared self-attention Q/K/V.
 
-    ``X_q`` is INT8 with the same shape as X. ``X_scale`` is FP32 with
-    shape ``[K/group_size, *X.shape[:-1]]`` and physical layout
-    ``[groups, flattened_rows]``. Existing K1 cubins are used unchanged.
+    v13: ``X_q`` is INT8 with the same shape as X.  ``X_scale`` is FP32 with
+    shape ``[*X.shape[:-1]]`` (per-row, one FP32 per flattened M row) — NOT
+    ``[K/group_size, *X.shape[:-1]]`` as in v7-v12.  Existing K1 cubins are
+    used unchanged (the v13 K1 writes per-row scales, not per-group scales).
     """
     normalized_dtype = str(input_dtype).upper()
     if normalized_dtype not in {

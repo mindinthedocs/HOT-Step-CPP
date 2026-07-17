@@ -44,11 +44,11 @@
 
 #if CONVROT_INT8_KERNEL_CUBIN_HEADER_AVAILABLE
 // ── Cubin header version guard ─────────────────────────────────────────────
-// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 12.
-// Version 3 added per-cubin tile dimensions; version 4 additionally reflects
-// the intentionally smaller cubin inventory: G256 only (plus optional G0 sentinel), and no specialized M1
-// cubins. Referencing removed G0/G256/M1 symbols here would make the plugin
-// silently depend on an oversized stale generated header.
+// The cubin header must declare CONVROT_INT8_CUBIN_HEADER_VERSION >= 13.
+// Version 13 is the per-row activation scaling + in-register H256 rotation
+// rewrite (ConvRot_HQQ_g256_per_row simulation strategy). It is NOT
+// backward-compatible with v7-v12 cubins: K1 and K2 lost stride_xsg and
+// butterfly parameters; K1 executes pure in-register H256 rotation and INT8 quant.
 //
 // Version 1: original (no _SHARED, no _BLOCK_M/_BLOCK_N)
 // Version 2: added _SHARED constants (shared-mem pre-flight check)
@@ -79,10 +79,17 @@
 //             the generated inventory is FP16IO-only (FP32IO retired).
 // Version 12: K2 masks the partial final M tile.  enqueue() uses one persistent
 //             launch and no padded tail launch/copy workspace.
+// Version 13: Per-row activation scaling + in-register H256 rotation
+//             (ConvRot_HQQ_g256_per_row simulation). K1 fuses H256 in-register
+//             rotation + per-row INT8 quant in one kernel; X_scale is [M] FP32
+//             (NOT per-256-block). K2 is simplified to a single full-K INT8×INT8 → INT32
+//             matmul plus an outer-product FP32 dequant (xs[m] * ws[n] * acc).
+//             stride_xsg and butterfly pointers are removed.
+//             Backward compatibility with v12 cubins is NOT preserved.
 #ifndef CONVROT_INT8_CUBIN_HEADER_VERSION
 #  error "Cubin header is missing CONVROT_INT8_CUBIN_HEADER_VERSION. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
-#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 12
-#  error "Cubin header version >= 12 required (masked-M single-launch Gluon K2). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
+#elif CONVROT_INT8_CUBIN_HEADER_VERSION < 13
+#  error "Cubin header version >= 13 required (per-row scale v13). Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
 #endif
 #ifndef CONVROT_INT8_HAS_GENERATED_LAUNCH_STUBS
 #  error "Cubin header is missing generated launch stubs/descriptors. Re-run tools/onnx-export/extract_jit_cubins_autotune.py to regenerate engine/src/plugins/assets/convrot_int8_kernel_cubin.h."
@@ -146,17 +153,19 @@ inline uint32_t persistentGridU32(uint32_t num_tiles, uint32_t num_sms, uint32_t
     return (num_tiles < cap) ? num_tiles : cap;
 }
 inline uint32_t queryMaxActiveCtasPerSm(CUfunction, uint32_t, uint32_t) { return 0; }
+// v13 K1 launch ABI: x_ptr, xq_ptr, xs_ptr, M, K, G, NUM_SMS, strides.
 inline CUresult launchConvRotQuant(ConvRotCubinDesc const&, CUfunction, CUstream,
     void const*, void*, void*,
-    int32_t, int32_t, int32_t,  // M, K, NUM_SMS
+    int32_t, int32_t, int32_t, int32_t,  // M, K, G, NUM_SMS
     int32_t, int32_t,           // stride_xm, stride_xk
     int32_t, int32_t,           // stride_xqm, stride_xqk
-    int32_t, int32_t,           // stride_xsm, stride_xsg
+    int32_t,                    // stride_xsm
     uint32_t = 0) { return CUDA_ERROR_INVALID_VALUE; }
+// v13 K2 launch ABI: no stride_xsg (per-row X_scale).
 inline CUresult launchConvRotGemm(ConvRotCubinDesc const&, CUfunction, CUstream,
     void*, void*, int8_t const*, float const*, void const*, void*,
     int32_t, int32_t, int32_t, int32_t,  // M, N, K, NUM_SMS
-    int32_t, int32_t, int32_t, int32_t,  // xq/xs strides
+    int32_t, int32_t, int32_t,           // xq/xs strides (no stride_xsg)
     int32_t, int32_t, int32_t, int32_t,  // w/y strides
     uint32_t = 0) { return CUDA_ERROR_INVALID_VALUE; }
 } // namespace hotstep::convrot_int8_generated
@@ -716,9 +725,16 @@ int32_t activationBlockKForGroupSize(int32_t groupSize) {
 }
 
 int32_t activationScaleGroups(int32_t K, int32_t groupSize) {
-    int32_t const blockK = activationBlockKForGroupSize(groupSize);
-    return (K + blockK - 1) / blockK;
+    // v13: X_scale is per-row ([M] FP32), so there is exactly one "scale
+    // group" per row.  The integer is retained only for ONNX shape
+    // emission compatibility (the K1-only node exposes X_scale as a graph
+    // tensor with shape derived from this count).
+    (void)groupSize;
+    (void)K;
+    return 1;
 }
+
+// ── Activation scaling / quantization helpers ──────────────────────────────
 
 }  // namespace
 
@@ -944,11 +960,11 @@ size_t ConvRotInt8LinearPlugin::getWorkspaceSize(nvinfer1::DynamicPluginTensorDe
     if (K <= 0) return 0;
 
     if (maxM > std::numeric_limits<int32_t>::max()) return 0;
-    int32_t const scale_groups = activationScaleGroups(K, m_group_size);
+    // v13: X_scale is per-row ([M] FP32), one scale group per row.
+    int32_t const scale_groups = 1;
     size_t const x_q_size = alignUp(
         static_cast<size_t>(maxM) * static_cast<size_t>(K), 16);
-    // X_scale is FP32 with transposed [n_groups, rows] layout.  No BLOCK_M
-    // padding or output-tail buffer is needed by the masked Gluon K2.
+    // X_scale is [M] FP32 (per-row).
     size_t const x_scale_size = alignUp(
         static_cast<size_t>(maxM) * static_cast<size_t>(scale_groups) * sizeof(float),
         16);
@@ -1120,13 +1136,14 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
         int32_t const N = m_N;
         if (M <= 0 || K <= 0 || N <= 0) return -1;
 
-        // K1-only graph node. X_q is row-major [..., K] and X_scale is
-        // transposed [K/group_size, flattened_rows], so all Q/K/V consumers
-        // can bind the same two tensors without a copy or a special cubin.
+        // v13: K1 writes X_q [M, K] INT8 + X_scale [M] FP32 (per-row, not
+        // per-group).  The K1-only graph node exposes both tensors so all
+        // Q/K/V consumers can bind the same two tensors without a copy.
         if (m_quantize_only) {
             if (!m_kernelFunc_quant || !m_desc_quant) return -1;
             auto const* quant_desc =
                 static_cast<hotstep::convrot_int8_generated::ConvRotCubinDesc const*>(m_desc_quant);
+            int32_t const G = (m_group_size > 0 && K > 0) ? (K / m_group_size) : 1;
             CUresult const status = hotstep::convrot_int8_generated::launchConvRotQuant(
                 *quant_desc,
                 static_cast<CUfunction>(m_kernelFunc_quant),
@@ -1136,13 +1153,13 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
                 outputs[1],
                 M,
                 K,
+                G,
                 m_num_sms,
                 K,
                 1,
                 K,
                 1,
                 1,
-                M,
                 m_max_ctas_per_sm_quant);
             return status == CUDA_SUCCESS ? 0 : -1;
         }
@@ -1188,6 +1205,7 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
             return -1;
         }
 
+        // v13 workspace layout: [X_q INT8 | X_scale FP32].
         size_t const x_q_size = alignUp(
             static_cast<size_t>(M) * static_cast<size_t>(K), 16);
         void* workspace_xq = m_prequantized ? nullptr : workspace;
@@ -1199,12 +1217,12 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
 
         int32_t const stride_xqm = K;
         int32_t const stride_xqk = 1;
-        int32_t const stride_xsm = 1;
-        int32_t const stride_xsg = M;  // tightly packed [groups, M]
+        int32_t const stride_xsm = 1;  // v13: per-row, no stride_xsg
         int32_t const stride_wn = K;
         int32_t const stride_wk = 1;
         int32_t const stride_ym = N;
         int32_t const stride_yn = 1;
+        int32_t const G = (m_group_size > 0 && K > 0) ? (K / m_group_size) : 1;
 
         if (!m_prequantized) {
             CUresult const status = hotstep::convrot_int8_generated::launchConvRotQuant(
@@ -1216,49 +1234,40 @@ int32_t ConvRotInt8LinearPlugin::enqueue(
                 xs_ptr,
                 M,
                 K,
+                G,
                 m_num_sms,
                 K,
                 1,
                 stride_xqm,
                 stride_xqk,
                 stride_xsm,
-                stride_xsg,
                 m_max_ctas_per_sm_quant);
             if (status != CUDA_SUCCESS) return -1;
         }
 
-        auto launch_gemm = [&](void* xq_base, void* xs_base, void* y_base,
-                               int32_t launch_m, int32_t launch_scale_stride) -> CUresult {
-            return hotstep::convrot_int8_generated::launchConvRotGemm(
-                *gemm_desc,
-                static_cast<CUfunction>(m_kernelFunc_gemm),
-                static_cast<CUstream>(stream),
-                xq_base,
-                xs_base,
-                wq_ptr,
-                ws_ptr,
-                bias_ptr,
-                y_base,
-                launch_m,
-                N,
-                K,
-                m_num_sms,
-                stride_xqm,
-                stride_xqk,
-                stride_xsm,
-                launch_scale_stride,
-                stride_wn,
-                stride_wk,
-                stride_ym,
-                stride_yn,
-                m_max_ctas_per_sm_gemm);
-        };
-
-        // Version 12 handles the partial final M tile with predicated A loads,
-        // scale loads, and output stores.  One persistent launch replaces the
-        // old aligned-prefix + padded-tail + D2D-copy sequence.
-        CUresult const gemm_status = launch_gemm(
-            xq_ptr, xs_ptr, y_ptr, M, stride_xsg);
+        // v13: K2 launch — no stride_xsg (X_scale is [M] FP32, stride_xsm=1).
+        CUresult const gemm_status = hotstep::convrot_int8_generated::launchConvRotGemm(
+            *gemm_desc,
+            static_cast<CUfunction>(m_kernelFunc_gemm),
+            static_cast<CUstream>(stream),
+            xq_ptr,
+            xs_ptr,
+            wq_ptr,
+            ws_ptr,
+            bias_ptr,
+            y_ptr,
+            M,
+            N,
+            K,
+            m_num_sms,
+            stride_xqm,
+            stride_xqk,
+            stride_xsm,
+            stride_wn,
+            stride_wk,
+            stride_ym,
+            stride_yn,
+            m_max_ctas_per_sm_gemm);
         if (gemm_status != CUDA_SUCCESS) return -1;
         return 0;
     } catch (...) {
@@ -1331,7 +1340,7 @@ void ConvRotInt8LinearPlugin::serialize(void* buffer) const noexcept {
 
 namespace {
 
-// Compile-time-valid group sizes for the phase-1 butterfly kernel.
+// Compile-time-valid group sizes for the phase-1 rotation kernel.
 // The current generated Triton inventory supports group_size=256 (and optional G0 sentinel); there
 // is no legacy G64 cubin.
 

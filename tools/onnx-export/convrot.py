@@ -32,7 +32,8 @@ Group size contract:
 from __future__ import annotations
 
 import math
-from typing import Dict
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -197,3 +198,11 @@ def verify_rotation_pair(weight: np.ndarray, x: np.ndarray, group_size: int) -> 
         "mean_abs_diff": float(np.mean(np.abs(ref - rot))),
         "pass": diff < 1e-3,
     }
+
+
+def rotate_weight_with_butterfly(
+    weight: np.ndarray, H: np.ndarray, group_size: int,
+    **kwargs,
+) -> np.ndarray:
+    """Offline weight rotation: applies ConvRot H_{group_size} rotation."""
+    return rotate_weight(weight, H, group_size)
